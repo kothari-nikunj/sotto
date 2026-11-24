@@ -30,60 +30,10 @@ export const cleanupSelectionSchema=z.discriminatedUnion('mode',[
 ]);
 export const cleanupInputSchema=z.object({items:cleanupItemsSchema.optional(),selection:cleanupSelectionSchema.optional()}).strict().refine(value=>(value.items===undefined)!==(value.selection===undefined));
 const resolveItemSchema=z.object({name:scalarName(),anchor_key:anchor.optional(),loop_version:hex.optional(),loop_identity:hex.optional(),correction}).strict().refine(v=>[v.anchor_key,v.loop_version,v.loop_identity].every(x=>x===undefined)||[v.anchor_key,v.loop_version,v.loop_identity].every(x=>x!==undefined));
-import {scalarName,explicitProfileFields,numberedReferenceIndices,OwnerTaskListUnavailable} from './owner-task-scalars.js';
+export {resolveManyOwnerTextMatches,ownerTaskReadback} from './owner-task-scalars.js';
+import {resolveManyOwnerTextMatches,scalarName,explicitProfileFields,numberedReferenceIndices,OwnerTaskListUnavailable} from './owner-task-scalars.js';
 export const resolveManyItemsSchema=z.array(resolveItemSchema).min(1).max(20).refine(items=>
   new Set(items.filter(item=>item.anchor_key).map(item=>item.anchor_key)).size===items.filter(item=>item.anchor_key).length && new Set(items.map(item=>item.name.toLocaleLowerCase('en-US'))).size===items.length);
-const withheldReversal=/\b(?:not|never|neither|don't|don’t|do not|actually|kidding|unsure|wait|undo|cancel|scratch|them|both|it|those|these|all|everything|anything)\b/i;
-export function ownerTaskReadback(text:string){
-  const value=text.trim();
-  const match=/(?:[.!]\s*|\s+[—–-]\s*)(?:what(?:(?:'s|’s| is)? left|(?:'s|’s)?(?: else| still)?(?: is)? open| remains)|any((?: [A-Za-z0-9_-]+){0,6}) tasks? left|anything else open|what else)\?$/i.exec(value);
-  return match?{claim:value.slice(0,match.index).trim(),scope:match[1]?.trim()??''}:undefined;
-}
-const connectors='(?:\\s|,|&|\\band\\b)*';
-const completionPatterns = [
-  new RegExp(`^(?:I|we|I've|we've|I have|we have)?\\s*(?:finished|completed|closed|resolved|sorted)(?:\\s+with)?\\s*${connectors}$`,'i'),
-  new RegExp(`^${connectors}(?:loops?\\s+)?(?:(?:are|were|is|have been)\\s+)?(?:both\\s+)?(?:closed|done|handled|finished|complete|completed|resolved|sorted)(?:\\s+(?:too|now))?$`,'i'),
-  new RegExp(`^(?:please\\s+)?(?:close|resolve|complete)\\s*${connectors}$`,'i'),
-  new RegExp(`^(?:please\\s+)?mark\\s+${connectors}(?:as\\s+)?(?:done|complete|completed|closed|resolved)$`,'i')
-];
-export function resolveManyOwnerTextMatches(items:ReadonlyArray<Pick<z.infer<typeof resolveManyItemsSchema>[number],'name'|'correction'>>,ownerText:string,mode:'named_people'|'owner_tasks',exactClause=false):boolean{
-  void mode;
-  let claim=exactClause?ownerText.trim():ownerTaskReadback(ownerText)?.claim??ownerText.trim();
-  claim=exactClause?claim:claim.replace(/[.!]\s*(?:you can|please) close (?:them|those|these)[.!]?$/i,'').trim();
-  // A counted restatement is redundant only when it names this same complete set.
-  const restatement=exactClause?null:/[.!]\s*(?:please\s+)?(?:close|resolve|mark)\s+(?:those|these|the)\s+(two|three|[2-9]|1[0-9]|20)(?:\s+(?:done|closed))?[.!]?$/i.exec(claim);
-  if(restatement){const count=restatement[1]!.toLowerCase()==='two'?2:restatement[1]!.toLowerCase()==='three'?3:Number(restatement[1]);if(count!==items.length)return false;claim=claim.slice(0,restatement.index).trim();}
-  const withheld=exactClause?null:/(?:[;,]\s*|\bbut\s+|(?<=\bdone)\s+)(?:leave\s+)?(.+?)\s+(?:still\s+)?open[.!]?$/i.exec(claim);
-  // A carve-out names a specific remaining item; a hedge, reversal or blanket pronoun withdraws the claim.
-  if(withheld&&withheldReversal.test(withheld[1]!))return false;
-  if(withheld)claim=claim.slice(0,withheld.index).trim();
-  claim=claim.replace(/[.!]$/,'').trim();
-  if(!claim||/[?]/.test(claim))return false;
-  // Independent explicit completion clauses remain independently selectable.
-  const clauses=claim.split(/[.;]\s+/);
-  if(clauses.length>1){
-    const groups=clauses.map(clause=>items.filter(item=>clause.includes(item.correction)));
-    return groups.flat().length===items.length&&new Set(groups.flat()).size===items.length&&groups.every((group,i)=>group.length>0&&resolveManyOwnerTextMatches(group,clauses[i]!,mode,exactClause));
-  }
-
-  const spans:{start:number;end:number}[]=[];
-  for(const item of items){
-    const name=item.name.toLocaleLowerCase('en-US');
-    const escaped=item.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    const found=[...claim.matchAll(new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`,'giu'))];
-    const index=found[0]?.index??-1;
-    if(found.length!==1||item.correction!==found[0]![0]||
-      (withheld?.[1]??'').toLocaleLowerCase('en-US').includes(name))return false;
-    spans.push({start:index,end:index+found[0]![0].length});
-  }
-  if(spans.some((span,i)=>spans.some((other,j)=>i!==j&&span.start<other.end&&other.start<span.end)))return false;
-  let remainder=claim;
-  for(const span of spans.sort((a,b)=>b.start-a.start))remainder=remainder.slice(0,span.start)+' '+remainder.slice(span.end);
-  if(/\b(?:not|never|neither|don't|do not|isn't|aren't|might|maybe|perhaps|if|unless|should|could|would|open|pending|waiting|unfinished)\b/i.test(remainder))return false;
-  if(/\bboth\b/i.test(remainder)&&items.length!==2)return false;
-  return completionPatterns.some(pattern => pattern.test(remainder.trim()));
-}
-
 /** Normalize labels only; uniqueness is still checked over every active peer. */
 export function loopContactName(value:string){return value.toLocaleLowerCase('en-US').replace(/\s+(?:(?:text|chat)\s+)?thread$/u,'').match(/[\p{L}\p{N}]+/gu)?.join(' ')??'';}
 
@@ -213,7 +163,7 @@ export function cleanupListText(list:CleanupList){if(list.scope==='open')return 
 export const cleanupPreviewSchema=z.object({version:z.literal(1),status:z.literal('preview'),event_id:hex,payload_hash:hex,review:cleanupListSchema}).strict();
 const cleanupOutcomeBase={index:z.number().int().min(1).max(50),action:z.enum(['dismiss','snooze','keep','resolve']),anchor_key:anchor};
 export const cleanupOutcomeSchema=z.discriminatedUnion('status',[
- z.object({...cleanupOutcomeBase,status:z.literal('applied'),post_digest:hex,loop_status:z.enum(['open','waiting','failed','blocked','parked','dismissed','resolved']),snoozed_until:snoozeDate.optional()}).strict().refine(v=>(v.action==='snooze')===(v.snoozed_until!==undefined)&&(v.action!=='dismiss'||v.loop_status==='dismissed')&&(v.action!=='resolve'||v.loop_status==='resolved')&&(v.action!=='snooze'||v.loop_status!=='parked'&&v.loop_status!=='dismissed'&&v.loop_status!=='resolved')&&(v.action!=='keep'||v.loop_status!=='dismissed'&&v.loop_status!=='resolved')),
+ z.object({...cleanupOutcomeBase,status:z.literal('applied'),label:z.string().min(1).max(480).optional(),post_digest:hex,loop_status:z.enum(['open','waiting','failed','blocked','parked','dismissed','resolved']),snoozed_until:snoozeDate.optional()}).strict().refine(v=>(v.action==='snooze')===(v.snoozed_until!==undefined)&&(v.action!=='dismiss'||v.loop_status==='dismissed')&&(v.action!=='resolve'||v.loop_status==='resolved')&&(v.action!=='snooze'||v.loop_status!=='parked'&&v.loop_status!=='dismissed'&&v.loop_status!=='resolved')&&(v.action!=='keep'||v.loop_status!=='dismissed'&&v.loop_status!=='resolved')),
  z.object({...cleanupOutcomeBase,anchor_key:z.union([anchor,z.literal('')]),status:z.literal('refused'),reason:z.enum(['target_changed','target_unavailable','source_unavailable','correction_unavailable'])}).strict(),
  z.object({...cleanupOutcomeBase,status:z.literal('unknown')}).strict(),z.object({...cleanupOutcomeBase,status:z.literal('skipped')}).strict(),
 ]);
@@ -245,7 +195,7 @@ export const ownerTaskToolArgsSchema = z.discriminatedUnion('operation', [
   z.object({operation: z.literal('close'), anchor, correction:scalarName().optional()}).strict(),
   z.object({operation:z.literal('keep'),...binding}).strict(),
   z.object({operation:z.literal('snooze'),...binding,days:z.number().int().positive().max(3652058)}).strict(),
-  z.object({operation:z.literal('correct'),...binding,to:z.enum(['resolved','dismissed'])}).strict(),
+  z.object({operation:z.literal('correct'),...binding,to:z.enum(['resolved','dismissed','open'])}).strict(),
   z.object({operation:z.literal('retarget'),...binding,direction:z.enum(['you','them']),text:text.optional(),contact:scalar(120).optional(),identifier:scalar(200).optional()}).strict(),
   z.object({operation: z.literal('fact_correct'), canonical_id: canonicalId, fact_id: factId, fact_version: hex, text: factText, ...explicitProfileFields, source_revision: hex}).strict(),
   z.object({operation:z.literal('add_identifier'),canonical_id:canonicalId,identifier:scalar(200).min(1).refine(value=>!/[\u0085\u2028\u2029]/u.test(value)),source_revision:hex}).strict(),
@@ -257,7 +207,7 @@ export const ownerTaskToolArgsSchema = z.discriminatedUnion('operation', [
   z.object({operation:z.literal('identifier'),review:identifierReviewSchema,proposal:relationProof}).strict(),
   z.object({operation:z.literal('propose_cleanup'),source_revision:hex,scope:z.literal('open').optional(),anchor_keys:ownerTaskAnchorKeysSchema.optional()}).strict().refine(v=>!v.anchor_keys||v.scope==='open'),
   z.object({operation:z.literal('cleanup'),list:cleanupListSchema,proposal:relationProof,items:cleanupItemsSchema,selection:cleanupSelectionSchema.optional()}).strict().refine(v=>v.items.every((item,i)=>item.index<=v.list.rows.length&&(i===0||v.items[i-1]!.index<item.index))),
-  z.object({operation:z.literal('resolve_many'),source_revision:hex,selection_mode:z.enum(['named_people','owner_tasks']),allow_partial:z.literal(true).optional(),items:resolveManyItemsSchema}).strict(),
+  z.object({operation:z.literal('resolve_many'),source_revision:hex,selection_mode:z.enum(['named_people','owner_tasks','delivered']),delivery:z.object({dispatch_id:z.string().regex(/^[a-f0-9]{16,64}$/),message_id:z.string().min(1).max(512),route_digest:hex,payload_hash:hex,quoted:z.literal(true).optional()}).strict().optional(),allow_partial:z.literal(true).optional(),items:resolveManyItemsSchema}).strict(),
 ]);
 export type OwnerTaskToolArgs = z.infer<typeof ownerTaskToolArgsSchema>;
 export const ownerTaskToolRejectionSchema = z.enum(['event_conflict', 'target_unavailable', 'owner_span_unavailable', 'owner_anchor_collision','target_changed','source_unavailable','correction_unavailable','anchor_collision','identifier_collision','similar_fact_exists']);
@@ -277,14 +227,14 @@ export const ownerTaskToolReceiptSchema = z.discriminatedUnion('operation', [
   z.object({...receiptBinding,operation:z.literal('close'),anchor_key:anchor,post_digest:hex,loop_status:z.literal('resolved')}).strict(),
   z.object({...receiptBinding,operation:z.literal('keep'),anchor_key:anchor,post_digest:hex,loop_status:z.enum(['open','waiting','failed','blocked','parked'])}).strict(),
   z.object({...receiptBinding,operation:z.literal('snooze'),anchor_key:anchor,post_digest:hex,loop_status:z.enum(['open','waiting','failed','blocked']),snoozed_until:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value=>{const stamp=new Date(value+'T00:00:00Z');return value.slice(0,4)!=='0000' && Number.isFinite(stamp.getTime()) && stamp.toISOString().slice(0,10)===value;})}).strict(),
-  z.object({...receiptBinding,operation:z.literal('correct'),anchor_key:anchor,post_digest:hex,loop_status:z.enum(['resolved','dismissed'])}).strict(),
+  z.object({...receiptBinding,operation:z.literal('correct'),anchor_key:anchor,post_digest:hex,loop_status:z.enum(['resolved','dismissed','open'])}).strict(),
   z.object({...receiptBinding,operation:z.literal('retarget'),old_anchor_key:anchor,anchor_key:anchor,old_post_digest:hex,post_digest:hex,loop_status:z.literal('open'),direction:z.enum(['you','them'])}).strict(),
 ]);
 export type OwnerTaskToolReceipt = z.infer<typeof ownerTaskToolReceiptSchema>;
 export function taskReceiptMatches(receipt: OwnerTaskToolReceipt, args: OwnerTaskToolArgs): boolean {
   if(receipt.operation !== args.operation)return false;
   if(args.operation==='cleanup')return receipt.operation==='cleanup'&&receipt.review_hash===args.list.review_hash&&receipt.items.length===args.items.length&&receipt.items.every((item,i)=>item.index===args.items[i]!.index&&item.action===args.items[i]!.action&&item.anchor_key===args.list.rows[item.index-1]!.anchor_key);
-  if(args.operation==='resolve_many')return receipt.operation==='resolve_many'&&receipt.items.length===args.items.length&&receipt.items.every((item,i)=>item.index===i+1&&item.action==='resolve'&&item.anchor_key===(args.items[i]!.anchor_key??'')&& (args.items[i]!.anchor_key!==undefined||item.status==='refused'));
+  if(args.operation==='resolve_many')return receipt.operation==='resolve_many'&&receipt.items.length===args.items.length&&receipt.items.every((item,i)=>item.index===i+1&&item.action==='resolve'&&(args.selection_mode==='delivered'&&!!args.delivery&&args.items.every(ref=>ref.anchor_key===undefined)||item.anchor_key===(args.items[i]!.anchor_key??'')&&(args.items[i]!.anchor_key!==undefined||item.status==='refused')));
   if(args.operation==='fact_add')return receipt.operation==='fact_add'&&receipt.canonical_id===args.review.canonical_id&&receipt.review_hash===args.review.review_hash&&receipt.added===!args.review.present;
   if(args.operation==='identifier')return receipt.operation==='identifier'&&receipt.canonical_id===args.review.canonical_id&&receipt.identifier===args.review.identifier&&receipt.review_hash===args.review.review_hash&&receipt.added===!args.review.present;
   if(args.operation==='relation')return receipt.operation==='relation'&&receipt.changed===(args.review.present!==(args.review.mode==='add'))&&(['mode','canonical_id','other_canonical_id','relation_type','date','review_hash'] as const).every(key=>receipt[key]===args.review[key]);
@@ -299,5 +249,14 @@ export function taskReceiptMatches(receipt: OwnerTaskToolReceipt, args: OwnerTas
   return true;
 }
 
-export function cleanupAcknowledgement(receipt:Extract<OwnerTaskToolReceipt,{operation:'cleanup'}>){if(receipt.outcome==='complete'&&receipt.items.length>5&&receipt.items.every(item=>item.action==='resolve'&&item.status==='applied'))return `Marked ${receipt.items.length} tasks done.`;return receipt.items.map(item=>`${item.index}. `+(item.status==='applied'?(item.action==='resolve'?'Marked done.':item.action==='dismiss'?'Dismissed.':item.action==='snooze'?`Snoozed until ${item.snoozed_until}.`:'Kept.'):item.status==='unknown'?'Outcome unconfirmed; this item may have changed.':item.status==='skipped'?'Not attempted.':`Not changed: ${item.reason.replaceAll('_',' ')}.`)).join('\n');}
-export function resolveManyAcknowledgement(receipt:Extract<OwnerTaskToolReceipt,{operation:'resolve_many'}>,args:Extract<OwnerTaskToolArgs,{operation:'resolve_many'}>){const refused={target_changed:'This one changed since I checked.',target_unavailable:'I couldn’t tell which one you meant.',source_unavailable:'I can’t check this right now.',correction_unavailable:'I couldn’t confirm what you wanted changed.'};return receipt.items.map((item,i)=>`${args.items[i]!.name}: `+(item.status==='applied'?'Marked done.':item.status==='unknown'?'I couldn’t confirm whether this was marked done.':item.status==='skipped'?'I haven’t changed this one.':refused[item.reason])).join('\n');}
+const refusals={target_changed:'This one changed since I checked.',target_unavailable:'I couldn’t tell which one you meant.',source_unavailable:'I can’t check this right now.',correction_unavailable:'I couldn’t confirm what you wanted changed.'};
+const ownerDate=(d:string)=>new Date(d+'T00:00Z').toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'});
+export function cleanupAcknowledgement(receipt:Extract<OwnerTaskToolReceipt,{operation:'cleanup'}>){if(receipt.outcome==='complete'&&receipt.items.length>5&&receipt.items.every(item=>item.action==='resolve'&&item.status==='applied'))return `Marked ${receipt.items.length} tasks done.`;return receipt.items.map(item=>`${item.index}. `+(item.status==='applied'?(item.action==='resolve'?'Marked done.':item.action==='dismiss'?'Dismissed.':item.action==='snooze'?`Snoozed until ${ownerDate(item.snoozed_until!)}.`:'Kept.'):item.status==='unknown'?'Outcome unconfirmed; this item may have changed.':item.status==='skipped'?'Not attempted.':`Not changed. ${refusals[item.reason]}`)).join('\n');}
+export function resolveManyAcknowledgement(receipt:Extract<OwnerTaskToolReceipt,{operation:'resolve_many'}>,args:OwnerTaskToolArgs,sourceRevision?:string){
+  if(args.operation!=='resolve_many')throw new Error('Task acknowledgement unavailable');
+  if(args.selection_mode==='delivered'&&args.items.length===1&&args.items[0]!.name.toLowerCase()==='done'){
+    const result=receipt.items[0]!;
+    if(result.status==='applied')return sourceRevision===args.source_revision&&result.label ? 'Marked done: '+result.label+'.' : 'Marked the task in my nudge done.';
+    if(result.status==='refused'&&result.reason==='target_unavailable')return 'Which task in my message did you finish?';
+  }
+  return receipt.items.map((item,i)=>`${item.status==='applied'&&args.selection_mode==='delivered'&&sourceRevision===args.source_revision&&item.label?item.label:args.items[i]!.name}: `+(item.status==='applied'?'Marked done.':item.status==='unknown'?'I couldn’t confirm whether this was marked done.':item.status==='skipped'?'I haven’t changed this one.':refusals[item.reason])).join('\n');}

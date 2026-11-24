@@ -73,7 +73,8 @@ constant `DEFAULT_RECENCY_DAYS` in `research_attendees.py`, not an env var.
   empty lists — an empty list beats a stretch."
 - One entry per attendee, no duplicates. Preserve the input email verbatim — it is the join key.
 - This is research only: no drafting, scheduling, or actions.
-- If search is unavailable, the script returns `[]` — nothing is fabricated.
+- If search is unavailable, the script returns an empty attendee list and a warning. The brief
+  composer receives that status and can disclose the missing research.
 
 ## Output
 One JSON object, passed straight into `compose_brief` / `compose_meeting_prep` as the
@@ -86,7 +87,7 @@ One JSON object, passed straight into `compose_brief` / `compose_meeting_prep` a
       "email": "taylor@startup.com",
       "title": "Co-founder & CEO",
       "company": "Startup Inc.",
-      "relevance": ["Raising a Series A in the space you invest in"],
+      "relevance": [],
       "summary": "Co-founder and CEO of Startup Inc., a developer-tools company focused on CI/CD. Previously a staff engineer at BigCo and an early PM at MidCo.",
       "company_summary": "Startup Inc. builds CI/CD pipelines for monorepos; ~40 engineering-team customers, seed-funded in 2024.",
       "recent_activity": [

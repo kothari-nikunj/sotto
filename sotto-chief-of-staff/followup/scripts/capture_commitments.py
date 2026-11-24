@@ -79,6 +79,14 @@ def successful_revisions(data_root: str) -> set[str]:
     return revision_history(data_root)[0]
 
 
+def cached_followup(meeting, user_email):
+    """Read an existing extraction without starting a model or repeating a ledger write."""
+    directory = Path(os.environ.get('SOTTO_DATA', '/data')) / 'events/notification-artifacts'
+    revision = extraction_revision(meeting, user_email, stable=not meeting.get('transcript'))
+    cached = jsonstore.read(str(directory / f'followup-{revision}.json'), default=None, strict=True)
+    return cached if isinstance(cached, dict) and revision in cached.get('revision_aliases', []) else None
+
+
 def extract_apply_meeting(meeting: dict, user_email: str = '', *, llm=None,
                           data_root: str | None = None) -> dict:
     """One cached, grounded extraction and canonical apply for every automatic caller."""

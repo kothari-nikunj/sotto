@@ -163,9 +163,9 @@ test('original triage gathers real queue; selected exact Gmail review saves once
     assert.deepEqual(queue.email.map((row:Record<string,any>)=>row.threadId),['thread-123','thread-456']);
     assert.equal(queue.email[0].message_id,'message-123');
     assert.equal(queue.email[0].important,true);assert.equal(queue.email[0].unread,true);
-    assert.ok(queue.imessage.some((row:Record<string,any>)=>row.name==='Jake Rosen'));
+    assert.ok(queue.imessage.some((row:Record<string,any>)=>row.name==='Quinn Albrecht'));
     const group=queue.imessage.find((row:Record<string,any>)=>row.is_group_chat);assert.ok(group);assert.equal(group.identifier,'');
-    assert.ok(!JSON.stringify(queue).includes('8885551234'));assert.equal(queue.whatsapp.length,1);
+    assert.ok(!JSON.stringify(queue).includes('8885550100'));assert.equal(queue.whatsapp.length,1);
     assert.equal(queue.coverage.gmail_query,'newer_than:1d');assert.equal(queue.coverage.local_since_hours,72);
     assert.equal(journal.db.prepare('SELECT count(*) AS n FROM actions').get()!.n,0);
     phase='review';step=0;

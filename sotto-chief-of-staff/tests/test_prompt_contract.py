@@ -287,5 +287,14 @@ def test_requested_draft_continuation_preserves_intent_and_source_time():
     assert 'only after the owner has chosen to take the meeting' in inline
     assert 'before composing any draft or fetching voice guidance' in inline
     assert 'Do not supply a placeholder neutral draft or promise future action' in inline
+    assert 'Read the relevant originals before deciding that owner input is missing' in inline
+    assert 'Preparing evidence-based comments does not require the owner to supply those comments' in inline
+    assert 'Apply a verified correction to the earlier proposal' in inline
+    assert 'ask only about what remains open' in inline
+    assert 'whether it will happen at all' in inline
+    assert 'Do not turn analysis into an invented personal opinion, approval or commitment' in inline
+    assert 'other permitted channels for the same person and topic' in inline
+    assert 'unavailable or no longer permitted' in inline
+    assert 'do not turn earlier brief prose into verified facts in the draft' in inline
     assert 'source-relative week that has clearly ended' in verify
     assert 'does not override an owner-requested inline draft' in alternatives

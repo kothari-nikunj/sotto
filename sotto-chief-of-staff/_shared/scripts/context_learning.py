@@ -33,7 +33,7 @@ Don't fill slots. Copy subject_id exactly from the input (for example, p1); it i
 identity, never a person's name, email address, or an email subject line. Return each subject_id at
 most once. Every fact needs source refs from messages with that exact subject_id. Owner instructions,
 permissions, mutes and standing priorities cannot be learned by this process. Writing voice is learned separately from the owner's actual sends.
-Maximum {FACTS_PER_PERSON} durable facts per subject.
+Maximum {FACTS_PER_PERSON} durable facts per subject, each about that subject person, never about someone else named in the messages.
 Each fact must use 1–{MAX_REFS} of the most relevant source refs;
 select decisive evidence, including a later answer or resolution, instead of citing the entire
 conversation. Each text must be at most {MAX_TEXT_CHARS} characters. No sensitive guesses.'''
@@ -197,7 +197,7 @@ def learn(records, llm=gemini.call_gemini, now=None):
     # Recheck consent after the model call, before any writer, including when only a valid subset remains.
     if any(not allowed(r['source']) for r in records):
         raise RuntimeError('source consent changed during memory extraction')
-    knowledge_update.apply({'person_updates': updates}, now=now)
+    knowledge_update.apply({'person_updates': updates}, now=now, match_names=False)
     result = {'reviewed': len(records), 'facts': sum(len(p['facts']) for p in updates)}
     if rejected:
         result['rejected_people'] = dict(rejected)  # counts/codes only; never source or model text

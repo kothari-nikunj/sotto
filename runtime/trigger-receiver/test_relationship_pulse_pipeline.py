@@ -58,7 +58,7 @@ def test_original_compute_state_and_restart_once(flow):
 def test_no_usable_interactions_no_state_write(flow):
     root,_,local,_,_,invoke = flow
     local['imessage'] = []
-    assert 'skipping the pulse' in invoke()['text']
+    assert 'no relationship suggestions this time' in invoke()['text']
     assert not (root/'knowledge/relationship_state.json').exists()
 
 
@@ -97,7 +97,7 @@ def test_mixed_bridge_receipts_withhold_unavailable_content(flow):
     local['source_status']['whatsapp'] = 'ok'
     local['whatsapp'] = []
     result = invoke()
-    assert 'imessage' in result['text'] and 'skipping the pulse' in result['text']
+    assert 'iMessage' in result['text'] and 'no relationship suggestions this time' in result['text']
     assert not (root/'knowledge/relationship_state.json').exists()
 
 
@@ -142,7 +142,7 @@ def test_original_gmail_only_graph_known_or_unknown(flow, known):
     if known:
         assert 'Dana' in result['text'] and (root/'knowledge/relationship_state.json').exists()
     else:
-        assert 'known-person interactions' in result['text']
+        assert 'match recent messages to people you know' in result['text']
         assert not (root/'knowledge/relationship_state.json').exists()
 
 
@@ -169,7 +169,7 @@ def test_neither_source_preserves_prior_state(flow):
     state['bridge_sources'] = []
     result = invoke()
     assert 'Fresh message and email checks unavailable.' in result['text']
-    assert 'skipping the pulse' in result['text'] and previous.read_bytes() == before
+    assert 'no relationship suggestions this time' in result['text'] and previous.read_bytes() == before
 
 
 def _lapsed_history(root, channel='imessage'):
@@ -199,7 +199,7 @@ def test_partial_channel_withholds_lapse_and_says_so(flow):
     local['source_status']['imessage'] = 'partial'
     text = invoke()['text']
     assert 'Fully lost touch' not in text
-    assert 'partial or unavailable for: imessage' in text and 'Some history may be missing' in text
+    assert 'partial or unavailable for: iMessage.\n\n' in text and 'Some history may be missing' in text
 
 
 @pytest.mark.parametrize('status', ['ok', 'partial'])
@@ -432,7 +432,7 @@ def test_complete_history_and_empty_complete_refresh_can_still_report_lapse(flow
         Path(args[args.index('--source-results-out') + 1]).write_text(json.dumps({'gmail': {'status': 'ok', 'complete': True}}))
     text = pipeline.run(PACK, {'mode': 'current'}, command, authority=lambda: state.copy())['text']
     assert 'Fully lost touch' in text and 'Maya' in text
-    assert 'skipping the pulse' not in text
+    assert 'no relationship suggestions this time' not in text
 
 
 def test_canonical_commitment_deadline_uses_owner_local_date(flow):

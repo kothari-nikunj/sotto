@@ -1,6 +1,6 @@
 ---
 name: sotto-meeting-prep
-description: Use when the user explicitly requests prep for the user's meetings ("prep my meetings", "who am I meeting", "brief me on my calendar"), to prep one named person or meeting ("prep Spencer", "prep me for my 2:15"), when the user says YES to a nudge that offered prep for a specific meeting, or for a Bridge meeting_prep trigger. A named meeting is a deep dive on that meeting alone; only a broad meeting request gets the sweep of outside meetings in the next 3 days. A request to write a short blurb, summary, or other copy about a company for a future meeting is a company research and drafting request, even if it mentions a meeting or time. Use Ask for the company facts and honor the requested length; do not queue meeting prep or all external meetings for that request.
+description: Use when the user explicitly requests prep for the user's meetings ("prep my meetings", "brief me on my calendar"), asks for prep on one named person or meeting ("prep Rowan", "prep me for my 2:15"), when the user says YES to a nudge that offered prep for a specific meeting, or for a Bridge meeting_prep trigger. A named meeting is a deep dive on that meeting alone; only a broad prep request gets the sweep of outside meetings in the next 3 days. A schedule-only question ("what’s on my calendar?") calls for a current calendar read. A request to write a short blurb, summary, or other copy about a company for a future meeting is a company research and drafting request, even if it mentions a meeting or time. Use Ask for the company facts and honor the requested length; do not queue meeting prep or all external meetings for that request.
 metadata:
   tags: [meeting-prep, chief-of-staff, sotto]
   category: productivity
@@ -18,7 +18,7 @@ they named a person or a time, or they're answering an offer to prep a specific 
 deep dive on that meeting alone; the compact sweep is only for "prep my meetings" across the days
 ahead. In the deep-dive case run the same command with `--focus "<the name>"` (or their email):
 that one person gets an extra grounded call covering their company and space, and the prep becomes
-a deep dive on their soonest meeting — their thread with you first, angles last. A `--focus` that
+a deep dive on their soonest meeting — their substantive exchange with you and a useful question. A `--focus` that
 matches nobody on the calendar ahead is unavailable: clarify the person or meeting rather than
 broadening to the sweep.
 
@@ -46,7 +46,7 @@ with a calendar summary or another offer to run prep.
 > The ONLY facts you may state about a person are ones that came from real attendee research (step 2)
 > or the knowledge graph. You may NOT assert a title ("founder", "CEO", "partner") or characterize a
 > company ("VC firm", "Alive *Ventures*") from the event title, the email domain, or memory. Concretely:
-> - Company name = **exactly** what the event title's parenthetical or email domain gives. `alive.inc`
+> - Company name = **exactly** what the event title's parenthetical or email domain gives. `alive.test`
 >   → "Alive" (never "Alive Ventures"); `(Browserbase)` → "Browserbase" with **no** role attached.
 > - Conversation memory is for continuity (open loops, "last time you discussed X"), **never** for
 >   inferring who someone is. A familiar-sounding fact you can't point to in the gathered data is a guess.
@@ -60,10 +60,17 @@ CC matches. It keeps the opening and latest replies within one 24,000-character 
 long threads or unavailable reads are labelled partial. Messages from muted senders are dropped
 from that read (the owner's own sent replies stay). Partial context cannot prove that no
 introduction or prior exchange exists. This uses the existing prep gather, with no extra model pass.
+The gather searches up to 15 unique attendee addresses. It records failures and addresses beyond
+that limit under `_search_failed`. Either leaves Gmail coverage partial. The attendee gather counts
+Gmail as consulted when at least one search succeeds, including one that finds no thread.
+If the missing history matters, the prep can briefly say which attendee could not be checked.
 
-Focused prep also carries the already-gathered, currently permitted direct-message conversation
-for the exact linked attendee into composition. Group conversations and ambiguous
-identities are excluded; bounded or unavailable history is not evidence of no prior exchange.
+Focused and exact-occurrence prep uses direct messages linked to the attendee’s exact email
+or uniquely owned contact identifier. A phone shared by conflicting contact cards is excluded.
+The writer receives dated exchanges in both directions.
+If a requested attendee’s observed chat was only partly read, the worker may refresh one
+exact peer. Known omissions accompany the evidence internally. Mention them only if they
+change a talking point or the owner’s next step. Group chats stay out of this read.
 Neither that conversation nor the expanded Gmail thread is sent to web research: research prompts
 carry only short email snippets, as the sweep always has.
 
@@ -91,9 +98,8 @@ carry only short email snippets, as the sweep always has.
    calendar title for a meeting, or the full name/attendee email for a person. Do not pass
    "that", a shortened title, or the whole request. Repeated titles require a day/time selection. Preserve
    the full day/time for a time-selected request; clarify if more than one meeting fits.
-   The result is a queued acknowledgement, not a completed prep: stop there, do not compose a
-   replacement prep or claim delivery, and do not run a second copy. Stopping this chat does not
-   cancel the queued job.
+   The runtime reports whether the job was queued. Finish the turn after the receipt. The actual
+   prep arrives separately if delivery succeeds. Stopping this chat does not cancel the queued job.
 2. **What the receiver's pipeline does** — for your understanding, not for you to run:
    - **Gather** — the calendar for the next 3 days, the local snapshot, the knowledge graph for
      everyone on the calendar ahead (even if their file hasn't been touched in weeks), and 30 days of
@@ -110,23 +116,25 @@ carry only short email snippets, as the sweep always has.
      included only when supported and relevant — one person, one extra call, never a fan-out. A deterministic,
      read-only X lane adds exact-handle identity only; a missing X token is an honest no-op.
    - **Compose** — the extraction prompt (`references/meeting-prep-prompt.md`) produces one
-     skimmable prep: the compact sweep, or the FOCUSED PREP variant — their thread with you first,
-     then what the company builds / the founder / traction / the space, then angles. It REQUIRES a
-     "Your thread:" line whenever private context exists. An unmatched focus yields no prep.
+     skimmable prep. Lead with what the person needs to decide or the important part of their
+     exchange, then give grounded questions. Keep relevant dates, names, evidence and source links.
+     Mention missing context only where requested or where it changes what to do. An unmatched focus
+     yields no prep.
    - **Persist the research** — each researched attendee's title/company/summary enters the graph
      as clearly-sourced, LOW-confidence (0.55) "Per web search: …" facts that decay, grounded in the
      research output only; the focus pass's company deep dive becomes that company's `## About`
      and its source-URLed traction signals, when present, `## News` lines. That is why the deep dive you pay for
      once is there for the *next* person from that company. A persistence failure is reported and
      never fails the prep.
-   - **Deliver** — on iMessage a focused prep arrives as a four-photo gallery when it fits; other
-     channels and short/sweep preps keep text. Never send images yourself or repeat the caption.
+   - **Deliver** — the receiver can send eligible focused prep as four photos on iMessage. Short
+     prep and sweeps use text. The attended prep command requires a supported owner route. Report
+     unavailable routes plainly and leave the delivery format to the receiver.
      To expand a delivered prep later, `sotto-ask` reads it with `accepted_brief_detail`.
 
 ## Notes
-- **The deep dive opens with the private thread.** Who they are and how you're connected — intro
+- **The deep dive leads with a substantive private thread when present.** Who they are and how you're connected — intro
   chain, quotes, past meetings, open ledger items — is the part no web search can produce, so it
-  leads. Depth follows focus: six sections × eight meetings is unreadable, one meeting earns it.
+  leads when relevant. A routine invite can be covered by the meeting heading.
 - **Every suggested angle fuses a private fact with a researched one where both exist.** An angle
   that only restates research is a question anyone could ask; one that only restates the thread is
   small talk. When one side is genuinely empty, angles from the other alone are fine — the missing

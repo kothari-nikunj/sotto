@@ -49,13 +49,13 @@ def test_every_writer_runs_in_order_and_the_receipt_says_what_ran(tmp_path, monk
                  granola=_touch(tmp_path, "granola.json"), knowledge_out=_touch(tmp_path, "know.json"),
                  continuity=_touch(tmp_path, "cont.json"))
     receipt = ls.learn(args, run=fake_run)
-    assert calls == ["knowledge_update.py", "continuity_resolve.py", "style_extract.py",
+    assert calls == ["knowledge_update.py", "continuity_resolve.py", "loop_check.py", "style_extract.py",
                      "draft_outcomes.py", "capture_commitments.py", "granola_graph.py",
                      "prewarm_graph.py"]
     assert receipt["ok"] is False and receipt["day"] == "2026-09-04" and receipt["kind"] == "morning"
     assert receipt["steps"]["granola"] == {"status": "failed", "exit": 3, "detail": "boom"}
     assert {k: v["status"] for k, v in receipt["steps"].items() if k != "granola"} == {
-        "knowledge": "ok", "continuity": "ok", "drafts": "ok", "style": "ok",
+        "knowledge": "ok", "continuity": "ok", "loopcheck": "ok", "drafts": "ok", "style": "ok",
         "commitments": "ok", "contacts": "ok"}
     on_disk = json.load(open(ls.receipt_path("2026-09-04", "morning")))
     assert on_disk == receipt
@@ -72,7 +72,7 @@ def test_a_step_with_no_input_is_skipped_never_failed(tmp_path, monkeypatch):
     assert calls == ["draft_outcomes.py", "prewarm_graph.py"]
     assert receipt["ok"] is True
     assert {k: v["status"] for k, v in receipt["steps"].items()} == {
-        "knowledge": "skipped", "continuity": "skipped", "drafts": "ok", "commitments": "skipped",
+        "knowledge": "skipped", "continuity": "skipped", "loopcheck": "skipped", "drafts": "ok", "commitments": "skipped",
         "style": "skipped", "granola": "skipped", "contacts": "ok"}
 
 
@@ -190,8 +190,8 @@ def test_the_cli_runs_the_real_writers_end_to_end(tmp_path, monkeypatch):
     This is the run a brief makes on its first quiet day."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     local = _touch(tmp_path, "local.json", json.dumps({
-        "contacts": [{"name": "Sarah Chen", "phones": ["+14155551234"], "emails": ["sarah@example.com"]}],
-        "imessage": [{"handle": "+14155551234", "is_from_me": True, "timestamp": "2026-09-04 09:00:00",
+        "contacts": [{"name": "Sarah Chen", "phones": ["+14155550107"], "emails": ["sarah@example.com"]}],
+        "imessage": [{"handle": "+14155550107", "is_from_me": True, "timestamp": "2026-09-04 09:00:00",
                       "text": "sounds good, sending the deck over tonight", "is_group_chat": False}]}))
     know = _touch(tmp_path, "know.json", json.dumps({"person_updates": [], "company_updates": []}))
     cont = _touch(tmp_path, "cont.json", json.dumps({"today": "2026-09-04", "new_actions": [], "local": {}}))
@@ -217,10 +217,10 @@ def test_learn_grades_drafts_without_rewriting_preferences(tmp_path, monkeypatch
     text = "On my way."
     (events / "drafts.jsonl").write_text(json.dumps({
         "ts": (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"), "channel": "imessage",
-        "identifier": "+14155551234", "text": text}) + "\n")
+        "identifier": "+14155550107", "text": text}) + "\n")
     (events / "queue.jsonl").write_text(json.dumps({
         "ts": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"), "verdict_class": "signal",
-        "event": {"source": "imessage", "id": "sent-1", "handle": "+14155551234",
+        "event": {"source": "imessage", "id": "sent-1", "handle": "+14155550107",
                   "timestamp": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   "text": text, "is_from_me": True}}) + "\n")
     prefs = tmp_path / "preferences.json"
@@ -242,7 +242,7 @@ def test_first_observed_verbatim_send_is_extracted_then_confirmed(tmp_path, monk
     events = tmp_path / "events"
     events.mkdir()
     text = "sounds good, sending the deck over tonight"
-    handle = "+14155551234"
+    handle = "+14155550107"
     sent_at = now - timedelta(hours=1)
     (events / "drafts.jsonl").write_text(json.dumps({
         "ts": (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -274,7 +274,7 @@ def test_previously_graded_verbatim_send_retries_only_style_confirmation(tmp_pat
     now = datetime.now(timezone.utc)
     events = tmp_path / "events"
     events.mkdir()
-    text, handle = "I will send it this afternoon.", "+14155551234"
+    text, handle = "I will send it this afternoon.", "+14155550107"
     draft = {"ts": (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
              "channel": "imessage", "identifier": handle, "text": text}
     (events / "drafts.jsonl").write_text(json.dumps(draft) + "\n")
@@ -321,7 +321,7 @@ def test_required_and_ancillary_phases_merge_one_receipt_without_losing_required
     calls.clear()
     args.phase = 'ancillary'
     receipt = ls.learn(args, run=fake_run)
-    assert calls == ['style_extract.py', 'draft_outcomes.py', 'prewarm_graph.py']
+    assert calls == ['loop_check.py', 'style_extract.py', 'draft_outcomes.py', 'prewarm_graph.py']
     assert not receipt['ok'] and receipt['required_ok']
     assert receipt['steps']['knowledge']['status'] == 'ok'
     assert receipt['steps']['drafts']['status'] == 'failed'

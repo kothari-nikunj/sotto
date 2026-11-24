@@ -24,6 +24,8 @@ def calendar_result(future, classify_error):
         receipt = source_context.source_result('ok' if complete else 'partial', complete=complete,
                                 **observation.get('coverage', {}))
         receipt['calendars'] = observation.get('calendars', [])
+        if observation.get('loop_cancellations'):
+            receipt['loop_cancellations'] = observation['loop_cancellations']
         return rows, receipt, None
     except Exception as error:
         return [], source_context.source_result('unavailable', error=classify_error(error)), f'calendar: {error}'

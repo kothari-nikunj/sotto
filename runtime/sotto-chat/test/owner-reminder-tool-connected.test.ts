@@ -97,7 +97,7 @@ test('original Intentions -> real reminder list across both creation lanes and r
       postPrepared: async request => {sent.push(request.text); return {acceptance: 'accepted', messageId: `ack-${sent.length}`};}});
     const sentence = 'Remind me in an hour to review the cedar packet.';
     await coordinator.receive(inbound('create-natural', sentence), context);
-    assert.equal(step, 3); assert.equal(sent.length, 1); assert.match(sent[0]!, /Reminder set\./);
+    assert.equal(step, 3); assert.equal(sent.length, 1); assert.match(sent[0]!, /Reminder set for /);
     const rows = readFileSync(join(folder, 'receiver/intentions.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
     assert.equal(rows.length, 1); assert.equal(rows[0].created_by, 'owner_tool'); assert.equal(rows[0].action, action);
     assert.equal(rows[0].owner_create.text_hash, journal.db.prepare("SELECT source_text_hash FROM actions WHERE kind='owner_reminder_tool'").get()!.source_text_hash);

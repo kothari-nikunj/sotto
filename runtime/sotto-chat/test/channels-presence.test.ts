@@ -437,7 +437,7 @@ for (const step of ['lookup', 'effect', 'invalid_target', 'provider_unavailable'
  assert.equal(snapshot.stages[0]!.outcome,'error');
  assert.equal(snapshot.stages[0]!.step,step==='effect'?'effect':'lookup');
  assert.equal(snapshot.stages[0]!.error_class,step==='invalid_target'?'target_unavailable':step==='provider_unavailable'?'provider_unavailable':'provider_error');
- assert.equal(lookups,1);assert.equal(reads,step==='effect'?1:0);assert.equal(reactions,0);
+ assert.equal(lookups,step==='effect'?2:1);assert.equal(reads,step==='effect'?1:0);assert.equal(reactions,step==='effect'?1:0);
  assert.doesNotMatch(JSON.stringify(snapshot),/private-token|private.example|secret-stack|owner|thread/);
 });
 
@@ -489,7 +489,7 @@ for (const acceptance of ['before', 'after', 'heart'] as const) {
   feedback.admitted({eventId: 'owner', text: acceptance === 'heart' ? 'thanks' : 'hello'}, 'thread', () => true);
   if (acceptance !== 'after') feedback.accepted({eventId: 'owner'}, 'thread');
   await new Promise(resolve => setTimeout(resolve, 15));
-  assert.deepEqual(calls, ['read']);
+  assert.deepEqual(calls, ['read', acceptance === 'heart' ? '❤️' : '💭']);
   read.resolve(); await new Promise<void>(resolve => setImmediate(resolve));
   feedback.accepted({eventId: 'owner'}, 'thread');
   feedback.accepted({eventId: 'owner'}, 'thread');
@@ -519,7 +519,7 @@ for (const boundary of ['superseded', 'closed', 'rejected'] as const) {
    feedback.admitted({eventId: 'fresh'}, 'thread', () => true); feedback.accepted({eventId: 'fresh'}, 'thread');
   }
   read.resolve(); await new Promise<void>(resolve => setImmediate(resolve));
-  assert.deepEqual(calls, boundary === 'superseded' ? ['read:old', 'read:fresh', 'fresh:💭', 'fresh:✅'] : ['read:old']);
+  assert.deepEqual(calls, boundary === 'superseded' ? ['read:old','old:💭','read:fresh','fresh:💭','fresh:✅'] : ['read:old','old:💭']);
   await feedback.close();
  });
 }
@@ -554,3 +554,39 @@ test('silent accepted work completes feedback once without claiming a reply or r
  const uncertain=new PhotonOwnerFeedback({markRead:async()=>{uncertainCalls.push('read');throw Error('synthetic failure');},addReaction:async()=>{uncertainCalls.push('reaction');}});
  uncertain.admitted({eventId:'unknown'},'thread',()=>true);await flush();uncertain.workAccepted({eventId:'unknown'},'thread');await flush();assert.deepEqual(uncertainCalls,['read']);await uncertain.close();
 });
+
+for (const order of ['read first', 'reaction first', 'read rejected', 'reaction rejected'] as const) {
+  test(`a pending read allows the first tapback but cannot advance completion: ${order}`, async () => {
+    const read = deferred<void>(), reaction = deferred<void>();
+    const calls: string[] = [];
+    const feedback = new PhotonOwnerFeedback(photonFeedbackProvider({fetchMessage:async (threadId:string,id:string) => ({
+      id,threadId,author:{isMe:false},raw:{
+        read:async () => {calls.push('read');await read.promise;if (order==='read rejected') throw Error('unknown read');},
+        react:async (emoji:string) => {
+          calls.push(emoji);
+          if (emoji !== '✅') {await reaction.promise;if (order==='reaction rejected') throw Error('unknown reaction');}
+        },
+      },
+    })} as never), 10);
+    try {
+      feedback.admitted({eventId:'owner',text:'hello'},'thread',()=>true);
+      await new Promise<void>(resolve=>setImmediate(resolve));
+      assert.deepEqual(calls,['read','💭'],'the reaction starts while the read promise is pending');
+      feedback.accepted({eventId:'owner'},'thread');
+      await new Promise(resolve=>setTimeout(resolve,25));
+      if (order.startsWith('reaction')) reaction.resolve();
+      else read.resolve();
+      await new Promise<void>(resolve=>setImmediate(resolve));
+      assert.deepEqual(calls,['read','💭'],'one settled operation cannot authorize an uncertain sibling');
+      read.resolve();reaction.resolve();
+      await new Promise<void>(resolve=>setImmediate(resolve));
+      const rejected=order.endsWith('rejected');
+      assert.deepEqual(calls,rejected?['read','💭']:['read','💭','✅']);
+      const snapshot=feedback.snapshot();
+      assert.ok(snapshot.available);
+      assert.equal(snapshot.uncertain,rejected);
+      assert.deepEqual(snapshot.stages.slice(0,2).map(stage=>[stage.outcome,stage.late_outcome]),
+        [['timeout',order==='read rejected'?'error':'success'],['timeout',order==='reaction rejected'?'error':'success']]);
+    } finally {read.resolve();reaction.resolve();await feedback.close();}
+  });
+}

@@ -43,13 +43,12 @@ Produce the user's morning brief: what needs attention, what you've already hand
    **everyone in today's inputs** — on the calendar, in current threads, in an email you got or
    sent, or attached to an active commitment — plus the identity map and the **company knowledge**
    for today's attendee domains and the packed people's employers.
-2. **Research attendees — ONE batched, grounded pass** (ported from the Mac's `gemini-research.ts`):
+2. **Research attendees — one grounded pipeline**:
    external attendees worth researching (excludes you, same-domain colleagues, known contacts;
    capped at 25), skipping anyone the graph researched in the last 30 days (the same filter
-   `sotto-meeting-prep` uses, so the two share one cache). It batches 5 attendees per grounded call,
-   grounded in real web results (`references/research-prompt.md` documents the original ported
-   prompt), and persists what it found as clearly-sourced, LOW-confidence "Per web search: …"
-   facts. **One rule, global: an external attendee is researched at most once per 30 days, and
+   `sotto-meeting-prep` uses, so the two share one cache).
+   `references/research-prompt.md` describes both research passes. The pipeline uses grounded web results
+   and persists supported durable facts with source and confidence. **One rule, global: an external attendee is researched at most once per 30 days, and
    every research run feeds the graph.** A bounded, read-only X lane adds exact-lookup identity
    only: WRITING an X identity down needs their full name plus the profile agreeing about their
    company/domain; a handle a page published for them rides ONE prep marked UNCONFIRMED; public
@@ -114,7 +113,8 @@ Produce the user's morning brief: what needs attention, what you've already hand
 - First brief (empty graph): the local window widens to 7 days (`read_local(since_hours=168)`); everything else is identical — the composer takes no window, it composes whatever was gathered. Day 2+: the default (24h) is the delta.
 - **The open-items contract:** an open loop earns its own line ONLY when it is **overdue, due within
   24 hours, or already chased without an answer** (`brief_validate.is_urgent` — deterministic, read
-  off the ledger row, never model-judged). Every urgent one appears exactly once — as an ask carrying
+  off the ledger row, never model-judged). An overdue loop you owe that the previous delivered brief
+  already named at the same loop version stays in the count line until the loop changes. Every urgent one appears exactly once — as an ask carrying
   its age, or in Already Handled when today's data shows it resolved. Every OTHER open loop is
   represented by ONE quiet line with a count and “Ask me what's still open” and is worked by the
   proactive nudges, not by the brief. The extraction prompt states it, `brief_validate` measures it,

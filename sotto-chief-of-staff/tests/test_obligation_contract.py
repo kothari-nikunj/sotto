@@ -27,7 +27,7 @@ def data(tmp_path, monkeypatch):
 
 def action(text, **extra):
     return {'type': 'reply', 'channel': 'imessage', 'contactName': 'Maya Chen',
-            'contactIdentifier': '+14155551234', 'contextSummary': text,
+            'contactIdentifier': '+14155550107', 'contextSummary': text,
             'created_at': '2026-09-10 09:00:00', **extra}
 
 
@@ -36,7 +36,7 @@ def rows():
 
 
 def message(**extra):
-    return {'rowid': 42, 'handle': '+14155551234', 'text': 'The signed contract is attached.',
+    return {'rowid': 42, 'handle': '+14155550107', 'text': 'The signed contract is attached.',
             'is_from_me': True, 'timestamp': '2026-09-18 10:00:00', **extra}
 
 
@@ -61,7 +61,7 @@ def resolve(**payload):
 
 def test_two_asks_same_message_and_paraphrase_carry_forward():
     proof = [{'sourceType': 'imessage', 'sourceId': '1', 'snippet': 'Contract and lunch?'}]
-    source = {'rowid': 1, 'handle': '+14155551234', 'text': 'Contract and lunch?',
+    source = {'rowid': 1, 'handle': '+14155550107', 'text': 'Contract and lunch?',
               'is_from_me': False, 'timestamp': '2026-09-10 08:00:00'}
     result = resolve(new_actions=[action('Send the signed contract', evidence=proof),
                                   action('Confirm lunch on Tuesday', evidence=proof,
@@ -193,7 +193,7 @@ def test_mismatched_loop_id_never_mutates_the_other_person():
     resolve(new_actions=[action('Send the signed contract')])
     maya = rows()[0]
     other = action('Confirm the budget', contactName='Noah Kim',
-                   contactIdentifier='+14155559999', loopId=maya['anchor_key'])
+                   contactIdentifier='+14155550116', loopId=maya['anchor_key'])
     resolve(new_actions=[other])
     current = rows()
     assert len(current) == 2
@@ -205,7 +205,7 @@ def test_model_claimed_canonical_id_cannot_redirect_a_different_identifier():
     resolve(new_actions=[action('Send the signed contract')])
     maya = rows()[0]
     resolve(new_actions=[action('Confirm the budget', contactName='Noah Kim',
-                                contactIdentifier='+14155559999',
+                                contactIdentifier='+14155550116',
                                 canonical_id='claimed-maya', loopId=maya['anchor_key'])])
     assert len(rows()) == 2
     assert cr._load_items()[maya['anchor_key']]['summary'] == 'Send the signed contract'
@@ -248,7 +248,7 @@ def test_unsupported_completion_stays_open(mutation):
     elif mutation == 'wrong_quote':
         update['evidence'][0]['snippet'] = 'This was never said'
     elif mutation == 'wrong_person':
-        msg['handle'] = '+14155559999'
+        msg['handle'] = '+14155550116'
     elif mutation == 'wrong_direction':
         msg['is_from_me'] = False
     elif mutation == 'old_message':
@@ -287,7 +287,7 @@ def test_generic_contact_and_age_never_pay_off_obligations():
     msg = message(text='Here are the weekend photos: https://example.test/photos')
     out = cr.resolve({'today': '2026-09-18', 'local': {'imessage': [msg]},
                       'signals': {'replied_thread_ids': ['a'], 'handled': [
-                          {'identifier': '+14155551234', 'channel': 'imessage'}]}}, NOW)
+                          {'identifier': '+14155550107', 'channel': 'imessage'}]}}, NOW)
     assert not out['resolved'] and not out['expired'] and len(out['active']) == 1
 
 
@@ -502,7 +502,7 @@ def test_identity_growth_replay_keeps_terminal_intro_and_distinct_open_meeting()
     sent = message(rowid=902, text='Maya, meet Lee. Lee, meet Maya.')
     assert resolve(loop_updates=[proposal(intro, sent)], local={'imessage':[sent]})['resolved']
     closed = cr._load_items()[intro['anchor_key']].copy()
-    p = kg.PersonFile(name='Maya Chen', canonical_id='c_aaaaaa', identifiers=['+14155551234'])
+    p = kg.PersonFile(name='Maya Chen', canonical_id='c_aaaaaa', identifiers=['+14155550107'])
     path = Path(kg.people_dir()) / 'c_aaaaaa.md'
     path.parent.mkdir(parents=True, exist_ok=True)
     kg.write_person_file(str(path), p)
@@ -522,7 +522,7 @@ def test_identity_growth_keeps_two_flagged_asks_from_one_source_separate():
                action('Confirm lunch on Tuesday', evidence=proof, newObligation=True)]
     resolve(new_actions=actions, local={'imessage':[source]})
     before = {row['anchor_key']: row['origin_key'] for row in rows()}
-    p = kg.PersonFile(name='Maya Chen', canonical_id='c_aaaaaa', identifiers=['+14155551234'])
+    p = kg.PersonFile(name='Maya Chen', canonical_id='c_aaaaaa', identifiers=['+14155550107'])
     path = Path(kg.people_dir()) / 'c_aaaaaa.md'
     path.parent.mkdir(parents=True, exist_ok=True)
     kg.write_person_file(str(path), p)
@@ -539,13 +539,13 @@ def test_identity_alias_never_supplies_missing_person_or_task_authority(boundary
     people = Path(kg.people_dir())
     people.mkdir(parents=True, exist_ok=True)
     p = kg.PersonFile(name='Maya Chen', canonical_id='c_aaaaaa',
-                      identifiers=['+14155551234', 'maya@example.test'])
+                      identifiers=['+14155550107', 'maya@example.test'])
     kg.write_person_file(str(people / 'c_aaaaaa.md'), p)
     other = kg.PersonFile(name='Maya Chen', canonical_id='c_bbbbbb', identifiers=['other@example.test'])
     if boundary == 'ambiguous_identifier':
-        other.identifiers.append('+14155551234')
+        other.identifiers.append('+14155550107')
     kg.write_person_file(str(people / 'c_bbbbbb.md'), other)
-    old = {'action_type':'reply', 'contact_identifier':'+14155551234', 'contact_name':'Maya Chen',
+    old = {'action_type':'reply', 'contact_identifier':'+14155550107', 'contact_name':'Maya Chen',
            'channel':'imessage', 'source_refs':[['imessage','910']]}
     old_key = cr.compute_anchor_key(old)
     incoming = {**old, 'canonical_id':'c_aaaaaa', 'contact_identifier':'maya@example.test'}
@@ -581,7 +581,7 @@ def test_ambiguous_retained_alias_origin_is_held_without_third_row():
     people = Path(kg.people_dir())
     people.mkdir(parents=True, exist_ok=True)
     kg.write_person_file(str(people / 'c_aaaaaa.md'), kg.PersonFile(name='Maya Chen',
-        canonical_id='c_aaaaaa', identifiers=['+14155551234']))
+        canonical_id='c_aaaaaa', identifiers=['+14155550107']))
     resolve(new_actions=[capture], local={'imessage':[source]})
     assert cr._load_items() == before and len(rows()) == 2
 
@@ -600,7 +600,7 @@ def test_shared_request_evidence_after_identity_growth_is_held_without_new_row()
     people = Path(kg.people_dir())
     people.mkdir(parents=True, exist_ok=True)
     kg.write_person_file(str(people/'c_aaaaaa.md'), kg.PersonFile(name='Maya Chen',
-        canonical_id='c_aaaaaa', identifiers=['+14155551234']))
+        canonical_id='c_aaaaaa', identifiers=['+14155550107']))
     resolve(new_actions=[action('Handle the outstanding request', evidence=proof)], local={'imessage':[source]})
     assert cr._load_items() == before
 

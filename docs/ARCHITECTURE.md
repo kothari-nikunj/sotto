@@ -2,8 +2,9 @@
 
 ## Current ownership and operational limits
 
-Ownership and recovery contracts reconciled against main `099c29b8` on November 3.
-The original readiness audit reviewed `7525695c`. The diagram below names existing owners;
+Hot, cold and recovery paths reviewed against main `11ca8895a` on November 16.
+The ownership table below records the current sweep; dated sections retain their narrower evidence.
+The diagram below names existing owners;
 capability presence is not release acceptance. See [runtime capabilities](RUNTIME-CAPABILITIES.md)
 for the supported product boundary and its daily-use/release limits.
 
@@ -42,6 +43,52 @@ The client chooses its own model and can receive private returned context. It ca
 grants for internal Bridge access, writes or Sotto's agent. Old grants do not gain new tool names.
 The Bridge keeps dialing out; hosted clients do not connect directly to the Mac.
 
+## Hot, cold and recovery paths
+
+The hot path starts with an owner message in `runtime/sotto-chat/src/conversation.ts`.
+The operational journal admits input, the coordinator runs the model with accepted context,
+and typed tools call the receiver. The receiver checks current source permission and original
+owner intent before invoking a reader or canonical writer. Replies return through the Node
+transport and its dispatch receipts. A source read can wait on Google or the Bridge. An explicit
+prep or brief request can admit a durable background job and return its receipt.
+
+The cold path starts with receiver schedules, source events or admitted work in
+`_shared/lib/work_queue.py`. Brief and procedure runners gather evidence, compose, validate,
+and save artifacts. Essential learning applies before handoff or enters durable recovery.
+The outbox owns delivery of the saved artifact, and acceptance unlocks delivery effects.
+History traversal and Dreamer run through the existing memory cycle. Weekly pruning runs in
+that cycle and weekly relationship review uses the existing scheduled procedure.
+
+Recovery runs through the same owners. Queue leases recover unfinished computation, saved
+artifacts avoid buying it again, dispatch receipts reconcile contacted sends, and pending effects
+repair bookkeeping after acceptance. Chat cancellation stops new work while exact accepted
+results and uncertain external operations retain their receipts.
+
+### State authority and removal decisions
+
+These rows group related lifecycles. They are not a count of every status field. The earlier November 6 inventory is a historical maintainer audit. This section describes
+the current runtime.
+
+| Mechanism and owner | What the state proves | Disposition |
+| --- | --- | --- |
+| Source intake in `receiver.handle_events`, seen ring and in-memory in-flight keys | A completed input can be acknowledged; a currently running input can still fail. | Keep completed identity and temporary exclusion. Return a retryable response for a batch overlapping in-flight work before admitting any fresh peer. |
+| Chat journal in `runtime/sotto-chat/src/journal/index.ts` | Durable input, current run, selected action, prepared reply and actual dispatch each have separate outcomes. | Keep cancellation and exact action/dispatch receipts. Remove the unused boolean prep-candidate wrapper and duplicate read-request aliases. Reminder and brief rejection handling reuse the tool schemas. |
+| Thread generation and run status in the chat journal | Admission and callback freshness survive interruption and restart. | Retain pending dedicated old-schema, concurrent-callback and rollback proof. Status equivalence alone is insufficient qualification to change persisted fencing. |
+| Accepted conversation in `conversation-memory.ts` and `background-context.ts` | Only admitted input and accepted replies enter recall; exact recent scheduled quotes can provide context under current route and source authority. | Keep derived recall separate from graph facts. The earlier ordinary quoted-background context gap was repaired. |
+| Accepted work in `_shared/lib/work_queue.py` | Which job owns computation, which result is saved, and whether handoff finished. | Keep renewable leases and saved artifacts. A completed calculation can still need delivery. |
+| Outbox in `runtime/trigger-receiver/outbox.py`, Node dispatch and delivery effects | Desired delivery, provider contact/acceptance and post-delivery domain changes. | Keep their separate failure boundaries. An uncertain contacted send remains held for receipt reconciliation. A proven late acceptance clears uncertainty; old accepted routine rows require their retained provider proof before their cursor can advance. |
+| Brief claims, onboarding and routine cursors | A scheduled occurrence was claimed, a welcome remains pending, or an occurrence was durably accepted. | Keep current adoption and recovery checks. Live job status is projected from jobs; the existing slot/wake columns retain final dispositions at prune. Claims alone cannot establish delivery. |
+| Model work and pipeline checkpoints | Paid attempts, started stages and saved validated results. | Keep accounting and replay fences. The legacy `operations.parked` column remains for previous worker compatibility. |
+| History cycle in `_shared/scripts/memory_cycle.py` | Which source pages have been traversed and what remains eligible. | Keep cursors and extraction backoff. Remove the second Dreamer failure/park machine that only ran for injected test curators. |
+| Curation in `_shared/scripts/dreamer.py` | Which exact fact versions were reserved, covered or exhausted, including correction dependencies. | Keep this single curation retry owner and import of existing legacy failure records. Remove the unused candidate revision result. |
+| Obligations, hints and graph facts | What is owed, what evidence suggests completion, and which sourced facts are current. | Keep canonical task/fact writers. Hints remain informational; task closure requires its own evidence or an owner action. |
+| Bridge cursors, source consent and MCP grants | What was acknowledged, what the owner permits and which tools a client may call. | Keep these independent authorities. A source success cannot regrant revoked access. |
+
+This pass removes no durable ledger or receipt store. The remaining large simplifications need
+proof at the old-data and concurrent-caller boundaries before implementation. Receiver hooks and
+cross-language adapters still connect live consumers. The managed pilot launcher compatibility
+remains a separate cut-over with its own volume and rollback qualification.
+
 ## Internal module ownership
 
 The runtime and durable store boundaries above are unchanged by the November 5 structural refactor. Shared leaf modules own rules or mechanics used by several existing workflows; they do not admit work or add stores, retries or providers.
@@ -54,7 +101,7 @@ The runtime and durable store boundaries above are unchanged by the November 5 s
 | `_shared/lib/source_authority.py`, `calendar_cache_contract.py` | Existing pipelines share authenticated live-authority transport; the calendar producer/consumer share their cache protocol. Workflow checkpoints, cache TTL and permission decisions remain separate. |
 | `runtime/trigger-receiver/owner_route_authority.py`, `owner_tool_admission.py` | Existing route/identity authority and original-event tool admission have neutral owners. Each feature retains arguments, review, receipts and its canonical writer. |
 | `runtime/trigger-receiver/owner_endpoint_http.py`, `installed_writers.py` | Bounded HTTP parsing/metadata and immutable installed-writer lookup are separate from domain invocation. The receiver's closed endpoint declarations inject existing dependencies; domain helpers own exceptional output bounds and cleanup diagnostics. |
-| `runtime/sotto-chat/src/tools/owner-contract.ts`, `owner-tool-transport.ts` | Mutation clients share stable identity/options and bounded loopback I/O. Domain clients retain receipt interpretation, exact limits/deadlines and error meaning. Already-aborted requests stop before invoking fetch; no retry is added. |
+| `runtime/sotto-chat/src/tools/owner-contract.ts`, `owner-tool-transport.ts` | Mutation clients share stable identity/options and bounded loopback I/O. Domain clients retain receipt interpretation, exact limits/deadlines and error meaning. Already-aborted requests stop before invoking fetch; no retry is added. Each domain's zod rejection enum is the one list of codes its Python tool may return (`test/owner-rejection-code-contract.test.ts` fails when Python adds a code Node cannot parse, which would leave a no-effect write "unknown"). |
 | `runtime/sotto-chat/src/agent/tool-diagnostics.ts`, `src/tools/google-read-contract.json` | Content-free diagnostic collection/projection is separate from agent orchestration. Node and `adapters/sotto/google_read_contract.py` consume the same finite Google vocabulary; it grants no read or effect authority. |
 | `adapters/sotto/bootstrap_runtime.py` | Managed/self-host bootstrap share exact health-only/environment mechanics while keeping distinct launch envelopes and secret cleanup ordering. |
 | `runtime/local-reader/src/contracts.js`, `tools/descriptor_bundle.py` | The isolated reader shares limits/results without importing its launcher. Runtime/OAuth bundlers share sealing mechanics while retaining distinct schemas. The helper is explicitly included in standalone publication. |
@@ -66,6 +113,7 @@ Optional input adapters remain with `jsonfiles`/`textutil`; live conflict projec
 
 Background proactive/event bundles now enter `compose_notification.py` directly after the existing
 funnel. Fixed context readers and a bounded native writer compose them; no chat-engine turn is involved.
+`notification_context.py` packs whole candidates into the budget after reserving space for the prompt and schema. `notification_layout.py` owns how the chosen nudge reads and the send rule (a draft or something to answer, unless time-critical).
 One primary item is delivered per push; unselected items retain coverage. Scheduling remains a
 question when complete calendar coverage is unproven. Gathering reads the selected readable
 calendars and reports partial failures; notification scheduling remains conservative. `model_work.py` owns durable per-revision
@@ -73,6 +121,11 @@ attempt claims and opaque receipts in `events/model-work.sqlite3`; validated art
 delivery retries. The proxy owns provider call accounting. Stable receiver job IDs distinguish
 retries from later occurrences; dead-worker claims retain unknown spend and allow bounded recovery.
 Notification source dates survive queue release and are displayed outside model-written copy.
+Brief draft offers reuse per-meeting follow-up extracts and the accepted delivery offer ledger.
+The brief carries a proposal and evidence label. The scoped reply reads the exact retained draft
+under current route and source authority, with no new model extraction or external write.
+Saved commitment nudges carry their action due date separately from the latest bound conversation.
+A uniquely linked calendar event can establish fulfillment. Unrelated calendar events cannot supply a meeting conflict.
 Prep offers reuse exact-address mail already in the consented queue/snapshot, plus invitation and
 graph facts; no source fetch or research call is added. Cached exact-address envelopes can supply a missing
 prep name with delivery-time consent. Calendar-change copy comes directly from the detector:
@@ -102,6 +155,9 @@ When source authority is incomplete, chat withholds prior recall and tells the m
 self-contained questions remain answerable. A supplied accepted background message that cannot
 be included also carries an explicit omission instruction. These signals never include withheld
 text, grant tool authority, or restore conversation removed by consent/retention policy.
+An authority read interrupted by the caller keeps its cancellation reason rather than
+reporting a permission change. A verified changed grant still withholds the result;
+matching grants never release an answer after cancellation.
 
 Queued skill status notices retain the admitted real owner chat ID and verified route digest. Receiver admission, enqueue and send each check that binding; source revocation can still permit a content-free failure notice, while source-bearing results require current authority. Accepted sends remain deduplicated, unknown sends remain held, and legacy aliases are never silently rebound. These contracts are locally tested; deployment and live evidence are recorded separately.
 
@@ -128,7 +184,7 @@ another writer without Sotto's provenance, correction and revocation contracts.
 | What source data is currently permitted | receiver source authority, `src/agent/source-authority.ts` | Catalog caching is per turn; each invocation still checks authority. |
 | Whether an external action happened | receiver receipts, Node journal and outbox | A model statement or queued job is not completion; unknown sends are never replayed. |
 | Whether two displayed requests mean the same thing | existing brief critic in `compose_brief.py` | Duplicate names are review hints, not instructions to delete or force a rewrite. |
-| Where a generated action link points | `_attach_tap_links` | Always rebuild from source-checked identifiers; a supplied or cached `tap_link` grants nothing. |
+| Where a generated action link points | `_attach_tap_links` | Always rebuild from source-checked identifiers; a supplied or cached `tap_link` grants nothing. The nudge labels the destination as a call or as a draft in the receiving app. |
 | Whether useful output reached the owner | outbox/provider acceptance, then separate device inspection | Unit tests and readiness are not content or display acceptance. |
 
 The fresh-brief path still has serial extract → critic → conditional revision. The last measured
@@ -149,7 +205,7 @@ failures observed here. This is a scoped code review, not proof of every skill o
 
 Ask restart may reuse an explicitly completed partial persistence receipt only before any answer contact, within the existing staged-artifact retention window and unchanged source/context authority. It reuses the saved research and skips confirmed writes; unknown started stages remain held. Persistence failure still does not block an otherwise useful first answer.
 
-Accepted conversation projection filters completed stable message identities in SQLite before loading message bodies. Owner input, accepted replies and frozen background deliveries have separate checkpoints, so late replies and deferred source groups remain eligible. Session rotation exclusions still use event identities, not a rowid high-water mark.
+Accepted conversation projection filters completed stable message identities in SQLite before loading message bodies. Owner input, accepted replies and frozen background deliveries have separate checkpoints, so late replies and deferred source groups remain eligible. Scheduled catch-up excludes earlier event identities at the original sweep cutoff and rebuilds retained events from the journal.
 
 Accepted reply shortening checks the existing `conversation_memory_excluded` receipt for the
 prior owner event and exact provider thread before loading its reply. Session rotation retires
@@ -161,8 +217,22 @@ Custom agents without projection do not write these receipts and retain the olde
 edit-context boundary, including its equal-timestamp limitation.
 
 Recent quoted scheduled text enters the model through a context-only projection. The journal
-freezes its exact accepted dispatch with route, payload and source revision; the existing session
-and 15-minute bounds apply. A scheduled dispatch must be created strictly after the current
+freezes its exact accepted dispatch with route, payload and source revision; the session bound and
+the delivered windows in `src/tools/delivered-context-policy.json` apply (7 days quoted, 12 hours
+unthreaded; `background-context.ts`). A late receipt cannot renew the provider delivery time or
+restore an unthreaded continuation after the owner has replied. An unthreaded reply also receives up to three other accepted
+scheduled texts sent since the owner's previous message, as labelled context only. Every proved Photon
+text, offers included, carries its composition revision through the outbox after source, body and
+route checks; only fixed notices without source text take the revision current at handoff. A due or missed
+reminder can include earlier source text and receives no new chat-context proof. The
+outbox rechecks current source and route before attaching chat context. Missing or stale proof
+preserves ordinary delivery without model context; legacy dispatches are not upgraded. The
+accepted projection contains text, not the composer’s original messages or source IDs.
+For an immediately preceding accepted gallery, a newly frozen continuation carries only its
+exact receipt identity. The model may request current_gallery; the tool inserts the trusted
+dispatch/message/payload proof and the protected reader resolves that exact retained artifact
+under current source and route checks. It never substitutes the latest eligible artifact.
+Old frozen turns are not upgraded; unrelated messages need not read the gallery. A scheduled dispatch must be created strictly after the current
 session's start. Equal millisecond timestamps cannot prove session ownership and are withheld,
 including a legitimate dispatch created in the exact session-start millisecond. The native
 projection excludes those rows before loading their bodies. The projection does not feed
@@ -178,7 +248,7 @@ the midday digest have their own procedures and share the source, relevance and 
 
 | Stage | Owner | In one sentence |
 |---|---|---|
-| **gather** | [`_shared/scripts/gather_google.py`](../sotto-chief-of-staff/_shared/scripts/gather_google.py) (+ `gather_granola.py`, `_shared/lib/attachments.py`, the Bridge's `read_local`) | Deterministic Python pulls the raw material; no model is involved. Two facts it reads that nothing read before (Sep 2026): the stale-sent lane (`gather_stale_sent` — one `in:sent` search plus one `threads.get` per candidate: is the last word on the thread still yours?) and your own answer to each invite (`normalize_event.my_response`). |
+| **gather** | [`_shared/scripts/gather_google.py`](../sotto-chief-of-staff/_shared/scripts/gather_google.py) (+ `gather_granola.py`, `_shared/lib/attachments.py`, the Bridge's `read_local`) | Deterministic Python pulls the raw material; no model is involved. Two facts it reads that nothing read before (Sep 2026): the stale-sent lane (`gather_stale_sent` — one `in:sent` search plus one `threads.get` per candidate: is the last word on the thread still yours? The exact last sent message stays in that lane as citable waiting-on evidence after the known-correspondent and RSVP filters) and your own answer to each invite (`normalize_event.my_response`). |
 | **compose** | [`_shared/scripts/compose_brief.py`](../sotto-chief-of-staff/_shared/scripts/compose_brief.py) | One Gemini call turns the gathered payload into prose and actions, plus the optional critic/revise pass — unanswered sent threads are candidate evidence for the model, never automatically minted debts. `_rsvp_actions` reflects explicit unanswered invitations that are nearly here. The model's own row for the same thread or event wins. After revision, a deterministic source-backed calendar preview precedes optional loop expansion; the model cannot delete its schedule. |
 | **validate** | [`_shared/lib/brief_validate.py`](../sotto-chief-of-staff/_shared/lib/brief_validate.py) | Checks structure, identifiers and deterministic obligations; findings guide the critic/revision pass. These checks cannot prove every model judgment correct. |
 | **commit essential memory** | [`_shared/scripts/learn_step.py`](../sotto-chief-of-staff/_shared/scripts/learn_step.py) `--phase essential` | Attempts extracted knowledge and continuity writes before handoff. Failed essential writes require admitted durable recovery; if admission also fails, the parent work retries the saved artifact. Presented closures still need exact committed version/evidence. The generation lock prevents replacement from discarding unfinished essential inputs. |
@@ -195,6 +265,13 @@ learning and hashes the exact projected inputs; retries reuse that receipt witho
 
 **The model judges meaning; code governs interruption and action authority.** Native Gemini classifies relevance, and the shared funnel applies cadence, consent, freshness and delivery policy. The Node chat runtime still exercises model discretion during interactive conversation; an adapter boundary cannot guarantee the quality of its replies. The funnel is documented rule by rule in [HOW-SOTTO-DECIDES.md](HOW-SOTTO-DECIDES.md), and
 the seven things that can start a nudge are the producer table at the top of that page.
+
+The shared `timeutil.source_observed_time` owns event-clock interpretation for triage age,
+conversation ordering and delivery eligibility. It prefers the Bridge's explicit UTC instant,
+uses the configured owner zone for older native wall times with UTC as fallback, and leaves
+ambiguous DST hours unknown.
+Delivery effects retain the existing event's optional `timestamp_utc` alongside its display time
+so later-reply checks use the same clock after restart. Event keys and terminal work are unchanged.
 
 Event triage reads retained conversation context once and adds copied rows from the current ingress
 batch before classification. The snapshot's optional inclusion predicate reuses the existing
@@ -332,10 +409,12 @@ against the gathered meeting: its id exists, the supporting quote was copied, th
 claimed owner, and it contains the obligation's action/deliverable words. Ambiguity drops the
 item instead of opening a loop. Exact occurrence identity handles reruns; the model may suggest at
 most one semantic merge, and code accepts it only if that anchor is live and points in the same
-direction. There is no fuzzy-matching subsystem. New source-backed Granola commitments close like
-every other obligation: through a `resolved` loop update that passes the code checks below and that
-the brief's critic reviewed. An explicit user lock remains manual. An ordinary reply, an old
-creation date, or the user's own chase cannot silently erase either.
+direction. For owner promises, the same exact quote must name the owner and prove an introduction,
+booking or callback with the verified counterpart before capture arms one of the three automatic
+signals. Later closure still requires the corresponding source event. Other captured promises
+stay open until manually resolved or supported by a brief update with the critic receipt below.
+An explicit user lock remains manual. An ordinary reply, an old creation date, or the user's own
+chase cannot silently erase either.
 
 The same ledger owns every obligation. Separate asks remain separate rows and the brief groups them
 once per person only when rendering.
@@ -359,24 +438,33 @@ closures.
 `local_snapshot.resolve_effective_local` resolves live/cached local inputs once before the runner's
 knowledge query and continuity pass. Composition and Learn share that consent-filtered view,
 including original per-source observation times; cached messages are never re-stamped as live.
+A failed source read (Bridge `degraded` with empty rows, or a `failed`/`unread` coverage receipt)
+is not an observation: the snapshot and its day archive keep that source's last good rows (within
+the 24-hour reuse bound; Contacts always), and `_source_failed` records the failure time so the
+brief says the source could not be read this run.
 A bounded attended read (the relationship pulse's incremental Bridge refresh) uses
 `local_snapshot.merge_local_unsaved`: the same merge in memory, never replacing the snapshot or its
 day archive with a narrower window.
 Source grants and derived-email dependencies are checked again at consumption and delivery.
 The native daily runner also requests `gather_google --loop-local <effective-local.json>`: the
-Gmail gather's bounded supplemental refresh interleaves exact Gmail threads or verified counterpart
-addresses with direct iMessage handles verified through canonical identity. No name search,
+Gmail gather's bounded supplemental refresh picks exact Gmail threads or verified counterpart
+addresses, direct iMessage handles verified through canonical identity, and observed direct
+WhatsApp chat JIDs (Bridge `get_messages` with `source: "whatsapp"`), by one stateless
+half-day rotation (`loop_context._select`). No name search,
 per-loop model call, or new polling job is used. Gmail group addresses rotate within the shared
 target allowance; the text lane selects direct counterparts only. Snooze, due and rotation days
 use the ledger's configured local day. A WhatsApp JID is never a mail address or an iMessage
-endpoint, and drafts, trash and spam are never evidence. The obligation's origin, channel and
+endpoint, and a phone is never turned into a WhatsApp JID, and drafts, trash and spam are never evidence. The obligation's origin, channel and
 alias dependencies must remain permitted for the read and for consumption of its evidence.
+The original exact iMessage handle and a direct WhatsApp JID can be reread while Gmail is unavailable. Inferred iMessage aliases retain their Gmail dependency. Bridge requires a receiver capability
+that confirms source-specific authorization before it serves the WhatsApp variant.
 
 Text reads run concurrently within the same target, request, message, character and time allowances
 as Gmail. Each selected exact handle supplies at most its newest 24 native messages within the
 native 90-day limit. Only verifiable messages after an original ask and no later than this pass
 are admitted; oversize texts are omitted intact. Their native event timestamps are preserved.
-Supplemental texts render separately as `LOOP_EVIDENCE`, for reviewing existing obligations through
+Supplemental iMessage and WhatsApp texts merge into their own snapshot lanes
+(`loop_context.merge_texts`) and render separately as `LOOP_EVIDENCE`, for reviewing existing obligations through
 the existing critic and resolver. They do not enter ordinary daily grouping, triage, signals,
 ordinary fact/style learning or new-ask/reopen capture. They do not replace the daily snapshot or expand its
 source-wide coverage. The refresh itself never writes task state.
@@ -385,8 +473,7 @@ Complete native Gmail bodies can be reused when this gather's thread inventory p
 selected message is present; a snippet or one message does not prove a whole thread was read.
 This is in-memory reuse only. Archived targeted replies retain a bounded body excerpt and message
 ID in the prompt, so fetched evidence is usable without treating archive status as completion.
-Any Gmail lane hitting quota stops supplemental loop reads; failures preserve earlier successful
-rows. The source receipt remains partial, recording omissions: this bounded sample never proves
+Gmail quota stops supplemental Gmail calls. Exact permitted Mac rereads remain eligible. Both fresh and reused Gmail threads select the six newest eligible messages at the pass cutoff. Failures preserve earlier successful rows. The source receipt remains partial, recording omissions: this bounded sample never proves
 absence of completion or a complete history search. Hosts using MCP dumps retain supplied evidence
 without this native refresh.
 
@@ -526,6 +613,13 @@ remains a live check.
 
 Daily jobs can recover within four hours of their declared time. The separate ten-minute
 wake-folding window describes a currently composing brief, not the lifetime of accepted work.
+For task replies to photo briefs and prep, the renderer supplies the caption and card wording to the existing delivery snapshot. The snapshot retains hashed selectors tied to the accepted gallery.
+
+Requested prep stores the known meeting start with the queue’s feedback route. This timestamp
+survives removal of the composed text and bounds failure notices after restart. For prep and
+timed notices the outbox passes the absolute cutoff to the chat runtime on text and gallery-byte
+requests. The runtime checks it at provider dispatch and returns existing receipts on replay.
+
 Normal brief preparation starts ten minutes early. The outbox's `not_before` holds its completed
 text until the declared time; consent and relevant Calendar facts are checked again before claiming
 the brief marker. A changed context revision permits a fresh composition. A slow essential model
@@ -608,7 +702,10 @@ docs link here.
    loaded Node identity before starting workers or serving requests; scheduled slots wait for the
    current owner activation.
 5. **Running and stopping.** The supervisor watches both process groups and the mount; any child
-   exit, including a clean one, stops the instance so the platform restarts it. On `SIGTERM` it
+   exit, including a clean one, stops the instance so the platform restarts it. Managed steady-state
+   monitoring excludes a foreground platform exec whose ancestry ends outside the PID namespace.
+   Close the shell and let its commands finish before a deploy or stop so shutdown can prove the
+   namespace is empty. On `SIGTERM` the supervisor
    sends the verified Node leader `SIGUSR2`, keeps the receiver available for up to 35 seconds of
    Node cleanup, then stops the rest within a 45-second bound, holding the flock until every owned
    process is reaped.
@@ -632,10 +729,11 @@ The Node half, all under `runtime/sotto-chat/`:
 | Path | Owns |
 |---|---|
 | `src/conversation.ts` | `ConversationCoordinator`: owner-input queue, model turns, acknowledgements and the delayed-outcome wakeup |
+| `src/reply-unconfirmed.ts` | The one notice for an owner answer whose acceptance stayed unknown, which resolves the events it covered |
 | `src/delayed-outcome-policy.ts` | The per-kind table of notice wording, settled statuses and inspection cadence for uncertain owner actions |
 | `src/journal/index.ts` and `src/journal/owner-task-selection.ts` | `OperationalJournal` and its synchronous accepted task-selection repair binding, `operations.sqlite` in Node's state directory: inbound events, runs, actions, prepared replies, dispatches and their attempts, activation evidence |
 | `src/channels/` | Chat SDK intake and sends (`gateway.ts`, `sdk.ts`), Photon and Telegram credentials, presence tapbacks, the Photon text formatter and media hydration |
-| `src/tools/` | Model tools and their receiver clients (the `owner-*` tools), read admission and its shared `read-policy.json`, the closed script runner |
+| `src/tools/` | Model tools and their receiver clients (the `owner-*` tools), read admission and its shared `read-policy.json`, the shared delivered-reply windows `delivered-context-policy.json`, the closed script runner |
 | `src/agent/` | Mastra agent construction (`runtime.ts`), Bridge source tools, source authority, typed Google reads and accepted brief detail |
 | `src/bootstrap/` | The strict config schema (`config.ts`) and process wiring (`main.ts`), including which owner tools each channel gets |
 | `evals/` | The actual-model conversation acceptance runner (`conversation.ts`) over synthetic sources and captured delivery |
@@ -660,7 +758,7 @@ imports the receiver back.
 | `brief_runner.py` | One deterministic daily/first-use procedure in Cloud and receiver-based self-host: durable artifact and inputs, essential knowledge/continuity writes, exact chat text, deferred ancillary learning |
 | `procedure_runner.py` | Shared proactive, digest and relationship-pulse procedures; eligible proactive results use deterministic templates or the bounded direct writer, and reviewed digest coverage advances only after delivery acceptance |
 | `work_queue.py` (shared library) | SQLite ownership of accepted work until output is handed to the outbox; stable input IDs, bounded leases/retries, two worker slots with at most one background worker |
-| `receiver.py` | The HTTP surface (`/health`, `/sotto/trigger`, `/chat/brief`, `/bridge/*`, `/mcp`, `/runtime/*`, `/selfhost/*`, `/cloud/*`, `/pair`, `/setup*`, `/google/*`, `/connect/*`, `/debug/*`; `dashboard.py` owns `/app` and `/api/*`), brief trigger dedup, the system schedule (`crons.json`), the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks |
+| `receiver.py` | The HTTP surface (`/health`, `/sotto/trigger`, `/chat/brief`, `/bridge/*`, `/mcp`, `/client-mcp`, `/client-oauth/*`, `/runtime/*`, `/selfhost/*`, `/cloud/*`, `/pair`, `/setup*`, `/google/*`, `/connect/*`, `/debug/*`; `dashboard.py` owns `/app` and `/api/*`), brief trigger dedup, the system schedule (`crons.json`), the event funnel's dispatch half, the setup wizard page, and every skills-tree subprocess it forks |
 | `adapters/sotto/startup_config.py` | Offline explicit-manifest renderer for strict Node config and a separate receiver URL/token projection. Private bounded input, derived MCP read bearer, cross-field channel/owner binding, explicit Photon first-owner-DM line configuration and atomic no-replace staging; no live credential lookup, consumer startup or readiness change. |
 | `dashboard.py` | The Window: `/app`, `/app/login`, `/static/*`, `/api/*` — sessions, CSRF, CSP, lockout, the JSON API, and every write lever (facts, loops, prefs, cadence, graph, voice, run-now, golden labels). Managed `/app/cloud/start` and `/app/cloud/consume` bind a Cloud grant to the receiver browser before minting a session; Cloud-issued sessions recheck their broker lease at most every 30 seconds. Existing local setup-code sessions remain an independent operator path, and self-host sessions need no Cloud broker. |
 | `cloud_pairing.py` | Managed account/Bridge handoff and device revocation; its control-authenticated dashboard grant endpoint writes the one-use grant into `config/cloud-pairing.sqlite` and checks the Cloud broker before redemption. No setup code or control bearer enters the dashboard handoff URL. |
@@ -672,7 +770,7 @@ imports the receiver back.
 | `runtime_retention.py` | One authenticated loopback call from the receiver's existing retention sweep to the Node chat runtime; it shares the adapter's loopback client and owns no clock or TTL. |
 | `retention.py` | THE table of what the volume keeps and for how long — every TTL, the three policies that apply them, and the guard that keeps the graph, the ledger and the corpus off every rule. Its sibling `retention_paths.py` checks file and lock paths before cleanup. It owns no clock: `receiver._retention_tick` fires it once a local day from the cron thread. **Retention is machinery, not an instruction a run can decline.** |
 | `tzchain.py` (a copy of `sotto-chief-of-staff/_shared/lib/tzchain.py`, placed here by the Dockerfile) | THE timezone chain — `SOTTO_TIMEZONE → TZ → the wizard's config/settings.json → UTC` — resolved by one file in every runtime: the skills import it as a sibling, the receiver and dashboard load it by path (this copy in the image, the original in a checkout). Four hand-mirrored copies drifted on their last rung (server local vs UTC), invisible on Railway and a day off on any other machine after 5pm (Sep 2026). |
-| `relay.py` | The reverse-MCP relay: the Mac long-polls `/bridge/poll` and answers on `/bridge/respond`; the Node chat runtime calls `/mcp` on loopback; no tunnel |
+| `relay.py` | The reverse-MCP relay: the Mac long-polls `/bridge/poll` and answers on `/bridge/respond`; the Node chat runtime calls `/mcp` on loopback, and the receiver refuses `/mcp` and `/chat/brief` from any non-loopback peer even with a valid bearer; no tunnel |
 | `runtime_read_admission.py` | The Python half of the shared read policy: loads `runtime/sotto-chat/src/tools/read-policy.json`, the same data Node's `src/tools/read-admission.ts` uses, and rechecks request, subject and cancellation independently for owner URL reads and skill requests |
 | `runtime_owner_*.py` | The receiver side of each Node owner tool, each behind a private `/runtime/owner-*` route and loaded with `_load_shared_lib`: Calendar moves, Contacts changes, exact-reviewed Gmail drafts and sends, reviewed Mac sends, task tools and the explicit `/loop` writer, reminder commands and tools, routines, preferences, quiet commands, brief / meeting-prep / skill requests, offer replies and owner URL reads. Effects keep their existing writers, queue and receipts |
 | `owner_google_effect.py` | The guard the attended Google effects (Calendar, Contacts, Gmail) share: refusal type, installed Google action module, source-authority and grant check, and the post-acceptance read-back decision |
@@ -684,6 +782,7 @@ imports the receiver back.
 | `telegram_link.py` | The Telegram link engine: validate the bot token, capture the owner from the first private message carrying the pairing phrase, persist the bot/owner record |
 | `visual_delivery.py` | Optional card presentation at the delivery seam; the source text stays authoritative and fixed fallback reasons go into the delivery receipt |
 | `fresh_routines.py` | Owner-approved routine definitions in `runtime/owner-routines.json`; occurrence state stays in the work queue |
+| `client_mcp.py` · `client_mcp_catalog.py` · `client_mcp_backend.py` · `client_mcp_contacts.py` · `client_mcp_audit.py` · `client_oauth.py` | The optional read-only `/client-mcp` surface for external assistants: transport, grants and dispatch; the tool catalog and `read:all` list; the bridge to the production readers, current source authority and the Bridge relay; contact names; the durable metadata-only owner access log; and hosted-client OAuth under `/client-oauth/*`. Grants live in `config/mcp-clients/`. None can send, write or start the agent (see *Client MCP contact names* below) |
 
 The Dockerfile copies seven `_shared/lib` modules into the image's receiver directory, where they
 load as siblings: `tzchain.py`, `work_queue.py`, `routine_cursor.py` (with its NOTICE),
@@ -700,7 +799,10 @@ triage, ledger reads, receiver claims and the dashboard. Those consumers retain 
 module-level names; the dashboard never imports the receiver. `utc_time.py` supplies the same
 UTC epoch formatter to dashboard and calendar-cache records. Skill env-only roots use
 `tzchain.data_root`; `envutil.py` and `jsonfiles.py` own the identical integer-env and optional
-JSON-input policies. Hook-based roots, credential paths, settings policies and differing
+JSON-input policies. `yamlio.py` owns the YAML frontmatter loader for ledger and person files
+(libyaml's safe loader when PyYAML has it, the pure-Python safe loader otherwise). `statmemo.py` lets one process reuse a parsed ledger row or the
+people index only while each file's name, inode, size, mtime and ctime are unchanged and the file was at
+least two seconds old when read; nothing is persisted and other processes are unaffected. Hook-based roots, credential paths, settings policies and differing
 format/parser contracts remain distinct.
 
 The shared writing-style reference asks for ordinary-language outcomes and recovery steps,
@@ -721,11 +823,11 @@ restarting a thread or process does not erase accepted work.
 | Work dispatch (`receiver.start_work_thread`, thread `sotto-work-dispatch`) | every 5s, or the moment a job is admitted or finishes (`_WORK_WAKE`) | Claims due jobs from `events/work.sqlite3` under a fresh per-claim owner and starts one `sotto-work` thread per claim, within the queue's two worker slots |
 | Work execution (`receiver._work_one`, thread `sotto-work`, one per claimed job) | for the life of the job | Runs the declared procedure (or reuses a saved result), saves the exact output, renews the lease once more, hands the text to the outbox, then `finish`es or `fail`s the job for bounded retry. Incoming-event notification writing gets four separate provider recoveries for explicit 429/500/502/503/504 responses, with exponential delay inside its original deadline. `model_work` preserves every call receipt while leaving validation attempts available. Only the declared notification runner's typed exit can request recovery; saved delivery handoffs keep their own limit. Final receipts distinguish queued retries from stopped work. |
 | Work lease (`receiver._work_one.keep_lease`, thread `sotto-work-lease`, one per running job) | every 30s while its job runs | Renews the job's 120s lease; a renewal the queue refuses (the lease was recovered by another claim) ends the keeper, and the worker's own pre-handoff renewal then fails rather than delivering twice |
-| Session archive (`receiver._session_archive_tick`, thread `sotto-session-archive`) | once a local day at the retention sweep slot (3:30 AM), spawned from the cron tick | Rotates the Node runtime's chat sessions through its private loopback API (`runtime_api.archive_sessions`) on its own thread, so one slow call cannot delay the brief window the cron thread is in |
+| Session archive (`receiver._session_archive_tick`, thread `sotto-session-archive`) | from the retention sweep slot (3:30 AM local), one in flight until completion | The private loopback API (`runtime_api.archive_sessions`) rotates at the sweep cutoff and keeps accepted conversation at or after it. The cron tick retries an unavailable runtime or missing completion stamp. The runtime can safely repeat the same cutoff. |
 | Calendar refresh (`calcache.start_refresh_thread`) | `SOTTO_CALENDAR_REFRESH_SECS`, default 900s | Refreshes the snapshot, rewrites `cache/calendar_today.json`, asks `tap_tick()` which meetings just ended, and `change_tick()` what changed about the imminent calendar |
 | Bridge tool re-list (`relay._refresh_tools`, thread `relay-tools-refresh`) | after a Bridge reconnect marks the cached tool list stale; at most one in flight | Re-lists the Bridge's tools in the background with a 20s bound; a failure keeps the last catalog |
 | Self-host first source read (`receiver._maybe_bootstrap_selfhost_source_read`) | from the minute heartbeat while a fresh self-host waits for context; one in flight, backing off from one minute to one hour | Asks the Bridge for `health`, then one consent-aware `read_local` when an eligible context source is enabled, so the first brief can open |
-| Snapshot seed (`receiver._seed_snapshot_from`) | one daemon thread per folded wake-push | Runs `compose_brief.py --seed-snapshot` (subprocess table below) to fold a payload into the local snapshot instead of composing a second brief |
+| Snapshot seed (`receiver._seed_snapshot_from`) | one daemon thread per folded wake-push; the background tick retries payloads under a day old until the seed subprocess confirms the write or reports empty input | Runs `compose_brief.py --seed-snapshot` (subprocess table below) to fold a payload into the local snapshot instead of composing a second brief. The payload is written atomically; a repeat seed is harmless because the snapshot is ordered by each payload's own stamp |
 
 ## Subprocess boundaries
 
@@ -745,7 +847,7 @@ per script name.
 | `receiver._finalize_delivery_effects` (chase/handoff) | `morning-brief/scripts/continuity_resolve.py --finalize-chase` / `--finalize-handoff` | 30s, one immediate retry |
 | `receiver._ack_gmail_events`, after accepted ingest | `event-triage/scripts/poll_gmail.py --ack <ids>` | 30s |
 | receiver Google setup (`_google_connected_uncached`, `exchange_google_code`, `start_google_authorization`, `_derive_google_account_email`) | `adapters/sotto/google_setup.py --check` (30s; 3s on the cached status path) · `--auth-code` · `--auth-url` (60s each) · `adapters/sotto/google_api.py gmail search` (30s, the account-email lookup) | JSON or exit status on stdout |
-| `runtime_knowledge_read` (`/runtime/knowledge-read`) | an inline `python -I -B -c` loader over the canonical knowledge query, with `SOTTO_READ_ONLY=1` | 10s; live Granola and triage-queue reads get 50s and stop when the caller disconnects; output capped at 64 KiB |
+| `runtime_knowledge_read` (`/runtime/knowledge-read`) | an inline `python -I -B -c` loader over the canonical knowledge query, with `SOTTO_READ_ONLY=1` | 10s, reported as `knowledge read timed out` (every other failure stays `knowledge read unavailable`); live Granola and triage-queue reads get 50s and stop when the caller disconnects; output capped at 64 KiB |
 | Node `channels/photon-text-formatter.ts` | a bounded Python child running `chatfmt.to_imessage` | 5s, empty environment, 512 KiB output bound |
 | `dashboard._run_skill_cli` | `_shared/knowledge/knowledge_edit.py` · `master_file.py` · `preferences.py` · `style_extract.py --confirm` · `retune_apply.py keep` · `event-triage/scripts/triage_event.py --promote` (via `receiver.run_promote`) | `{"ok": …}` on stdout, 30s — ONE subprocess policy for the whole write surface, so every dashboard edit rides the identical code path the same instruction typed in chat would |
 | `calcache._run_calendar_gather` | `_shared/scripts/gather_google.py --skip-gmail` | writes legacy event data plus a source-result receipt, 60s; only a complete successful observation replaces the authoritative snapshot |
@@ -829,7 +931,10 @@ setup without deployment-log copying and does not create a web conversation surf
 Everything that crosses a process boundary crosses as a file on the volume. Receiver-owned JSON
 snapshots use `connectors.write_json` (tmp at 0600 → `os.replace`); skill-owned transaction files
 use the same temp-then-replace pattern, and the continuity ledger adds one cross-process lock around
-read/modify/write. JSONL records are append-only and bounded. **"skills" below means the
+read/modify/write. Both transactions (`connectors.json_transaction`, `jsonstore.transaction`) give
+the default only to a MISSING file: a corrupt one is moved to `<file>.corrupt.<unix-ts>` (kept for a
+human; the next transaction starts fresh) and the operation raises; any other read error raises with
+the file untouched. The retention sweep removes set-aside copies after 7 days, and `forget.py --receipts` erases them. A set-aside outbox is said once in the Record. JSONL records are append-only and bounded. **"skills" below means the
 `sotto-chief-of-staff` scripts, running in a different process.**
 
 | File | Writer | Reader |
@@ -841,7 +946,8 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `config/onboarding.json` | receiver `onboarding.py` | receiver first-use tick and scheduled hold |
 | `config/model-lease.json` | adapter `model_lease.py` | receiver renewal heartbeat and operator recovery diagnostics |
 | `config/cloud-pairing.sqlite` | receiver `cloud_pairing.py` | managed Bridge device grants (redemption, authentication, listing and revocation), bootstrap request fingerprints and results, and one-use dashboard grants; dashboard redemption removes the latter, while the Cloud broker owns its account lease |
-| `config/source-state.json` | shared `source_context.py` | consent-aware readers, history learning and authenticated dashboard diagnostics; bounded per-source access status and last extraction counts/timestamp, never source content |
+| `logs/mcp-access-<date>.jsonl` | `client_mcp_audit.py` | Owner Connections page; content-free metadata retained for 30 days |
+| `config/source-state.json` | shared `source_context.py` (and `gmail_poll_health.py` for the receiver's Gmail poll row) | consent-aware readers, history learning and authenticated dashboard diagnostics; bounded per-source access status and last extraction counts/timestamp, plus a `gmail_poll` paused-since row the brief's source note reads; never source content |
 | `knowledge/history-state.json` | `memory_cycle.py` | diagnostics/setup: initial bounds, progress, extraction request latches, legacy Dreamer latch import, per-source history protocol latch and bounded work receipt |
 | `knowledge/dreamer.json` | `dreamer.py` | Schema-versioned fact coverage, bounded attempts, reservation and fair cursor; full-file hashes still guard concurrent writes. Unreadable person files remain untouched and are skipped per scan; canonical filenames retain prior coverage and attempts, while actual deletion still removes their checkpoint. Receipts retain only the unreadable count. Preparation avoids identical checkpoint writes and shares one invalidation-receipt read within each graph-locked scan. Coverage survives request-contract changes (code, prompt, model route); only a `CURATION_VERSION` bump or a changed fact version reopens it, while a contract change gives parked work a fresh bounded try |
 | `knowledge/conflicts.json` | `knowledge_update.consolidate` | `knowledge_query.py` renders unresolved pairs with their source facts and `dreamer.py` treats them as required context — both through `knowledge_update.live_conflict_pairs`, so a pair with an edited or archived side is ignored at once and dropped on the person's next curation. At most three pairs per person and 100 people, the oldest evicted first; capacity never refuses curation |
@@ -860,8 +966,8 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `sotto-home/google_token.json` | `adapters/sotto/google_setup.py` via owner OAuth or Cloud bootstrap (managed receiver UID10001) | private 0600 Google credential on the tenant volume; the shared Google reader and `adapters/sotto/google_api.py` read it through explicit `SOTTO_HOME`; inaccessible to Node UID10000 |
 | `briefs/<date>.<kind>.claim` · `briefs/<date>.<kind>.delivered` | receiver (the `.claim`; and the `.delivered` when the send seam's gate claims it), skills (`brief_marker.py --claim`) | receiver (trigger dedup, the cron-window fold, and the outbox's deliver-once gate — the `.delivered` file's CONTENT is the claiming run's id), skills (`proactive_scan.py`) |
 | `briefs/<date>.<kind>.payload.json` | receiver | skills (`compose_brief.py`) |
-| `briefs/<date>_<kind>.json` | skills | dashboard; consent-aware item feedback |
-| `briefs/<date>.<kind>.named.json` | skills (`compose_brief.py`) | skills (`proactive_scan.py` — which open loops that brief NAMED, so a chase is held only for a genuine double-tell) |
+| `briefs/<date>_<kind>.json` | skills | dashboard and brief composition readback |
+| `briefs/<date>.<kind>.named.json` | receiver outbox (`delivery_effects.finalize`, after provider acceptance of the body) | proactive scan reads named loop IDs and acceptance time; the next brief reads exact overdue loop versions, including across a missed brief |
 | `briefs/<date>.<kind>.learned.json` | skills (`learn_step.py`, phases `essential`, `ancillary`, or legacy `all`) | Receiver diagnostics: per-writer `ok`, `partial`, `skipped`, `queued` or `failed`, bounded per-item dispositions and input hashes; queued work or rejected proposals cannot masquerade as complete learning |
 | `events/model-work.sqlite3` | shared model_work.py | opaque attempt claims and usage; [retention](DATA-FLOW.md#everything-written-to-disk-and-for-how-long) |
 | `events/notification-artifacts/` | `compose_notification.py`, `capture_commitments.py` | validated notification copy plus persisted per-meeting extraction/apply results and bounded lock shards; [retention](DATA-FLOW.md#everything-written-to-disk-and-for-how-long) |
@@ -872,6 +978,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `events/seen.json` | receiver | receiver (idempotency ring — Bridge events, keyed `(source,rowid)`) |
 | `events/gmail_seen.json` | receiver, through `poll_gmail.py --ack` after accepted ingest | skills (`poll_gmail.py`) — version 2 keeps separate inbox/sent fixed query bounds, page cursors and pending page IDs; fetch or receiver failure advances neither lane |
 | `events/loop-reviews.json` | `compose_brief.py` after an explicit positive critic verdict | Shared continuity projection/resolver; at most 512 proposal digests and timestamps, valid for 14 days, pruned on write. No source text; persistent empty lock sidecar |
+| `events/loop-checks.json` | `loop_check.py` (Learn step `loopcheck`, after the ledger merge; reads the Learn `--granola` file for `met` and calls `loop_interactions.py` for direct iMessage reads/reactions), and `closure_pass.py` (called in-process by `triage_event.py` for the owner's own direct message; sets one `you_messaged` note at send time, and refreshes it on a newer direct reply) | `loops_query.py` (chat, MCP, dashboard views), the brief's ledger prompt and Still open lines, and Friday's review (`retune_scan.looks_done`, read-only); one possibly-handled note per open task, keyed by loop version: basis (`you_messaged`, `meeting`, `call`, `sent_to_them`, `met`, `meeting_cancelled`, `dates_passed`, `read_no_reply`, `reacted`), time, consent source and, on a scheduling ask they answered without a question, `replied_since` with the reply source. A date-passed hint requires the current complete Calendar receipt from the brief gather. An iMessage receipt or current reaction is informational, also applies to waiting-on tasks, and is excluded from Friday review and outcome logs. No source text; a note requires consent for all its evidence. Compose binds the new hints and their source dependencies to the same note snapshot. Learn keeps newer notes and honors removals made during its pass. A removed note can be evaluated again on the next pass. Deleted by `forget.py --receipts`; never closes or edits a task |
 | `events/work.sqlite3` | shared `work_queue.py` | receiver workers lease bounded accepted work and retain terminal results |
 | `events/work-inputs/brief-<run>/` | receiver `brief_runner.py` | resumable brief and background learning procedures |
 | `events/learning-diagnostics/brief-<hash>.json` | receiver `brief_runner.py` | bounded rejected-proposal evidence from consented sources only; deleted when its sources are revoked, seven days after first capture, or by `forget.py --receipts`; lock sidecars follow the same window |
@@ -887,7 +994,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `events/owner-meeting-prep-offers.json` | receiver (`runtime_owner_meeting_prep_request.py`) | Detached chat questions bound to the current Calendar occurrence, source revision and owner action; exact accepted dispatch proof activates the existing pending offer. Expired previews are pruned on access; accepted-delivery recovery receipts survive seven days. At most 1,024 unfinished proposals are retained, and the idle file expires under staged-artifact retention. No prep is queued by proposal. |
 | `events/owner-gmail-drafts.json` | receiver (`runtime_owner_gmail_draft_tool.py`, the ONE writer) | receiver (exact-reviewed Gmail save/send previews, approvals and replay receipts); the retention sweep reduces aged terminal records to content-free receipts, while committed typed results still awaiting local learning retain bounded words until repair, for at most one extra retention window (60 days total). Effect identities and consumed-approval tombstones are never age-deleted. |
 | `events/delivery.jsonl` | receiver (the ONE writer) | dashboard (the Record, source `delivery`), skills (`compose_brief.py`) — closing rows carry `usage`, correlated `decision_ids`, and content-free photo/text presentation detail |
-| `events/outbox.json` | `outbox.py` (the ONE writer) | receiver (the retry drain), dashboard (`/api/runs` — the pending/failed line) — one row per message Sotto composed, written BEFORE the first send attempt and flipped to `delivered` only on the channel's ack. Closed rows prune after 7 days, except a terminal row its producer has not reconciled yet (`terminal_reconciled`; e.g. an owner reminder with an unknown send), which stays until it is |
+| `events/outbox.json` | `outbox.py` (the ONE writer) | receiver (the retry drain), brief composition (closure notice reservations), dashboard (`/api/runs` — the pending/failed line) — one row per message Sotto composed, written BEFORE the first send attempt and flipped to `delivered` only on the channel's ack. Closed rows prune after 7 days, except a terminal row its producer has not reconciled yet (`terminal_reconciled`; e.g. an owner reminder with an unknown send), which stays until it is |
 | `events/outbox.json.effects.lock` | `outbox.py` | Empty persistent lock file for post-acceptance and invalidation callbacks; operating-system locks release on process exit |
 | `events/delivery-effects-<run>.json` | shared `delivery_effects.py`, merging procedure contributions transactionally | Receiver result commit and outbox handoff: source/Calendar eligibility, original coverage cutoff, chase/handoff, proactive/intention and offer effects; only delivery-dependent effects activate after provider acceptance |
 | `events/sends.jsonl` | skills (`google_action.py`) | you — one metadata-only line per real-effect **attempt** (send, reply, calendar create/delete/RSVP), allowed or refused, carrying `payload_sha256` so "what did Sotto send?" isn't answered by a prompt's promise |
@@ -897,6 +1004,8 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `cache/research_<date>.json` | skills (`research_attendees.py`) | dashboard (`/api/research` cards), skills (`compose_brief.py` joins it) |
 | `cache/visual-briefs/<id>/*` | shared `visual_brief.py` renderer | receiver gallery delivery; seven-day staged-artifact sweep |
 | `cache/brief-granola.json` | receiver `brief_runner.py` | resumable brief preparation and composition |
+| `cache/brief-window.json` | receiver `brief_runner.py` via `_shared/lib/brief_window.py`, after a composed brief | the next brief's read window (`read_local` hours, `gather_google --catch-up-days`, `compose_brief --window-hours`) |
+| `cache/session_rotation.json` | receiver (`_session_archive_tick`, after a completed rotation) | receiver — today's rotation already happened, so a restart does not rotate again |
 | `cache/update_check.json` | receiver (daily update check — the ONE writer) | receiver (`/setup` line, `/api/overview` banner), skills (`compose_brief.py` update line) |
 | `cache/update_notice.json` | skills (`compose_brief.py`) | skills (`compose_brief.py` — the once-per-version marker) |
 | `connectors/<service>.json` | connectors (OAuth write; `/setup` Disconnect deletes) | skills (`connector_tokens.py`), receiver (presence only) |
@@ -904,7 +1013,7 @@ read/modify/write. JSONL records are append-only and bounded. **"skills" below m
 | `connectors/<service>.error` | skills (the gather; `/setup` Disconnect deletes) | receiver (`/setup` reconnect hint) |
 | `dashboard_sessions.json` · `dashboard_audit.jsonl` | dashboard | dashboard; Cloud-issued session records carry a broker lease and fail closed when its bounded recheck cannot confirm active account/tenant state, while local setup-code sessions keep their own policy |
 | `decks/<view_id>.pdf` · `decks/<view_id>.json` | skills (`docsend_fetch.py` — the pdf is the deck's pages assembled, the json is the read cache that stops a re-ask logging a second view) | you (dashboard `GET /api/decks/<id>.pdf`), skills (cache hits, incl. unattended) |
-| `knowledge/master.md` | `_shared/knowledge/master_file.py` (the ONE writer — user-stated words; chat confirms, dashboard edits shell out to it) | skills (`compose_brief.py`, `compose_meeting_prep.py` — always in the prompt), chat, dashboard (Learned page card) |
+| `knowledge/master.md` | `_shared/knowledge/master_file.py` (the ONE writer — user-stated words; chat confirms, dashboard edits shell out to it) | skills (`compose_brief.py`, `compose_meeting_prep.py`, `compose_notification.py` — always in the prompt), chat, dashboard (Learned page card) |
 | `knowledge/last_local_snapshot.json` | skills (`compose_brief.py`) | skills — the RAW Bridge payload, overwritten each brief and never deleted; its 24h TTL stops reuse, not storage ([DATA-FLOW.md](DATA-FLOW.md)) |
 | `knowledge/snapshots/<date>.json` | skills (`compose_brief.py` — dated archive copy, last write of the day wins, pruned after 60 days) | `tools/build_golden_corpus.py` — the corpus's message history; one live snapshot only holds ~a day |
 | `corpus/<version>/` | `tools/build_golden_corpus.py` (`--out`; refuses to write on a leak), maintainer Labels route (`/app#labels`, absent from main navigation) (`labels.yaml` only — the owner's judgments) | `evals/run_golden.py` (scoring), maintainer Labels route (`/app#labels`, absent from main navigation). CONFIDENTIAL REGARDLESS — never leaves the volume |
@@ -940,6 +1049,10 @@ later dismissal by stable obligation identity. These are review candidates, not 
 or complete historical coverage; missing history remains unknown. Durable delivery runs deduplicate
 proposal observations by run identity. Local and legacy observations lack that identity, so the proof
 report labels their proposal counts as candidate observations that may include repeated invocations.
+Content-free `loop_label` records name each owner decision on a loop (resolved, dismissed,
+retargeted, snooze, keep, or an audited owner add) with the `events/loop-checks.json` hint it had
+just before. `continuity_resolve._persist` writes them through `log_outcome`, after the row is saved;
+`_shared/scripts/loop_label_report.py` reads them read-only to give each hint's precision.
 
 Every row but the last is **one-way**: exactly one writer, and readers that never write. That is the
 property that keeps the two processes from needing a lock.
@@ -984,8 +1097,8 @@ and owner-approved routines (`receiver._fresh_routine_tick` admits each slot as 
 | Ambiguous X identity suggestions | `knowledge/x_link_suggestions.json` | `_shared/scripts/x_connectivity.py`; a weak or already-owned match is proposed here instead of being silently attached |
 | Meeting attendance + Apple Contacts identity | same files | `_shared/scripts/granola_graph.py` (who you sat with) and `_shared/scripts/prewarm_graph.py --sync-contacts` (every email/phone as an identifier, the card's notes + birthday) — both *through* `knowledge_update.apply()` |
 | User-initiated graph edits | same files | `_shared/knowledge/knowledge_edit.py` — which routes *through* `knowledge_update.apply()`, so a dashboard edit and a texted correction are byte-identical |
-| Open loops (the continuity ledger) | `knowledge/continuity/*.md` | `morning-brief/scripts/continuity_resolve.py` owns the locked, atomic write API; brief extraction, `apply_commitments.py`, and user edits in `knowledge_edit.py` all write through it (`ledger_io.py` is the shared read side; `_shared/lib/protected_ledger_io.py` the bounded, descriptor-safe protected read side: whole reads up to 16384 rows / 64 MiB; tolerant reads that skip one bad file for loop nudges, scoped to one anchor for reminders and offer snapshots). `_persist` carries a row's content provenance across bookkeeping-only writes and a `resolve()` pass syncs the ledger directory once before it returns |
-| Optional owner-confirmed standing context (who the user is, the people around them, their priorities and Procedures; included in brief/prep prompts and chat when present, separate from learned people and history; editable on the dashboard's Learned page) | `knowledge/master.md` | `_shared/knowledge/master_file.py` — user-stated words only, chat confirms before writing, dashboard edits shell out to the same CLI; size-capped so "always in context" stays honest |
+| Open loops (the continuity ledger) | `knowledge/continuity/*.md` | `morning-brief/scripts/continuity_resolve.py` owns the locked, atomic write API; brief extraction, `apply_commitments.py`, `loop_check.py` (the three owner-approved automatic closes, row shape in `_shared/lib/signal_closes.py`, which also records the accepted brief that named a close and the owner's reopen; a capture's `deliverable`/`owed_by` fields and its direction check live in `_shared/lib/capture_shape.py`; the phone, handle and email-recipient matching its evidence checks use lives in `_shared/lib/message_match.py`) and user edits in `knowledge_edit.py` all write through it (`ledger_io.py` is the shared read side; `_shared/lib/protected_ledger_io.py` the bounded, descriptor-safe protected read side: whole reads up to 16384 rows / 64 MiB; tolerant reads that skip one bad file for loop nudges, scoped to one anchor for reminders and offer snapshots). `_persist` carries a row's content provenance across bookkeeping-only writes and a `resolve()` pass syncs the ledger directory once before it returns |
+| Optional owner-confirmed standing context (who the user is, the people around them, their priorities and Procedures; included in brief/prep/nudge-writer prompts and chat when present, separate from learned people and history; editable on the dashboard's Learned page) | `knowledge/master.md` | `_shared/knowledge/master_file.py` — user-stated words only, chat confirms before writing, dashboard edits shell out to the same CLI; size-capped so "always in context" stays honest |
 | Stated preferences | `preferences.json` (`explicit` block) | `_shared/scripts/preferences.py` |
 | Writing style | `style.json` | `_shared/scripts/style_extract.py` |
 | Relationship analytics | `knowledge/relationship_state.json` | `relationship-pulse/scripts/relationship_pulse.py`; accepted candidate-offer receipts through `_shared/lib/review_candidates.py` under the same JSON lock |
@@ -1080,6 +1193,13 @@ The company half is why the deep dive is worth its call twice: it is knowledge a
 from that company arrives cold. `company_knowledge()` is its one read side — for the next research
 result reuse locally, and (through `knowledge_query.py`) for the brief's **Company Context** block.
 
+The research batch projects matching source sentences from Parallel citation excerpts into its
+retained rows. Prep composition and persistence recheck those sentences against the input's
+corporate or explicit company domain. Company persistence groups and retries by domain when
+available. The canonical writer prefers a known domain, falls back to a compatible legacy name
+or alias, and creates a separate path for a known namesake. An explicit saved slug still selects
+the owner-edit target. A thin About can only fill an empty current About under the graph lock.
+
 Obligation replay also preserves old task identities when a previously observed email/phone later
 resolves to a canonical contact. Both exact identifiers must uniquely resolve to that same person;
 request evidence/origin ordinal or an explicit task ID still determines the task. Ambiguity holds
@@ -1172,6 +1292,7 @@ values to the replacement fact with `user_edit` protection. Omitted fields suppo
 fact are withdrawn; no prose supplies typed identity. The committed receipt digest covers each
 explicit value and its support. Legacy prose-only receipts retain their original shape.
 `knowledge_correction.py` holds pure state/coverage helpers for the existing graph writers;
+`fact_hygiene.py` holds the one exact-copy and wrong-person rule the fact writer and readers share;
 `runtime_owner_fact_correction.py` validates the receiver arguments. Neither owns file writes.
 
 In attended owner chat, explicit teaching of a new person fact uses `knowledge-edit --op add
@@ -1311,7 +1432,11 @@ the draft skill must resolve the target from the actual thread or contact before
 
 Attended Mac sends use `bridge_send_review` and `bridge_send_confirm` through the private
 owner-command receiver. The exact recipient and body must have an accepted canonical review,
-followed by a separate clear owner yes. The receiver independently validates the saved proposal,
+followed by a separate clear owner yes. Every review-then-yes write (sends, drafts, calendar,
+contacts, routines, tasks including the cleanup "which ones?" repair question, facts) confirms only while that review is still the latest message Sotto
+sent to that destination: a nudge, brief or other reply that started or was retried after the review
+was prepared voids it, even one accepted while the review was still on its way, and Sotto
+must show it again before a yes counts. The receiver independently validates the saved proposal,
 owner/route, source revision and 15-minute age; managed `allow_send` and the Mac's local opt-in
 remain required. The runtime still has only a read bearer for raw `/mcp`: `send_message` is not
 exposed to the model or scheduled skills. The private action lane stores a durable claim before
@@ -1345,6 +1470,7 @@ Historical source-specific purge, dashboard exchange and the iCloud mirror remai
 Photon processing Tapbacks come from the Node runtime (`channels/presence.ts`): a bounded local text match selects 📝 for writing, 🧠 for memory, 🔎 for research/prep, 📅 for calendar requests, or 💭 for general questions. A short standalone thanks keeps ❤️. After an accepted reply the adapter sets ✅ on the original message. Reactions stay scoped to their triggering message. No model call is added. These are best-effort conversational status indicators, never evidence that a draft was saved or an email sent. The transport sends one replacement operation; notification presentation still belongs to Apple Messages.
 
 The model proxy distinguishes a durable pilot allowance stop (`402`, `sotto_budget_exhausted`) from upstream rate limits (`429`). The Node chat runtime answers an allowance stop with its own fixed reply (`conversation.ts`). Failed notification sends remain retryable. The allowance is not reset or increased by this error handling.
+Attended chat can make one tool-free recovery attempt for invalid tool output from a model request that exposed tools, before any tool invocation. This uses the same active turn deadline and rechecks source authority. Once a tool starts, existing receipts and uncertain actions control the outcome. A turn that reaches its own deadline gets a distinct timeout notice through the same delivery receipt.
 For OpenAI-compatible chat, the proxy joins consecutive leading plain-text system messages in their original order before forwarding. It leaves later conversation turns and native requests unchanged; ambiguous leading system content is rejected before provider contact.
 
 Chat receipt eligibility also permits an assistant message’s optional `extra_content.google.thought_signature`, observed in a bounded public synthetic final response. It uses the same exact nested validator as tool-call signatures; only a nonempty signature string is accepted, unknown siblings remain ineligible, and signatures are never stored in usage diagnostics. Future eligible final responses and their assistant continuations can settle from complete receipts. Historical holds remain unchanged.
@@ -1595,7 +1721,10 @@ unfinished batch of up to eight people and 40 supplied facts per person. The exi
 `knowledge/dreamer.json` records semantic fact versions, coverage, bounded attempts, one reservation
 and a fair person cursor. Oldest pending versions advance beyond the leading forty facts;
 bookkeeping-only sightings, confidence and timestamps do not create new work. Owner corrections
-and live conflict endpoints are required context within the same cap; a stored pair whose other side is no longer active is not. Parked required context
+and live conflict endpoints are required context within the same cap. A stored pair whose other
+side is inactive is excluded. Spare slots can include this person's covered summary facts for
+comparison. Those facts alone never schedule work. The worker rechecks the projected fact
+versions before contacting the model. Parked required context
 holds dependent work; it cannot be omitted to make a call fit. Capacity and dependency holds are
 reported separately from reviewed work. Finite eligible backlog makes progress when evidence stops
 changing and calls succeed; this does not promise every pair of facts is compared.
@@ -1646,14 +1775,27 @@ repeatedly replay already learned first pages.
 
 
 
-`usefulness_feedback.py` binds explicit useful/not-useful ratings to retained delivered briefs
-and writes through `log_outcome.py`. Item identity is a hashed positional locator, with a unique
-excerpt required when recording an item rating. `personal_context.py` resolves at most 320
-characters per item from the authorized archive for the latest eight recent examples. Every
-recorded source permission must still be enabled. Missing provenance, a changed/deleted archive
-or revoked source suppresses the excerpt. Offered-draft archives currently lack source provenance,
-so their text is excluded from this reuse. The bounded listing and recording use the same reader. Explicit rules win; ratings never change mutes,
-approval gates or loop state. Silence and legacy draft-dismissal receipts are not negative ratings.
+`usefulness_feedback.py` lists retained provider-accepted briefs and writes explicitly rated versions
+through `log_outcome.py`. `accepted_briefs.py` joins staged artifacts to outbox run IDs. Feedback
+requires a confirmed acceptance and matching normalized delivery-body digest and checks every recorded source permission.
+Requested replay shares the join and retains its own restrictions on offers and directed briefs.
+A date/kind send claim can exist before acceptance. A replacement composition leaves the previously
+accepted brief eligible while the replacement is unconfirmed.
+Among accepted editions, provider-contact time selects the latest brief. Receipt reconciliation
+time cannot promote an earlier send over a newer one. Missing contact evidence withholds feedback.
+
+`personal_context.py` projects ratings only for the current verifiable accepted version of each
+date/kind. A hashed positional locator can recover up to 320 characters of a uniquely identified
+item for up to eight recent examples. Unversioned ratings and ratings that lose their proof remain
+in the ledger until its normal sweep. Offered drafts lack the provenance required for feedback
+reuse. Explicit rules still win, and ratings leave mutes, approval gates and loop state alone.
+
+One accepted event notification sent as Photon text with a selected Gmail message can receive an explicit
+usefulness rating by direct provider reply. Node checks the frozen provider quote against its
+accepted dispatch and passes opaque IDs and hashes. The receiver checks the existing outbox
+acceptance, selected decision and Gmail message reference hash, plus the current route and source
+grant. The existing owner preference action and outcome writer record the rating. Outbox receipts
+carry the proof without retaining another copy of the notification. A later brief can use an explicit rating when the exact original Gmail message is already in its permitted inputs and the accepted receipt still matches. Ratings do not attach to other messages from the same person.
 
 The first-day native-model replay exercises an empty memory directory and frozen invented history,
 including author-verified voice seeding and different completed/pending invitations. Shared
@@ -1676,6 +1818,7 @@ recovery of the separate proxy control state remains an operator launch check.
 `sotto-chief-of-staff/tools/verify.py` is the common credential-free backend/release gate used by
 local shipping, private CI and generated public CI. It includes proxy tests in
 addition to the shared pipeline, receiver, adapters, lint and available publication guards.
+Its Python and Node lanes run concurrently; each shards its main test suite by file (`SHARDS`).
 The proxy and instance base images use the same pinned Python image digest. Cloud and
 self-host share procedures; skills come from the immutable image, not from the volume.
 
@@ -1735,8 +1878,8 @@ single-use browser-bound session protect the callback, which returns to Sotto wi
 page. It does not route through localhost code copy/paste, the Mac Bridge, or a Sotto OAuth broker.
 Existing connected Desktop-client tokens remain valid; another authorization requires replacing
 the client in setup, which setup and the retry page offer without touching an existing token. Boot
-seeds `GOOGLE_OAUTH_CLIENT_JSON` only when no client is saved, never mints a consent URL, and never
-exchanges `GOOGLE_AUTH_CODE` (it only logs a reminder to remove it). Managed boot leaves Google to
+does not seed a client from `GOOGLE_OAUTH_CLIENT_JSON`, never mints a consent URL, and never
+exchanges an authorization code from the environment. Managed boot leaves Google to
 the Cloud broker.
 
 The Mac first-run flow lives in `SetupWizard.swift`: Welcome → Google → Mac sources / Full Disk
@@ -2187,6 +2330,14 @@ The receiver limits each decompressed provider response to 256 KiB before parsin
 JSON result to 64 KiB. A monotonic 15-second work budget and per-request socket timeouts bound the
 normal provider path; this is not a hard wall-clock guarantee when DNS/connect or token refresh stalls.
 
+### Client MCP read fences
+
+`client_mcp_backend._read` checks source authority before and after every read. A Mac read's
+before-check reuses a successful Bridge health probe for up to 30 seconds
+(`receiver._BRIDGE_PROBE_CACHE`, process memory only); the after-read check compares consent
+revisions without a Bridge round trip. The Bridge serves one request at a time, so parallel reads
+no longer queue probes behind each other. See `docs/specs/client-mcp.md`.
+
 ### Client MCP note pages
 
 External `sotto_note_get` uses the existing Bridge `get_note` path with per-request
@@ -2199,6 +2350,27 @@ cache is introduced. The receiver validates native page metadata and retains bef
 source authority and client grant fences. Old Bridges return the existing full-note response
 for receiver-side paging; changing native/legacy cursor format requires a restart. Whole-Mac
 context pages continue through their existing receiver-owned path.
+
+### Client MCP contact names
+
+`client_mcp_catalog.py` holds the client tool catalog (schemas, source readers and the reviewed
+`read:all` list); `client_mcp.py` keeps transport, grants and dispatch and re-exports the catalog.
+The OAuth consent page (`client_oauth.py`) lists today's `read:all` tools by the first sentence of
+each description, says the grant includes read-only tools added later, and states the 30-day limit.
+It offers Allow or Cancel only; which sources are shared is chosen in Sotto Settings.
+
+`client_mcp_contacts.py` adds `<field>_name` to client MCP message, search and Mac context rows
+from the one permitted Mac Contacts card that owns each identifier, using
+`render_local.build_contact_lookup`. It reads the full address book through the existing Bridge
+`read_local` (168 hours, since 48 hours or less returns a touched subset) and holds the lookup in
+process memory for at most 10 minutes per source-authority revision; it writes no file. The same
+module compacts Contacts cards and serves the `query` lookup. A person read that matches no one or
+several people adds `candidates` from `_shared/knowledge/person_candidates.py`. The dedicated
+Mac readers `sotto_calls`, `sotto_reminders` and `sotto_browser_history` wrap the matching
+`sotto_mac_context` sources (`MAC_WRAPPERS`). The optional browser service filter uses the existing
+bounded domain summaries and source grants, and removes unrelated domains and search terms.
+`sotto_contacts` searches Mac Contacts and Google
+Contacts and reports each side separately.
 
 ### Fixed-five profiles
 
@@ -2259,7 +2431,9 @@ hash receipts acknowledge duplicates without repeating observation. They do not 
 restart or authorize re-execution. Event source reservations prevent a busy message store from
 starving other stores. Upload and durable cursor commit are separate failure points; only success
 of both advances the in-memory committed cursor, with generation-scoped receiver deduplication
-covering replay between the two. Native status distinguishes upload and cursor-storage failures.
+covering replay between the two. A batch that overlaps an unfinished receiver request gets
+HTTP 503 so the Bridge keeps its cursor and retries the whole batch. Native status distinguishes
+upload and cursor-storage failures.
 
 
 ### Integrated loop-closure delivery fence
@@ -2324,7 +2498,9 @@ look up runtime delivery receipts** for text-context proofs. Legacy queue-receip
 receiver-held binding and expiry for compatibility. This is not a second conversation-provenance
 boundary. The small read policy data, `runtime/sotto-chat/src/tools/read-policy.json`, is loaded by
 Node's `src/tools/read-admission.ts` and by the receiver's `runtime_read_admission.py`, which
-rechecks request, subject and cancellation on its own; no subject store is added.
+rechecks request, subject and cancellation on its own; no subject store is added. Its sibling
+`delivered-context-policy.json` holds the two delivered-reply windows, loaded the same way by
+`src/background-context.ts` and `runtime_read_admission.py` (for `delivered_tasks.select`).
 External writes keep their existing exact approval and durable receipt checks.
 
 The actual-model conversation runner uses production bootstrap, tools, receiver, worker and outbox
@@ -2398,3 +2574,10 @@ Accepted-agent surfaced diagnostics are attempted before a deferred commit can f
 completion receipts follow the commit. Diagnostics remain best-effort. Single rows keep bounded append/fsync without
 scanning the queue. This is not a permanent consumed-event ledger or a transaction across source
 acknowledgment and the queue; existing ingress completion receipts retain that recovery boundary.
+
+Photon task follow-ups use the existing inbound journal selection and receiver outbox. At handoff to the outbox, delivered_tasks.py captures the visible task references and their ledger versions. A displayed line binds a task only when it names that task's person, or when the delivery was given that exact task version (a nudge's eligibility, a brief's named tasks, or the tasks meeting prep recorded for its attendees in a `prep_tasks_offered` effect) and the line names nobody else; matching words alone never bind. Acceptance binds those references to the provider message, payload digest, route, and source revision. An exact quote marks the delivery `quoted`, so the receiver applies the 7-day threaded window instead of the 12-hour unthreaded one. The resolve_many operation checks the owner’s words against this snapshot and uses the existing ledger writer and replay receipt.
+
+The chat journal records the native Photon event time, entry into Sotto’s gateway callback,
+and insertion of the incoming owner message. These timestamps help locate reply delays.
+Task selection continues to use the frozen delivery receipt. Older journal rows can lack
+the first two timestamps.

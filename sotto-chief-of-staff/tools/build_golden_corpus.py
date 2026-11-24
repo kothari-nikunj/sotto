@@ -71,9 +71,10 @@ DEFAULT_DAYS = 42
 
 def _load_module(rel_path: str, name: str):
     spec = importlib.util.spec_from_file_location(name, os.path.join(PACK, rel_path))
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
+    mod = sys.modules.get(name)  # reuse a loaded copy: a second one orphans its importers
+    if os.path.realpath(getattr(mod, "__file__", None) or "") != os.path.realpath(spec.origin):
+        mod = sys.modules[name] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
     return mod
 
 
@@ -395,7 +396,7 @@ class IdentityMap:
         promises to remove, which is therefore also what alias allocation must never collide with
         and exactly what the leak scan hunts. A name shorter than 4 chars or on the stop-list is
         never a key (a contact called 'Will' would eat the corpus); a multiword name also
-        contributes its first and last tokens (>=3 chars) and its squashed form ('nikunjkothari',
+        contributes its first and last tokens (>=3 chars) and its squashed form ('caseylindgren',
         the shape names take inside URL slugs and social handles)."""
         keys = []
         if len(real) >= 4 and real.lower() not in NAME_STOP:
@@ -574,7 +575,7 @@ def _read_ledger(data_root: str) -> list:
     """The continuity ledger's frontmatter, as the dicts the replay re-seeds from. An unreadable or
     malformed entry is skipped, never guessed at — same posture the ledger's own reader takes."""
     import yaml  # noqa: PLC0415 — a pack dependency (knowledge.py), loaded only where it's used
-    kn = _load_module(os.path.join("_shared", "knowledge", "knowledge.py"), "knowledge")
+    kn = _load_module("_shared/knowledge/knowledge.py", "knowledge")
     out = []
     for path in sorted(glob.glob(os.path.join(data_root, "knowledge", "continuity", "*.md"))):
         try:
@@ -589,7 +590,7 @@ def _read_ledger(data_root: str) -> list:
 
 
 def _read_people(data_root: str) -> list:
-    kn = _load_module(os.path.join("_shared", "knowledge", "knowledge.py"), "knowledge")
+    kn = _load_module("_shared/knowledge/knowledge.py", "knowledge")
     out = []
     for path in sorted(glob.glob(os.path.join(data_root, "knowledge", "people", "*.md"))):
         try:
@@ -597,11 +598,9 @@ def _read_people(data_root: str) -> list:
                 p = kn.parse_person_file(f.read())
         except (OSError, ValueError):
             continue
-        # Relation NAMES ride along: an edge stores the other person's display name, and while
-        # the writer always links an edge to a real file (so that name is normally registered by
-        # this same loop), a hand-edited or hand-imported file can carry a name no file claims.
-        # Registering them here means the text rewriter pseudonymizes that name everywhere it
-        # appears in the corpus, consistently with whoever else shares it.
+        # Relation NAMES ride along: an edge stores the other person's display name, normally a
+        # file this loop registers, but a hand-edited file can carry a name no file claims.
+        # Registering it lets the rewriter pseudonymize it everywhere, consistently.
         out.append({"name": p.name, "identifiers": list(p.identifiers), "company": p.company,
                     "relation_names": [r.name for r in p.relations if r.name]})
     return out

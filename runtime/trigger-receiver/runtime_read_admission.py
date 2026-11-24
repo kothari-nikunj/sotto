@@ -6,10 +6,20 @@ import unicodedata
 
 # Source checkout and packaged image locations; TS compiles this same JSON into dist.
 _base = Path(__file__).resolve().parent.parent
-_paths = (_base / 'sotto-chat/src/tools/read-policy.json',
-          _base / 'runtime/sotto-chat/dist/tools/read-policy.json')
-POLICY = json.loads(next(path for path in _paths if path.is_file()).read_text())
+
+
+def _policy(name):
+    paths = (_base / 'sotto-chat/src/tools' / name, _base / 'runtime/sotto-chat/dist/tools' / name)
+    return json.loads(next(path for path in paths if path.is_file()).read_text())
+
+
+POLICY = _policy('read-policy.json')
 READ_CONTEXT_WINDOW_MS = POLICY['contextWindowMs']
+# Replies to a delivered message: an exact quote lasts while the outbox keeps its receipt (seven days);
+# an unthreaded reply reaches back twelve hours. Neither is read permission.
+_DELIVERED = _policy('delivered-context-policy.json')
+DELIVERED_THREADED_WINDOW_MS = _DELIVERED['threadedWindowMs']
+DELIVERED_UNTHREADED_WINDOW_MS = _DELIVERED['unthreadedWindowMs']
 
 
 def _matches(key, text):
@@ -24,16 +34,12 @@ def owner_read_request(text):
     return not read_cancelled(text) and not _matches('reported', text) and not _matches('personalRecall', text) and _matches('request', text)
 
 
-def contextual_read_request(text):
-    return owner_read_request(text)
-
-
 def explicit_read_reference(text):
     return _matches('reference', text)
 
 
 def prep_research_request(text):
-    return contextual_read_request(text) and explicit_read_reference(text) and not _matches('prepSavedOnly', text)
+    return owner_read_request(text) and explicit_read_reference(text) and not _matches('prepSavedOnly', text)
 
 
 def subject_mention(text, subject):

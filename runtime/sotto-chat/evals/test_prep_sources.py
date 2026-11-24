@@ -104,7 +104,7 @@ def test_worker_gather_requires_connection_then_reaches_native_boundary(tmp_path
     missing=subprocess.run(argv,env=env,text=True,capture_output=True,timeout=20)
     assert missing.returncode!=0 and 'Calendar prep source unavailable' in missing.stderr
     assert not (tmp_path/'source-reads.jsonl').exists()
-    setup=subprocess.run([sys.executable,'-c','from prep_sources import seed_calendar_connection;import sys;seed_calendar_connection(sys.argv[1])',str(home)],
+    setup=subprocess.run([sys.executable,'-c','from prep_sources import seed_google_connection;import sys;seed_google_connection(sys.argv[1], ["https://www.googleapis.com/auth/calendar"])',str(home)],
                          env=env,text=True,capture_output=True,timeout=10)
     assert setup.returncode==0,setup.stderr
     now=datetime.now(timezone.utc)

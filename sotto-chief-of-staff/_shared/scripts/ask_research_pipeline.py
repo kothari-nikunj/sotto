@@ -10,8 +10,11 @@ from datetime import datetime, timezone, timedelta
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import pack_path  # noqa: E402
+pack_path.ensure()  # resolve_person imports knowledge/ lazily
 from source_authority import current_authority  # noqa: E402
 from pipeline_checkpoint import CheckpointStages  # noqa: E402
+from research_contract import project_research_for_answer  # noqa: E402
 
 
 def resolve_person(selector, topic='', *, now=None, snapshot=None):
@@ -191,7 +194,8 @@ def run(pack, selection, question, command, answer, *, authority=current_authori
                 research_path.write_text(json.dumps(research, ensure_ascii=False))
                 persistence = stage('persistence', lambda: persist_command(
                     '--company-only', '--research', research_path))
-                evidence = json.dumps({'research': research, 'persistence': persistence,
+                checked = project_research_for_answer(research, company_selector=selection['company'])
+                evidence = json.dumps({'research': checked, 'persistence': persistence,
                     'identity_coverage': 'Company-only public research; no person was selected or created.'},
                     ensure_ascii=False)
             else:
@@ -218,7 +222,8 @@ def run(pack, selection, question, command, answer, *, authority=current_authori
 
                 persistence = stage('persistence', persist)
                 attendee, knowledge, limitation = checkpoint['identity']
-                evidence = json.dumps({'person_knowledge': knowledge, 'research': research,
+                checked = project_research_for_answer(research, attendee_email=attendee.get('email'))
+                evidence = json.dumps({'person_knowledge': knowledge, 'research': checked,
                     'persistence': persistence, 'identity_coverage': limitation}, ensure_ascii=False)
             if len(evidence.encode()) > 96000:
                 raise RuntimeError('Ask evidence exceeds answer bound')

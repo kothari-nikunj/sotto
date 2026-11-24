@@ -91,7 +91,7 @@ def test_actual_queue_outbox_successor_restart_and_cancel_fence(context, monkeyp
     monthly_cases = {
         'monthly': ('2026-01-01T09:01:00+00:00', 'UTC', 9, 0, '2026-02-01T09:00:00.000000Z'),
         'monthly_year': ('2026-12-01T09:01:00+00:00', 'UTC', 9, 0, '2027-01-01T09:00:00.000000Z'),
-        'monthly_fold': ('2026-11-01T04:31:00+00:00', 'America/Havana', 0, 30, '2026-12-01T05:30:00.000000Z'),
+        'monthly_fold': ('2020-11-01T04:31:00+00:00', 'America/Havana', 0, 30, '2020-12-01T05:30:00.000000Z'),
         'monthly_gap': ('2017-09-01T04:31:00+00:00', 'America/Asuncion', 0, 30, '2017-11-01T03:30:00.000000Z'),
     }
     hourly_cases = {
@@ -149,7 +149,7 @@ def test_actual_queue_outbox_successor_restart_and_cancel_fence(context, monkeyp
     monkeypatch.setattr(rec, '_runtime_source_authority', lambda: {'complete': True, 'revision': '8' * 64})
     monkeypatch.setattr(rec, '_record_delivery', lambda *args, **kwargs: None)
     sent = []
-    def send(*args):
+    def send(*args, **_context):
         sent.append(args)
         return True, '', {'message_id': 'accepted-routine'}
     for name, hook in {'send': send, 'on_delivered': lambda *args: True,

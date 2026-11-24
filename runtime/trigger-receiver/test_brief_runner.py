@@ -14,11 +14,9 @@ PACK = Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff'
 @pytest.mark.parametrize('wrapped', [False, True])
 @pytest.mark.parametrize('fail', [None, 'compose_brief.py', 'learn_step.py'])
 def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, wrapped, kind):
-    payload = tmp_path / 'payload.json'
-    local = {'imessage': [{'text': 'fixture'}]}
+    payload, local = tmp_path / 'payload.json', {'imessage': [{'text': 'fixture'}]}
     payload.write_text(json.dumps({'local_data': local} if wrapped else local))
-    seen = []
-    temp_paths = []
+    seen, temp_paths = [], []
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
 
     def invoke(argv, **kwargs):
@@ -33,7 +31,7 @@ def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, 
         if name == 'gather_google.py':
             path('--gmail-out').write_text('[{"id":"email"}]')
             path('--cal-out').write_text('[]')
-            path('--source-results-out').write_text(json.dumps({'gmail': {'status': 'ok'}, 'calendar': {'status': 'ok', 'complete': True}}))
+            path('--source-results-out').write_text('{"gmail":{"status":"ok"},"calendar":{"status":"ok","complete":true}}')
         if '--out' in argv:
             path('--out').write_text('{}')
         if name == 'select_attendees.py':
@@ -50,8 +48,10 @@ def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, 
                               'loop_updates': [{'loopId': 'fixture', 'status': 'waiting'}]})
         if name == 'learn_step.py':
             assert argv[argv.index('--phase')+1] == 'essential'
-            assert json.loads(path('--continuity').read_text())['new_actions'] == [{'summary': 'fixture debt'}]
-            assert json.loads(path('--continuity').read_text())['loop_updates'] == [{'loopId': 'fixture', 'status': 'waiting'}]
+            saved = json.loads(path('--continuity').read_text())
+            assert saved['new_actions'] == [{'summary': 'fixture debt'}]
+            assert saved['calendar_observation'] == {'status': 'ok', 'complete': True}
+            assert saved['loop_updates'] == [{'loopId': 'fixture', 'status': 'waiting'}]
             assert json.loads(path('--knowledge-out').read_text()) == {'person_updates': []}
             out = json.dumps({'completion': 'complete', 'ok': True, 'steps': {}})
         return SimpleNamespace(returncode=0, stdout=out, stderr='')
@@ -72,7 +72,7 @@ def test_procedure_order_learning_and_failure_gate(tmp_path, monkeypatch, fail, 
             before = list(seen)
             assert brief_runner.run(request) == 'Exact composed brief'
             assert seen == before  # retry reuses the saved artifact and required-write receipt
-    assert all(p.exists() for p in temp_paths)  # durable follow-up owns cleanup
+    assert all(p.exists() for p in temp_paths)  # durable cleanup
 
 
 @pytest.fixture
@@ -103,8 +103,7 @@ def procedure(tmp_path, monkeypatch):
             state['google_args'].append(argv)
             output('--gmail-out', [])
             output('--cal-out', [{'id': 'meeting-1', 'start': '2026-09-08T10:00:00-07:00', '_calendar_primary': True}])
-            output('--source-results-out', {'gmail': {'status': 'ok'},
-                                            'calendar': {'status': 'ok', 'complete': True}})
+            output('--source-results-out', {'gmail': state.get('gmail', {'status': 'ok'}), 'calendar': {'status': 'ok', 'complete': True}})
         elif name == 'gather_granola.py':
             output('--out', {'meetings': [{'id': 'note-1'}]})
         elif '--out' in argv:

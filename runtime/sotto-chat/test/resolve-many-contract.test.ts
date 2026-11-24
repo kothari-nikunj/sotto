@@ -15,12 +15,12 @@ test('numbered completion shares bounded reference and ambiguity cases with the 
 });
 
 test('one explicit owner clause binds each selected current person or exact owner task',()=>{
-  const people=ownerTaskToolArgsSchema.parse({operation:'resolve_many',source_revision:hex,selection_mode:'named_people',items:[item('Tina','t'),item('shimolee','s'),item('Hari','h')]});
+  const people=ownerTaskToolArgsSchema.parse({operation:'resolve_many',source_revision:hex,selection_mode:'named_people',items:[item('Wren','t'),item('ines','s'),item('Theo','h')]});
   assert.equal(people.operation,'resolve_many');
   if(people.operation!=='resolve_many')return;
-  assert.equal(resolveManyOwnerTextMatches(people.items,'Tina shimolee Hari loops are closed. What else is open?',people.selection_mode),true);
-  assert.equal(resolveManyOwnerTextMatches(people.items,'Tina, shimolee, and Hari are sorted. What else is open?',people.selection_mode),true);
-  for(const text of ["Don't close Tina shimolee Hari loops",'Should Tina shimolee Hari loops be closed?','Tina shimolee loops are closed. What else is open?'])
+  assert.equal(resolveManyOwnerTextMatches(people.items,'Wren ines Theo loops are closed. What else is open?',people.selection_mode),true);
+  assert.equal(resolveManyOwnerTextMatches(people.items,'Wren, ines, and Theo are sorted. What else is open?',people.selection_mode),true);
+  for(const text of ["Don't close Wren ines Theo loops",'Should Wren ines Theo loops be closed?','Wren ines loops are closed. What else is open?'])
     assert.equal(resolveManyOwnerTextMatches(people.items,text,people.selection_mode),false);
   const tasks=ownerTaskToolArgsSchema.parse({operation:'resolve_many',source_revision:hex,selection_mode:'owner_tasks',items:[item('Sotto acceptance 11A','a'),item('Sotto acceptance 11B','b')]});
   assert.equal(tasks.operation,'resolve_many');
@@ -28,13 +28,13 @@ test('one explicit owner clause binds each selected current person or exact owne
   assert.equal(resolveManyOwnerTextMatches(tasks.items,'I finished Sotto acceptance 11A and Sotto acceptance 11B; leave Sotto acceptance 11C open.',tasks.selection_mode),true);
   assert.equal(resolveManyOwnerTextMatches(tasks.items,'Sotto acceptance 11A and Sotto acceptance 11B done, Sotto acceptance 11C still open. What’s still open?',tasks.selection_mode),true);
   assert.equal(resolveManyOwnerTextMatches(tasks.items,'I finished Sotto acceptance 11A and Sotto acceptance 11B; leave Sotto acceptance 11A open.',tasks.selection_mode),false);
-  const pair=[item('Tina','t'),item('Hari','h')];
+  const pair=[item('Wren','t'),item('Theo','h')];
   for(const question of ["what’s left?",'what is left?','what remains?'])
-    assert.equal(resolveManyOwnerTextMatches(pair,`Tina and Hari done. ${question}`,'named_people'),true,question);
-  assert.equal(resolveManyOwnerTextMatches(pair,'Tina and Hari done — what’s left?','named_people'),true);
-  assert.equal(resolveManyOwnerTextMatches(pair,"Tina done. Hari is still open. what’s left?",'named_people'),false);
-  assert.equal(resolveManyOwnerTextMatches(pair,"Tina done; Hari is still open — what’s left?",'named_people'),false);
-  for(const text of ['Tina is done. Hari is pending.','Tina is done; remind me to call Hari.','Tina is sorted, but I need to call Hari.','Tina and Hari are open, Other is done.','Finished Tina and calling Hari tomorrow','finished Tina and Hari is still pending','Tina needs a call; Hari is done'])
+    assert.equal(resolveManyOwnerTextMatches(pair,`Wren and Theo done. ${question}`,'named_people'),true,question);
+  assert.equal(resolveManyOwnerTextMatches(pair,'Wren and Theo done — what’s left?','named_people'),true);
+  assert.equal(resolveManyOwnerTextMatches(pair,"Wren done. Theo is still open. what’s left?",'named_people'),false);
+  assert.equal(resolveManyOwnerTextMatches(pair,"Wren done; Theo is still open — what’s left?",'named_people'),false);
+  for(const text of ['Wren is done. Theo is pending.','Wren is done; remind me to call Theo.','Wren is sorted, but I need to call Theo.','Wren and Theo are open, Other is done.','Finished Wren and calling Theo tomorrow','finished Wren and Theo is still pending','Wren needs a call; Theo is done'])
     assert.equal(resolveManyOwnerTextMatches(pair,text,'named_people'),false,text);
   assert.equal(resolveManyOwnerTextMatches(tasks.items,'I might finish Sotto acceptance 11A and Sotto acceptance 11B.',tasks.selection_mode),false);
 });
@@ -49,7 +49,7 @@ test('numbered completion and direct completion retain distinct receipt shapes',
 
 test('multi-loop refusals explain each held reason without exposing internal codes',()=>{
   const args=ownerTaskToolArgsSchema.parse({operation:'resolve_many',source_revision:hex,selection_mode:'named_people',
-    items:[item('Tina','t'),item('Hari','h'),item('Alex','a'),item('Dana','d')]});
+    items:[item('Wren','t'),item('Theo','h'),item('Alex','a'),item('Dana','d')]});
   const receipt=ownerTaskToolReceiptSchema.parse({version:1,status:'committed',operation:'resolve_many',
     action_id:hex,event_id:hex,payload_hash:hex,args_hash:hex,outcome:'partial',items:[
       {index:1,action:'resolve',anchor_key:'t',status:'refused',reason:'target_changed'},
@@ -60,8 +60,8 @@ test('multi-loop refusals explain each held reason without exposing internal cod
   assert.equal(args.operation,'resolve_many');assert.equal(receipt.operation,'resolve_many');
   if(args.operation!=='resolve_many'||receipt.operation!=='resolve_many')return;
   assert.equal(resolveManyAcknowledgement(receipt,args),[
-    'Tina: This one changed since I checked.',
-    'Hari: I couldn’t tell which one you meant.',
+    'Wren: This one changed since I checked.',
+    'Theo: I couldn’t tell which one you meant.',
     'Alex: I can’t check this right now.',
     'Dana: I couldn’t confirm what you wanted changed.',
   ].join('\n'));

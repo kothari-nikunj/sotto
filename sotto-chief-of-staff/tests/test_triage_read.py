@@ -32,9 +32,9 @@ def transport(monkeypatch):
     monkeypatch.setattr(triage.sources, 'allowed', lambda source: True)
     monkeypatch.setattr(triage.sources, 'consent_receipt_readable', lambda: True)
     local = {'source_status': {'imessage': 'ok', 'whatsapp': 'ok', 'contacts': 'ok'},
-             'contacts': [{'name': 'Dana', 'phones': ['+12069994970']}],
-             'imessage': [{'handle': '+12069994970', 'text': 'can you send it?', 'is_from_me': False, 'timestamp': '2026-10-06T09:00'},
-                          {'handle': '+18885551234', 'text': 'your code', 'is_from_me': False, 'timestamp': '2026-10-06T09:00'}],
+             'contacts': [{'name': 'Dana', 'phones': ['+12065550143']}],
+             'imessage': [{'handle': '+12065550143', 'text': 'can you send it?', 'is_from_me': False, 'timestamp': '2026-10-06T09:00'},
+                          {'handle': '+18885550100', 'text': 'your code', 'is_from_me': False, 'timestamp': '2026-10-06T09:00'}],
              'whatsapp': []}
     def bridge(name, args):
         assert name == 'read_local' and args == {'since_hours': 72}

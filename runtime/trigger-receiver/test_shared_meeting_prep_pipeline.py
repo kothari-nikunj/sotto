@@ -623,8 +623,8 @@ def test_focused_worker_supplies_direct_conversation_to_writer_but_not_research(
     import compose_meeting_prep as composer
     request = 'Context. ' * 50 + 'Please test the profile at https://example.test and tell me what broke.'
     monkeypatch.setattr(source_context, 'read_local', lambda _: {'contacts': [], 'contact_index': [
-        {'display_name': 'Dana', 'identifiers': ['dana@outside.com', '+14155551234']}], 'imessage': [
-        {'handle': '+14155551234', 'text': request, 'timestamp': datetime.now(timezone.utc).isoformat()}]})
+        {'display_name': 'Dana', 'identifiers': ['dana@outside.com', '+14155550107']}], 'imessage': [
+        {'handle': '+14155550107', 'text': request, 'timestamp': datetime.now(timezone.utc).isoformat()}]})
     research_context = []
     def capture(script, *args, **kwargs):
         if script.endswith('research_attendees.py'):

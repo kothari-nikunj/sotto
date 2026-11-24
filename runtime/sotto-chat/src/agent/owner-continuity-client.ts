@@ -1,3 +1,4 @@
+import type { BriefDetailSelector } from './brief-detail.js';
 import {isGoogleReadFailureStage,isGoogleReadHttpStatus,isGoogleReadFailurePhase,googleReadPhaseMatches,type GoogleReadFailureStage,type GoogleReadFailureDetails} from './google-read-diagnostic.js';
 /** Private receiver transport shared by bounded owner-scoped read projections. */
 export interface OwnerContinuityClientOptions { bridgeUrl: string; readBearer: string; fetch?: typeof fetch }
@@ -58,9 +59,7 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal, onLateValue?: (v
 export async function readOwnerContinuityJson(options: OwnerContinuityClientOptions,
                                               route: OwnerContinuityRoute,
                                               body: { include_parked: boolean } | Record<string, never> |
-                                                { artifact_id: string; offset: number; limit: number } |
-                                                { latest: true; offset: number; limit: number } |
-                                                { date?: string; query?: string; kind?: 'brief'|'prep'; offset: 0; limit: number } |
+                                                BriefDetailSelector |
                                                 { operation: string; arguments: Record<string, unknown>; source_revision: string } |
                                                 { operation: 'master_file'; arguments: {argv: ['get']}; source_revision: null },
                                               callerSignal?: AbortSignal): Promise<unknown> {

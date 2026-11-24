@@ -30,7 +30,7 @@ export const contactsPreviewSchema=z.object({version:z.literal(1),status:z.liter
 export type ContactsPreview=z.infer<typeof contactsPreviewSchema>;
 export const contactsReceiptSchema=z.object({version:z.literal(1),status:z.literal('committed'),action_id:hex,event_id:hex,payload_hash:hex,args_hash:hex,outcome:z.object({operation:z.enum(['create','update','delete']),status:z.enum(['created','updated','deleted']),resource_name:contactResourceSchema,review_hash:hex}).strict()}).strict().refine(r=>r.outcome.status===({create:'created',update:'updated',delete:'deleted'} as const)[r.outcome.operation]);
 export type ContactsReceipt=z.infer<typeof contactsReceiptSchema>;
-export const contactsRejectionSchema=z.enum(['authority_changed','contacts_permission_unavailable','invalid_target','target_changed','review_unavailable','event_conflict']);
+export const contactsRejectionSchema=z.enum(['authority_changed','contacts_permission_unavailable','permission_unavailable','invalid_target','target_changed','review_unavailable','event_conflict']);
 export type ContactsRejection=z.infer<typeof contactsRejectionSchema>;
 export function contactsReviewHash(review:z.infer<typeof contactsReviewSchema>):string {const {review_hash,...rest}=review;return createHash('sha256').update(contactsCanonical(rest)).digest('hex');}
 export function validContactsReview(p:ContactsPreview):boolean{return contactsReviewHash(p.review)===p.review.review_hash;}

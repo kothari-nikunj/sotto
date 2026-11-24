@@ -54,7 +54,7 @@ Choose **Other setup options → Self-host Sotto** in Bridge.
    prepares the fresh volume and starts Sotto. Keep Bridge open during preparation. Resume
    observes saved operations without repeating an uncertain create or a second initializer.
 5. **Connect this Mac**, grant **Full Disk Access**, and return to Bridge. This grant is required
-   before source choices and cannot be skipped. Review sources, then **Save & Connect**.
+   before source choices and cannot be skipped. Review sources, then choose **Continue** to save them.
 6. Open your conversation and send an owner hello. Check the real reply and first brief on your
    device. **Connect Google** opens your server's private setup page when you want Gmail or
    Calendar; that consent is separate from the Google AI model key.
@@ -279,7 +279,7 @@ never auto-sends**:
   7am; the two paths coordinate so you never get a double).
 - **Real-time nudges** — new messages and calls stream from your Mac within seconds and go through a
   strict triage funnel; only the genuinely interruption-worthy (a real ask from someone you know, a
-  missed call) becomes a nudge — **with a reply drafted in your voice, one tap to send**. Everything
+  missed call) becomes a nudge — **with a reply drafted in your voice**. Message links open drafts for review. Call links open the dialer. Everything
   quieter waits for an adaptive **12:30 catch-up digest** (silent on light days) or the next brief.
   If your Mac was offline for hours, the backlog drains silently — no barrage of stale pings.
 - **Scheduled watchers** — a mostly-silent check every ~15 min for time-sensitive items (a meeting
@@ -297,11 +297,12 @@ override by design, and on the supervised image these schedules always run; thei
 The **[RAILWAY.md](RAILWAY.md) troubleshooting table** covers the common ones: setup link says
 `localhost`, no reply on iMessage (send from the exact owner phone in your config), briefs
 never arrive (`/debug/brief-log`), Google dying after a week (consent
-screen left in Testing — step 3②.3). **Replies feel stale, or Sotto starts echoing a delivered brief
+screen left in Testing — tile ②, step 3). **Replies feel stale, or Sotto starts echoing a delivered brief
 back at you:** send **`/new`** in the chat — it starts a fresh session on the latest persona.
 Sessions also rotate nightly; `/new` is the one you control. **Uninstalling the Mac app:** quit Sotto Bridge from its menu-bar
 icon, drag `/Applications/Sotto Bridge.app` to the Trash, and remove its Full Disk Access entry in
-System Settings → Privacy & Security. That's everything — it keeps no other state on the Mac.
+System Settings → Privacy & Security. The login item, Keychain token and local state files remain;
+the [uninstall guide](docs/UNINSTALL.md) removes those too.
 
 **On a managed Mac (ThreatLocker, CrowdStrike, Jamf, …):** endpoint security will get in the way
 twice, and the symptoms look nothing alike. If the app is killed at launch, its *execution* is

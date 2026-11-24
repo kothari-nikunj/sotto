@@ -94,7 +94,7 @@ def test_imessage_draft_and_research_are_readable_and_idempotent():
 def test_imessage_keeps_urls_and_words_and_full_handled_recap():
     raw = '*Already Handled*\n\nJamie — replied.\n\nAlex — passed.\n\n*Filtered*\n\n2 newsletters'
     out = cf.compact_handled(cf.to_imessage(raw))
-    assert 'Already Handled\n• Jamie - replied.\n• Alex - passed.\n\nFiltered' in out
+    assert 'Already Handled\n\n• Jamie - replied.\n• Alex - passed.\n\nFiltered' in out
     assert cf.compact_handled(cf.to_imessage(out)) == out
     plain = 'https://example.com/some_page_here?q=a_b_c\n2 * 3 = 6\nunknown_identifier'
     assert cf.to_imessage(plain) == plain
@@ -120,7 +120,7 @@ SAMPLE = """## Needs Attention Now
 
 ---
 
-Reply here: sms:+14155551234
+Reply here: sms:+14155550107
 More: https://example.com/thread/42
 """
 
@@ -150,7 +150,7 @@ def test_markers_stripped_and_rules_dropped():
 
 def test_deep_link_lines_survive_verbatim():
     out = cf.to_chat(SAMPLE)
-    assert "sms:+14155551234" in out
+    assert "sms:+14155550107" in out
     assert "https://example.com/thread/42" in out
 
 
@@ -158,7 +158,7 @@ def test_idempotent_running_twice_changes_nothing():
     once = cf.to_chat(SAMPLE)
     assert cf.to_chat(once) == once
     # already-chat-formatted producer output (single-asterisk headers/bold) also passes untouched
-    chat = "*Waiting on you*\n- *Sarah Chen (Acme)* — waiting 5 days for reply\nsms:+14155551234"
+    chat = "*Waiting on you*\n- *Sarah Chen (Acme)* — waiting 5 days for reply\nsms:+14155550107"
     assert cf.to_chat(chat) == chat.replace(" — ", " - ")
 
 
@@ -193,3 +193,12 @@ def test_handled_compaction_stops_before_deterministic_sections():
     assert '\nStill open\nDana:' in out
     assert '\nWeekly review\nKeep it' in out
     assert '• Still open' not in out
+
+
+def test_imessage_keeps_the_blank_line_between_a_heading_and_its_list():
+    # Nov 16, 2026: a list's heading, entries and closing lines arrived as one block on the phone.
+    raw = 'From saved commitments.\n\n**Follow-ups**\n\n- **Ellen Kim** — Asked about the podcast.\n\n- **Nora Ali** — Asked for samples.\n\n2 other items are on your list.'
+    out = cf.to_imessage(raw)
+    assert out == ('From saved commitments.\n\nFollow-ups\n\n• Ellen Kim - Asked about the podcast.\n'
+                   '• Nora Ali - Asked for samples.\n\n2 other items are on your list.')
+    assert cf.to_imessage(out) == out

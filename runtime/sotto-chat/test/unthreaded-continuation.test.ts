@@ -15,6 +15,7 @@ const context = {threadId: 'thread', destination: 'owner', lineKey: 'line'};
 function setup() {
   const folder = mkdtempSync(join(tmpdir(), 'sotto-continuation-'));
   const journal = new OperationalJournal(join(folder, 'journal.sqlite'));
+  journal.db.exec("CREATE TABLE memory_sessions (provider_thread TEXT PRIMARY KEY,memory_thread TEXT NOT NULL,created_at INTEGER NOT NULL); INSERT INTO memory_sessions VALUES('thread','first',1)");
   return {journal, folder, close: () => {journal.close(); rmSync(folder, {recursive: true, force: true});}};
 }
 function accepted(journal: OperationalJournal, id = 'offer', native = true) {
@@ -238,7 +239,6 @@ test('complete provider proof recovers delayed prep without settling historical 
     const event=journal.admitInbound({eventId:inbound.eventId,accountKey:'account',lineKey:'line',threadKey:'thread',channel:'photon',sender:'owner',
       payload:JSON.stringify({inbound,context}),continuation:{routeDigest:digest,providerSentAtMs:at}}).event;
     assert.equal(journal.continuationArgs(String(event.id)),null,'uncertain local ordering still refuses');
-    assert.equal(journal.hasPrepContinuationCandidate(String(event.id),digest),true);
     assert.deepEqual(journal.prepContinuationCandidate(String(event.id),digest),{providerSentAtMs:stamp});
     const proof=precedingPrepMessage({messages:[
       {guid:'prep-provider',isFromMe:true,dateCreated:new Date(stamp)},
@@ -250,7 +250,9 @@ test('complete provider proof recovers delayed prep without settling historical 
     assert.deepEqual({...journal.getDispatch('historical-unknown')!},unknownBefore);
     assert.deepEqual(journal.db.prepare('SELECT * FROM dispatch_attempts WHERE dispatch_id=?').all('historical-unknown'),attemptsBefore);
     assert.equal(READ_CONTEXT_WINDOW_MS,15*60_000);
-    assert.equal(journal.acceptedBackgroundMessage(String(event.id),stamp-2),undefined,'effect selector does not restore old model context');
+    // The 15-minute read window still bounds read admission; delivered context uses its own 12-hour window.
+    assert.equal(journal.acceptedBackgroundMessage(String(event.id),stamp-2,READ_CONTEXT_WINDOW_MS),undefined,'effect selector does not restore old read context');
+    assert.equal(journal.acceptedBackgroundMessage(String(event.id),stamp-2)?.dispatchId,'fresh-prep','a 61-minute-old delivery is still context');
     assert.equal(journal.db.prepare('SELECT count(*) AS n FROM actions').get()!.n,0,'selector alone grants no action');
   } finally {close();}
 });
@@ -270,7 +272,7 @@ test('provider rescue age boundary and the selected dispatch own uncertainty rem
       journal.beginDispatch('old-unknown');journal.settleDispatch('old-unknown',1,'unknown');
       if(mode==='own-unknown')journal.db.prepare("INSERT INTO dispatch_attempts(dispatch_id,number,status,started_at) VALUES('offer',2,'unknown',?)").run(sent-1);
       const event=admit(journal,'fresh-yes',at);
-      assert.equal(journal.hasPrepContinuationCandidate(String(event.id),digest),age<PREP_OFFER_MAX_AGE_MS,mode);
+      assert.equal(journal.prepContinuationCandidate(String(event.id),digest) !== null,age<PREP_OFFER_MAX_AGE_MS,mode);
       journal.freezeProviderContinuation(String(event.id),digest,at,{messageId:'offer-provider',sentAtMs:sent});
       assert.equal(Boolean(journal.continuationArgs(String(event.id))),mode==='fresh-edge',mode);
       assert.equal(journal.getDispatch('old-unknown')!.status,'unknown');
@@ -291,5 +293,72 @@ test('candidate without native time retains the original 15-minute provider fall
     const candidate=journal.prepContinuationCandidate(String(event.id),digest);
     assert.deepEqual(candidate,{});
     assert.equal(prepContinuationWindowStart(at,candidate!.providerSentAtMs),at-15*60_000);
+  } finally {close();}
+});
+
+test('task completion binds only the accepted message frozen for this reply', async () => {
+  const {deliveredTaskDispatch} = await import('../src/background-context.js');
+  const {resolveManyOwnerTextMatches} = await import('../src/tools/owner-task-tool-contract.js');
+  const {journal,close} = setup();
+  try {
+    accepted(journal, 'f'.repeat(16));
+    const event = admit(journal);
+    journal.db.prepare('UPDATE inbound_events SET received_at=300 WHERE id=?').run(String(event.id));
+    const selected = deliveredTaskDispatch(journal, String(event.id));
+    assert.equal(selected?.dispatch_id, 'f'.repeat(16));
+    assert.equal(selected?.route_digest, digest);
+    accepted(journal, 'b'.repeat(16));
+    assert.deepEqual(deliveredTaskDispatch(journal, String(event.id)), selected);
+    const matches = (owner:string, names:string[]) => resolveManyOwnerTextMatches(
+      names.map(name => ({name, correction:name})), owner, 'delivered');
+    assert.ok(matches('Redirect done. Close ryan as well', ['Redirect','ryan']));
+    assert.ok(matches('Done', ['Done']));
+    assert.ok(matches('I sent the deck.', ['deck']));
+    assert.ok(matches('I sent a contract.', ['contract']));
+    assert.ok(matches('I sent an invoice.', ['invoice']));
+    assert.equal(matches('I sent a signed contract.', ['signed contract']), false);
+    assert.equal(matches('I sent a signed contract.', ['contract']), false);
+    assert.equal(matches('Redirect done. Leave ryan open.', ['Redirect','ryan']), false);
+    assert.equal(matches('Done?', ['Done']), false);
+  } finally { close(); }
+});
+
+test('the chat task tool supplies the frozen dispatch to the writer and reuses its receipt', async () => {
+  const {createOwnerTaskTools} = await import('../src/tools/owner-task-tool.js');
+  const {createOwnerTaskToolClient} = await import('../src/tools/owner-task-tool-client.js');
+  const {RequestContext} = await import('@mastra/core/request-context');
+  const {stableActionIdentity} = await import('../src/tools/action-gate.js');
+  const {journal,close} = setup();
+  const id='a'.repeat(16), revision='b'.repeat(64);
+  const identity={tenant_id:'tenant',account_id:'account',owner_id:'owner',line_key:'line',channel:'photon' as const,
+    route_mode:'fixed' as const,route_id:'thread',target:'photon' as const,project_fingerprint:'c'.repeat(64)};
+  const sourceAuthority={read:async()=>({version:2 as const,complete:true,revision,bridge_sources:[],google_sources:[]})};
+  let writes=0;
+  const client=createOwnerTaskToolClient({identity,bearer:'d'.repeat(64),bridgeUrl:'http://127.0.0.1:1/mcp',fetch:async (_url,init)=>{
+    const body=JSON.parse(String(init?.body));
+    assert.equal(body.operation,'apply');
+    assert.equal(body.args.delivery.dispatch_id,id);
+    assert.equal(body.args.delivery.message_id,id+'-provider');
+    assert.deepEqual(body.args.items,[{name:'Done',correction:'Done'}]);
+    writes++;
+    return Response.json({version:1,status:'committed',event_id:body.event_id,action_id:body.action_id,payload_hash:body.payload_hash,
+      args_hash:stableActionIdentity(body.event_id,'owner_loop_tool',body.args).payloadHash,operation:'resolve_many',outcome:'complete',
+      items:[{index:1,action:'resolve',status:'applied',anchor_key:'party-review',post_digest:revision,loop_status:'resolved',label:'Party spreadsheet review'}]});
+  }});
+  try {
+    accepted(journal,id);
+    const event=journal.admitInbound({eventId:input.eventId,accountKey:'account',lineKey:'line',threadKey:'thread',channel:'photon',sender:'owner',
+      payload:JSON.stringify({inbound:{...input,text:'Done'},context}),continuation:{routeDigest:digest,providerSentAtMs:stamp+1000}}).event;
+    journal.db.prepare('UPDATE inbound_events SET received_at=300 WHERE id=?').run(String(event.id));
+    journal.startRun({eventId:String(event.id),runId:'run'});
+    const tool=createOwnerTaskTools({client,journal:()=>journal,sourceAuthority}).owner_task_resolve_many;
+    const requestContext=new RequestContext();
+    for(const [key,value] of Object.entries({runId:'run',ownerRequestKey:event.id,mode:'chat',allowOwnerTask:true,sourceRevision:revision}))
+      requestContext.set(key,value);
+    const invoke=()=>tool.execute!({selection_mode:'delivered',items:[{name:'Done',correction:'Done'}]}, {requestContext} as never);
+    const first=await invoke();
+    assert.ok(first && typeof first==='object' && 'status' in first && first.status==='recorded');
+    assert.deepEqual(await invoke(),first);
+    assert.equal(writes,1);
   } finally {close();}
 });

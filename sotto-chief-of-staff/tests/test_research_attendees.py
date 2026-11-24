@@ -51,11 +51,11 @@ def test_dedup_cap_and_batching(monkeypatch):
 # ── Pass A upgrades: company fallback + comms context + grounding discipline ──────────────────────
 
 def test_profile_prompt_domain_hint_and_company_fallback():
-    p = ra._build_prompt([{"name": "Nelson Rojas", "email": "nelson@cobalt-research.com"},
-                          {"name": "sam", "email": "sam@rasyn.ai"},
+    p = ra._build_prompt([{"name": "Nelson Rojas", "email": "nelson@cobalt-research.example"},
+                          {"name": "sam", "email": "sam@rasyn.example"},
                           {"name": "Jo Free", "email": "jo@yahoo.com"}])
-    assert "(corporate domain cobalt-research.com — research the company too)" in p
-    assert "(use domain rasyn.ai to identify company)" in p          # no last name → identify company
+    assert "(corporate domain cobalt-research.example — research the company too)" in p
+    assert "(use domain rasyn.example to identify company)" in p          # no last name → identify company
     # freemail: no company hint (yahoo, because the public-repo secrets guard flags g-mail addresses)
     assert "jo@yahoo.com>" in p and "yahoo.com to identify" not in p
     assert "company_summary" in p and "Degrade person → company → nothing" in p
@@ -312,14 +312,14 @@ def test_main_writes_out_file_and_truncates_stale(tmp_path, monkeypatch, capsys)
 def test_matches_focus_one_rule():
     # '@' in the argument → exact email; otherwise a case-insensitive substring of the name or of
     # the email's local part.
-    assert ra.matches_focus("spencer", "Spencer Kim", "spencer.kim@commenda.io")
-    assert ra.matches_focus("KIM", "Spencer Kim", "s.kim@commenda.io")
-    assert ra.matches_focus("s.kim", "Someone Else", "s.kim@commenda.io")     # local part
-    assert ra.matches_focus("spencer.kim@commenda.io", "Spencer Kim", "spencer.kim@commenda.io")
-    assert not ra.matches_focus("spencer@other.com", "Spencer Kim", "spencer.kim@commenda.io")
-    assert not ra.matches_focus("dana", "Spencer Kim", "spencer.kim@commenda.io")
-    assert not ra.matches_focus("", "Spencer Kim", "spencer.kim@commenda.io")
-    assert not ra.matches_focus("commenda.io", "Spencer Kim", "spencer.kim@commenda.io")  # domain ≠ local
+    assert ra.matches_focus("rowan", "Rowan Pike", "rowan.pike@larkspur.example")
+    assert ra.matches_focus("PIKE", "Rowan Pike", "r.pike@larkspur.example")
+    assert ra.matches_focus("r.pike", "Someone Else", "r.pike@larkspur.example")     # local part
+    assert ra.matches_focus("rowan.pike@larkspur.example", "Rowan Pike", "rowan.pike@larkspur.example")
+    assert not ra.matches_focus("rowan@other.com", "Rowan Pike", "rowan.pike@larkspur.example")
+    assert not ra.matches_focus("dana", "Rowan Pike", "rowan.pike@larkspur.example")
+    assert not ra.matches_focus("", "Rowan Pike", "rowan.pike@larkspur.example")
+    assert not ra.matches_focus("larkspur.example", "Rowan Pike", "rowan.pike@larkspur.example")  # domain ≠ local
 
 
 def test_focus_prompt_excludes_private_context_and_company_memory():
@@ -333,10 +333,10 @@ def test_focus_prompt_excludes_private_context_and_company_memory():
 
 
 def test_focus_prompt_covers_company_founder_traction_market_and_honesty():
-    p = ra._build_focus_prompt({"name": "Spencer Kim", "email": "spencer@commenda.io"})
+    p = ra._build_focus_prompt({"name": "Rowan Pike", "email": "rowan@larkspur.example"})
     assert "Focus Person (the ONLY person to research here)" in p
-    assert "(company domain commenda.io — that is the company to research)" in p
-    assert "Already known: CEO at Commenda" not in p
+    assert "(company domain larkspur.example — that is the company to research)" in p
+    assert "Already known: CEO at Larkspur" not in p
     for field in ("builds:", "founder_story:", "traction:", "market:"):
         assert field in p
     assert 'Choose additional searches to answer material gaps' in p  # scope follows the meeting
@@ -353,9 +353,9 @@ def test_focus_prompt_covers_company_founder_traction_market_and_honesty():
 
 def test_postfilter_focus_drops_unsourced_traction_and_empty_fields():
     out = ra._postfilter_focus({"company_deep": {
-        "company": "Commenda",
-        "builds": [f"Product area {i}" for i in range(7)] + ["", "  "],
-        "founder_story": "  ",
+        "company": "Larkspur",
+        "builds": ["Larkspur is certified."] + [f"Product area {i}" for i in range(7)],
+        "founder_story": "Larkspur received SunSpec certification.",
         "traction": ["Series A led by Ridgeline, June 2026 (https://tc.com/a)",
                      "Allegedly at $4M ARR",                       # no URL → dropped
                      "Launched the filing API (https://c.io/blog)"],
@@ -363,14 +363,13 @@ def test_postfilter_focus_drops_unsourced_traction_and_empty_fields():
     }})["company_deep"]
     assert out["builds"] == [f"Product area {i}" for i in range(5)]         # capped at 5, blanks gone
     assert "founder_story" not in out                                       # empty field never renders
-    assert out["traction"] == ["Series A led by Ridgeline, June 2026 (https://tc.com/a)",
-                               "Launched the filing API (https://c.io/blog)"]
+    assert "traction" not in out  # A URL alone supplies no company or claim evidence.
     assert out["market"] == "Displaces the EOR incumbents."
-    assert out["company"] == "Commenda"
+    assert out["company"] == "Larkspur"
 
 
 def test_postfilter_focus_company_name_alone_is_not_a_deep_dive():
-    assert ra._postfilter_focus({"company_deep": {"company": "Commenda"}}) == {}
+    assert ra._postfilter_focus({"company_deep": {"company": "Larkspur"}}) == {}
     assert ra._postfilter_focus({"company_deep": {}}) == {}
     assert ra._postfilter_focus({}) == {}
 
@@ -380,7 +379,7 @@ def _stub_passes(monkeypatch):
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.setattr(ra, "_research_batch",
                         lambda batch, key:
-                        [{"email": a["email"], "title": "CEO", "company": "Commenda",
+                        [{"email": a["email"], "title": "CEO", "company": "Larkspur",
                           "relevance": [], "summary": "bio"} for a in batch])
     monkeypatch.setattr(ra, "_deep_batch", lambda batch, key: [])
 
@@ -391,34 +390,34 @@ def test_focus_merges_company_deep_onto_that_one_attendee(monkeypatch):
 
     def fake_focus(attendee, key):
         calls.append(attendee["email"])
-        return [{"email": "WRONG@echo.com",                # model echoed a different key…
-                 "company_deep": {"company": "Commenda", "builds": ["Global tax filing"],
+        return [{"email": "WRONG@echo.test",                # model echoed a different key…
+                 "company_deep": {"company": "Larkspur", "builds": ["Global tax filing"],
                                   "founder_story": "Built it after a misfiled quarter.",
                                   "traction": ["Series A, June 2026 (https://tc.com/a)",
                                                "unsourced claim"],
                                   "market": "Post-EOR shift."}}]
     monkeypatch.setattr(ra, "_focus_batch", fake_focus)
-    people = [{"name": "Spencer Kim", "email": "spencer@commenda.io", "known": "CEO at Commenda"},
+    people = [{"name": "Rowan Pike", "email": "rowan@larkspur.example", "known": "CEO at Larkspur"},
               {"name": "Dana Roe", "email": "dana@acme.com"}]
-    out = ra.research(people, "ctx", focus="spencer")["attendees"]
-    assert calls == ["spencer@commenda.io"]      # ONE call, for ONE person
-    spencer, dana = out
+    out = ra.research(people, "ctx", focus="rowan")["attendees"]
+    assert calls == ["rowan@larkspur.example"]      # ONE call, for ONE person
+    rowan, dana = out
     # …but the join key is the TARGET's email, so a deep dive can never land on someone else.
-    assert spencer["email"] == "spencer@commenda.io" and spencer["company"] == "Commenda"
-    assert spencer["company_deep"]["builds"] == ["Global tax filing"]
-    assert spencer["company_deep"]["traction"] == ["Series A, June 2026 (https://tc.com/a)"]
+    assert rowan["email"] == "rowan@larkspur.example" and rowan["company"] == "Larkspur"
+    assert rowan["company_deep"]["builds"] == ["Global tax filing"]
+    assert "traction" not in rowan["company_deep"]
     assert "company_deep" not in dana                                  # nobody else gets one
-    assert not any(a["email"] == "wrong@echo.com" for a in out)
+    assert not any(a["email"] == "wrong@echo.test" for a in out)
 
 
 def test_focus_no_match_and_deep_disabled_fire_no_extra_call(monkeypatch):
     _stub_passes(monkeypatch)
     calls = []
     monkeypatch.setattr(ra, "_focus_batch", lambda *a, **k: calls.append(1) or [])
-    ra.research([{"name": "Dana Roe", "email": "dana@acme.com"}], "", focus="spencer")
+    ra.research([{"name": "Dana Roe", "email": "dana@acme.com"}], "", focus="rowan")
     assert calls == []                                                # no match → sweep only
     monkeypatch.setenv("SOTTO_RESEARCH_DEEP", "0")
-    ra.research([{"name": "Spencer Kim", "email": "spencer@commenda.io"}], "", focus="spencer")
+    ra.research([{"name": "Rowan Pike", "email": "rowan@larkspur.example"}], "", focus="rowan")
     assert calls == []                                                # the knob kills it too
 
 
@@ -428,8 +427,8 @@ def test_focus_call_failure_never_kills_the_rest(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("focus pass exploded")
     monkeypatch.setattr(ra, "_focus_batch", boom)
-    out = ra.research([{"name": "Spencer Kim", "email": "spencer@commenda.io"}], "", focus="spencer")
-    assert [a["email"] for a in out["attendees"]] == ["spencer@commenda.io"]
+    out = ra.research([{"name": "Rowan Pike", "email": "rowan@larkspur.example"}], "", focus="rowan")
+    assert [a["email"] for a in out["attendees"]] == ["rowan@larkspur.example"]
     assert "company_deep" not in out["attendees"][0]
 
 
@@ -439,12 +438,12 @@ def test_cli_focus_flag_reaches_research(tmp_path, monkeypatch, capsys):
                         lambda att, ctx, comms=None, focus="": seen.update(focus=focus) or
                         {"attendees": []})
     att = tmp_path / "in.json"
-    att.write_text(json.dumps([{"name": "Spencer Kim", "email": "spencer@commenda.io"}]))
+    att.write_text(json.dumps([{"name": "Rowan Pike", "email": "rowan@larkspur.example"}]))
     monkeypatch.setattr("sys.argv", ["research_attendees.py", "--attendees", str(att),
-                                     "--out", str(tmp_path / "o.json"), "--focus", "Spencer"])
+                                     "--out", str(tmp_path / "o.json"), "--focus", "Rowan"])
     ra.main()
     capsys.readouterr()
-    assert seen["focus"] == "Spencer"
+    assert seen["focus"] == "Rowan"
 
 
 # ── Dashboard persistence hook: $SOTTO_DATA/cache/research_<local-date>.json ─────────────────────
@@ -589,11 +588,11 @@ def test_deep_by_default_never_fans_out_across_matching_people(monkeypatch):
     monkeypatch.setattr(ra, "_focus_batch",
                         lambda attendee, key:
                         calls.append(attendee["email"]) or [])
-    people = [{"name": "Spencer Kim", "email": "spencer@commenda.io"},
-              {"name": "Spencer Ruiz", "email": "spencer@other.com"},
+    people = [{"name": "Rowan Pike", "email": "rowan@larkspur.example"},
+              {"name": "Rowan Ruiz", "email": "rowan@other.com"},
               {"name": "Dana Roe", "email": "dana@acme.com"}]
-    ra.research(people, "ctx", focus="spencer")
-    assert calls == ["spencer@commenda.io"]        # one target, one call — not one per match
+    ra.research(people, "ctx", focus="rowan")
+    assert calls == ["rowan@larkspur.example"]        # one target, one call — not one per match
 
 
 # ── The ad-hoc lane: research the user ASKS for must be researchable, and must land ──────────────
@@ -658,18 +657,37 @@ def test_company_uses_original_grounded_batch_without_person(tmp_path, monkeypat
     novelty, calls = [], []
     import knowledge_update as ku
     monkeypatch.setattr(ku, "company_knowledge", lambda **kwargs: novelty.append(kwargs) or {})
+    official = "Cedar Labs launched clinic scheduling."
+    member = "Cedar Labs (cedar.example) is a contributing member."
+    overclaim = "Cedar Labs (cedar.example) is certified for clinic scheduling."
+    certified = "Cedar Labs (cedar.example) is certified for version 2 clinic data exchange only."
+    namesake = "Cedar Labs (cedar.test) is certified for telescope tracking."
+    url = "https://directory.test/cedar?group=members#member"
+    home = "https://cedar.example/news"
+    issuer = "https://certifier.test/certificates/cedar"
+    claims = [f"{text} ({source})" for text, source in (
+        (overclaim, url), (namesake, url), (member, url), (official, home), (certified, issuer))]
+    grounding = [{"field": "companies.0", "citations": [
+        {"url": url, "excerpts": [member, namesake]},
+        {"url": home, "excerpts": [official]},
+        {"url": issuer, "excerpts": [certified]},
+    ]}]
     def grounded(prompt, schema, timeout, fallback):
         calls.append(prompt)
         assert schema is ra.COMPANY_SCHEMA
         assert "owner-supplied domain cedar.example" in prompt
         assert "Owner-corrected baseline" not in prompt and ra.NO_UNSOURCED_NUMBERS in prompt
         assert "## Focus Person" not in prompt and "email:" not in prompt
-        return {"companies": [{"identity_status": "identified", "domain": "invented.example",
-            "email": "invented@cedar.example", "company_deep": {"company": "Cedar Labs",
-            "builds": ["Scheduling tools"], "traction": ["Unsourced", "Launch (https://cedar.example/news)"]}}]}, "fixture"
+        return {
+            "companies": [{"identity_status": "identified", "domain": "cedar.test",
+                "email": "invented@cedar.test", "traction_sources": {url: [overclaim]},
+                "company_deep": {"company": "Cedar Labs", "builds": ["Scheduling tools"], "traction": claims}}],
+            "_provider_grounding": grounding,
+        }, "parallel"
     monkeypatch.setattr(ra.wr, "deep_research", grounded)
     expected = {"companies": [{"company_deep": {"company": "Cedar Labs", "builds": ["Scheduling tools"],
-        "traction": ["Launch (https://cedar.example/news)"]}, "domain": "cedar.example"}]}
+        "traction": [f"{member} ({url})", f"{official} ({home})", f"{certified} ({issuer})"]},
+        "domain": "cedar.example", "traction_sources": {url: [member], home: [official], issuer: [certified]}}]}
     assert ra.research_company("Cedar.Example") == expected
     assert ra.research_company("Cedar.Example") == expected
     assert len(calls) == 1

@@ -203,6 +203,17 @@ def _dependencies(fid, person, pairs):
     return required
 
 
+def _include_covered_summary(person, pairs, rows, supplied):
+    # Compare new work against the person's existing summary in leftover slots.
+    for fid in person.summary_refs[:4]:
+        if not isinstance(fid, str) or fid in supplied or not rows.get(fid, {}).get('covered'):
+            continue
+        required = _dependencies(fid, person, pairs)
+        if (len(supplied | required) <= DREAM_FACTS
+                and all(k in supplied or rows.get(k, {}).get('covered') for k in required)):
+            supplied.update(required)
+
+
 @contextmanager
 def _preparation_state(path):
     with jsonstore.lock(path):
@@ -264,6 +275,7 @@ def prepare(legacy_failure=None):
                         supplied.update(required)
                     if not work:
                         continue
+                    _include_covered_summary(person, pairs, rows, supplied)
                     facts = {fid: {'text': person.facts[fid].text, 'source': person.facts[fid].source,
                                    'ref': person.facts[fid].source_ref,
                                    'refs': sorted(person.facts[fid].evidence_refs),
@@ -277,9 +289,7 @@ def prepare(legacy_failure=None):
                                            json.dumps(pairs, sort_keys=True).encode()).hexdigest()})
                     if len(candidates) == DREAM_PEOPLE:
                         break
-    pending = [(p['id'], p['semantic']) for p in candidates]
     return {'candidates': candidates, 'request_revision': contract,
-            'candidate_revision': hashlib.sha256(json.dumps(pending, sort_keys=True).encode()).hexdigest(),
             'parked': parked, 'blocked_dependency': blocked, 'context_capacity': capacity,
             'legacy_unmapped': bool(state.get('legacy_unmapped')), **diagnostics}
 
@@ -304,7 +314,9 @@ def _reserve(prepared, diagnostics=None):
                     return None
                 rows = state['facts'].get(cid, {})
                 for fid, version in candidate['versions'].items():
-                    if (fid not in rows or rows[fid]['version'] != version
+                    fact = people[cid][1].facts.get(fid)
+                    if (not fact or fact.status != 'active' or ku.curation_fact_version(fact) != version
+                            or fid not in rows or rows[fid]['version'] != version
                             or (not rows[fid]['covered'] and rows[fid]['attempts'] >= ATTEMPTS)):
                         return None
                 work[cid] = {fid: candidate['versions'][fid] for fid in candidate['work']}

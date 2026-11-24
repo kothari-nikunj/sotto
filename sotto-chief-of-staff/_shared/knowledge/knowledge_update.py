@@ -24,11 +24,8 @@ asymmetric pieces — because the two dupe shapes have opposite risk profiles:
      identity bug (two different John Smiths in one file), and conflicting identifiers — two
      emails, or two phones, with nothing in common — suppress the suggestion entirely. A pair the
      user dismissed is tombstoned in the same file's `dismissed` list and never suggested again.
-  3. COMPANIES GET PREVENTION, NOT REPAIR. Company files are keyed by name-slug with aliases and a
-     domain stored but never consulted, so "YC" and "Y Combinator" became two files. Resolution now
-     consults both (alias-slug and domain) before minting a new file, every company_name seen is
-     recorded as an alias, and compose_brief feeds the known company names back into the extraction
-     prompt so the model stops free-forming the name in the first place.
+  3. COMPANY WRITES resolve a known domain before considering names or aliases. Conflicting
+     domains get separate files, and every company name seen becomes an alias.
 
 COMPANY RESEARCH lands here too, through the SAME `company_updates` lane — there is no second
 company writer. `about` is the company's durable identity paragraph (what it builds, who founded
@@ -72,7 +69,9 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # knowledge.py, its sibling
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+import pack_path; pack_path.ensure()  # noqa: E402 -- render_local, imported lazily, reads scripts/
 import knowledge as kg  # noqa: E402
+import fact_hygiene  # noqa: E402
 import knowledge_correction as correction  # noqa: E402
 import jsonstore  # noqa: E402 — THE lock for the volume (see apply)
 from source_corrections import MAX_RECEIPTS  # noqa: E402
@@ -122,7 +121,7 @@ def _person_head(path: str) -> "kg.PersonFile":
             if line.startswith("facts:") or line.rstrip("\r\n") == "---":
                 break
             lines.append(line)
-    fm = yaml.safe_load("".join(lines)) or {}
+    fm = kg.yaml_load("".join(lines)) or {}
     if not isinstance(fm, dict):
         return kg.PersonFile()
     return kg.PersonFile(canonical_id=fm.get("canonical_id", ""), name=fm.get("name", ""),
@@ -513,11 +512,10 @@ def _s(v) -> str:
 # ── Entity-dedup lite: companies (prevention, not repair) ─────────────────────
 
 def _company_index() -> dict:
-    """One pass over companies/*.md → {"by_alias": {alias_slug: path}, "by_domain": {domain: path}}.
-    The frontmatter has carried `aliases` and `domain` since the Rust port; nothing ever READ them,
-    which is exactly why "YC" and "Y Combinator" became two files."""
+    """Index saved names and domains in one pass over the company files."""
     by_alias: dict = {}
     by_domain: dict = {}
+    domains: dict = {}
     for path in sorted(glob.glob(os.path.join(kg.companies_dir(), "*.md"))):
         try:
             with open(path, encoding="utf-8") as f:
@@ -529,11 +527,12 @@ def _company_index() -> dict:
         for alias in ([fm.get("normalized")] + list(fm.get("aliases") or [])):
             slug = kg.safe_slug(kg.company_slug(_s(alias))) if alias else None
             if slug:
-                by_alias.setdefault(slug, path)
+                by_alias.setdefault(slug, set()).add(path)
         dom = _s(fm.get("domain")).strip().lower().lstrip("@")
+        domains[path] = dom
         if dom:
             by_domain.setdefault(dom, path)
-    return {"by_alias": by_alias, "by_domain": by_domain}
+    return {"by_alias": by_alias, "by_domain": by_domain, "domains": domains}
 
 
 def _company_domain_of(upd: dict) -> str:
@@ -549,21 +548,40 @@ def _company_domain_of(upd: dict) -> str:
 
 
 def resolve_company_path(upd: dict, index: dict) -> tuple:
-    """(path, slug) for a company update — slug first (today's behavior), then the alias and domain
-    lookups that prevent the duplicate. Returns (None, None) when the name is unusable."""
-    slug = kg.safe_slug(_s(upd.get("company_slug")) or kg.company_slug(_s(upd.get("company_name"))))
+    """Match by domain, fall back to a compatible name, and separate known namesakes."""
+    explicit_slug = _s(upd.get("company_slug"))
+    slug = kg.safe_slug(explicit_slug or kg.company_slug(_s(upd.get("company_name"))))
     if not slug:
-        return (None, None)
-    path = kg.safe_path(kg.companies_dir(), slug)
+        return None, None
+    directory = kg.companies_dir()
+    path = kg.safe_path(directory, slug)
+    domain = _company_domain_of(upd)
+    hit = index["by_domain"].get(domain)
+    if hit:
+        return hit, _stem(hit)
+    if explicit_slug and not domain and os.path.exists(path):
+        return path, slug
+
+    candidates = set(index["by_alias"].get(slug, ()))
     if os.path.exists(path):
-        return (path, slug)
-    hit = index["by_alias"].get(slug)
-    if not hit:
-        dom = _company_domain_of(upd)
-        hit = index["by_domain"].get(dom) if dom else None
-    if hit and os.path.exists(hit):
-        return (hit, _stem(hit))
-    return (path, slug)
+        candidates.add(path)
+    compatible = {candidate for candidate in candidates
+                  if not domain or index["domains"].get(candidate) == ""}
+    if len(compatible) == 1:
+        hit = compatible.pop()
+        return hit, _stem(hit)
+    if not domain:
+        return (None, None) if compatible else (path, slug)
+    if not candidates:
+        return path, slug
+
+    base = f"{slug[:100]}-{(kg.safe_slug(domain) or 'company')[:100]}"
+    slug = base
+    suffix = 2
+    while os.path.exists(path := kg.safe_path(directory, slug)):
+        slug = f"{base}-{suffix}"
+        suffix += 1
+    return path, slug
 
 
 
@@ -581,6 +599,7 @@ def _unique_company_path(upd):
         return None, None
     domain = _company_domain_of(upd)
     candidates = set()
+    domain_matches = set()
     try:
         directory = kg.companies_dir()
         try:
@@ -590,8 +609,7 @@ def _unique_company_path(upd):
         paths = [Path(directory) / name for name in sorted(names) if name.endswith('.md')]
         for path in paths:
             yaml_str, _ = kg.split_frontmatter_body(path.read_text(encoding='utf-8'))
-            import yaml
-            fm = (yaml.safe_load(yaml_str) if yaml_str else {}) or {}
+            fm = (kg.yaml_load(yaml_str) if yaml_str else {}) or {}
             if (type(fm) is not dict or type(fm.get('aliases', [])) is not list
                     or any(type(a) is not str for a in fm.get('aliases', []))
                     or any(type(fm.get(k, '')) is not str for k in ('normalized', 'domain'))):
@@ -599,10 +617,13 @@ def _unique_company_path(upd):
             aliases = [fm.get('normalized', ''), *fm.get('aliases', [])]
             alias_slugs = {kg.safe_slug(kg.company_slug(a)) for a in aliases if a}
             saved_domain = fm.get('domain', '').strip().lower().lstrip('@')
-            if path.stem == slug or slug in alias_slugs or domain and domain == saved_domain:
+            if domain and domain == saved_domain:
+                domain_matches.add(str(path))
+            elif (not domain or not saved_domain) and (path.stem == slug or slug in alias_slugs):
                 candidates.add(str(path))
     except Exception as exc:  # noqa: BLE001 -- strict read must not misreport unreadable as missing
         raise CompanyLookupError('unavailable') from exc
+    candidates = domain_matches or candidates
     if len(candidates) > 1:
         raise CompanyLookupError('ambiguous')
     if not candidates:
@@ -613,7 +634,7 @@ def _unique_company_path(upd):
 def company_knowledge(company_name: str = "", domain: str = "", company_slug: str = "", *, unique: bool = False) -> dict:
     """What is ALREADY on file about a company — the read side of the writer above, and the only
     one. Returns {slug, name, domain, about, news[], context, updated_by, last_researched} for the file the
-    same resolution (slug → alias → domain) would write to, or {} when nothing is on file.
+    same resolution (domain, then compatible slug or alias) would write to, or {} when nothing is on file.
 
     Two callers, one purpose — never buy a fact twice: `research_attendees` injects it into the
     focus pass as "already on file, don't repeat it", and `persist_prep` asks it whether the About
@@ -699,6 +720,8 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
     "unlinked" relation is stored by exactly the code that stores every other fact."""
     if float(fu.get("confidence", 0.8)) < 0.5:
         return {'disposition': 'rejected', 'reason': 'low_confidence'}
+    if fu.get('source') not in fact_hygiene.OWNER_SOURCES and (reason := fact_hygiene.unreadable(str(fu.get('fact') or ''), p, fu.get('memory_type', ''))):
+        return {'disposition': 'rejected', 'reason': reason}
     if (fu.get('source') == 'apple_contacts' and fu.get('change_type') != 'correction'
             and not any(c.isalpha() for c in str(fu.get('fact') or ''))):
         return {'disposition': 'rejected', 'reason': 'non_assertion'}
@@ -740,12 +763,8 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
     family_refs, family_incomplete, family_latest, family_unknown = set(), False, None, False
     family_resolved = False
     if source == 'observed_message' and not force:
-        # Overlapping words do not prove two historical statements agree. Keep both assertions
-        # for evidence-based curation instead of strengthening or overwriting one heuristically.
-        # Active first (same reason as kg.find_similar_fact): an archived twin must not shadow the
-        # live copy of the same words and turn a re-observation into a SKIP.
         exact = next((fid for fid, fact in sorted(p.facts.items(), key=lambda kv: kv[1].status == 'archived')
-                      if ' '.join(fact.text.split()).casefold() == ' '.join(fu['fact'].split()).casefold()), None)
+                      if fact_hygiene.observed_match(fact, fu['fact'], p)), None)
         if exact:
             family = _duplicate_family(p.facts, exact)
             if family is None:
@@ -756,6 +775,8 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
                 return {'disposition': 'rejected', 'reason': 'protected_owner_correction', 'fact_id': exact}
             revivable = p.facts[exact].archived_reason == 'stale'
             action, existing_id = (kg.BUMP if p.facts[exact].status == 'active' or revivable else kg.SKIP, exact)
+            if action == kg.BUMP and not fact_hygiene.is_readable(p.facts[exact], p):
+                action, existing_id = kg.NEW, None
         else:
             action, existing_id = kg.NEW, None
     if action == kg.BUMP:
@@ -820,6 +841,8 @@ def _apply_fact(p: "kg.PersonFile", cid: str, fu: dict, today: str, counts: dict
             ex.archived_reason = "user_corrected" if source == "user_edit" else "superseded"
             counts["superseded"] += 1
         fid = kg.generate_fact_id(cid, fu["fact"], today)
+        if source == 'observed_message' and not force and fid in p.facts and not fact_hygiene.is_readable(p.facts[fid], p):
+            fid = kg.generate_fact_id(cid, fu["fact"], f'{today}:{fu.get("memory_type", "")}')
         p.facts[fid] = kg.FactMeta(
             text=fu["fact"], type=fu.get("memory_type", ""), status="active",
             seen=1, conf=float(fu.get("confidence", 0.8)),
@@ -922,7 +945,7 @@ def graph_lock():
         yield
 
 
-def apply(extracted: dict, now: datetime | None = None, *, maintain_identities: bool = True) -> dict:
+def apply(extracted: dict, now: datetime | None = None, *, maintain_identities: bool = True, match_names: bool = True) -> dict:
     """Apply an extraction to the graph under ONE lock — the graph's single writer, serialized.
 
     Four processes call this concurrently (the brief's Learn step, meeting-prep research, the
@@ -933,11 +956,11 @@ def apply(extracted: dict, now: datetime | None = None, *, maintain_identities: 
     the suggestion refresh — because those steps read each other's output.
 
     Explicit target-only owner edits disable identity maintenance to avoid incidental migration,
-    merges or suggestion refresh; fact construction and persistence still use this writer.
+    merges or suggestion refresh. History observations never use display names to match existing people.
 
     jsonstore.lock is reentrant within a process, so the locked merge/relation entry points nest here for free."""
     with graph_lock():
-        return _apply(extracted, now, maintain_identities=maintain_identities)
+        return _apply(extracted, now, maintain_identities=maintain_identities, match_names=match_names)
 
 
 def prune_stale_memory(now: datetime | None = None) -> dict:
@@ -1076,7 +1099,7 @@ def project_source_correction(refs, now=None, *, after='', limit=100):
     return counts
 
 
-def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities: bool = True) -> dict:
+def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities: bool = True, match_names: bool = True) -> dict:
     # UTC, not server-local: now_iso labels the timestamp with a 'Z' suffix, so feeding it local
     # time would write a lie into every updated_at in the graph.
     now = now or datetime.now(timezone.utc)
@@ -1121,7 +1144,7 @@ def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities:
                             {'disposition': 'rejected', 'reason': 'missing_person_identity'})
             continue  # nothing usable to key this person by (garbage-name-only update)
 
-        path = kg.find_person_file(name=name, identifier=ident, cid=cid, index=index)
+        path = kg.find_person_file(name=name if match_names else "", identifier=ident, cid=cid, index=index)
         if path and os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 p = kg.parse_person_file(f.read())
@@ -1213,8 +1236,6 @@ def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities:
 
     company_index = _company_index()
     for upd in extracted.get("company_updates", []):
-        # Never use a caller-supplied company_slug raw — always slugify (H2). Then the alias/domain
-        # lookup: "YC" resolves INTO the existing "Y Combinator" file instead of minting a second.
         path, slug = resolve_company_path(upd, company_index)
         if not slug:
             continue
@@ -1237,8 +1258,6 @@ def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities:
         else:
             aliases = [upd.get("company_name", "")]
 
-        # Prevention, continued: every name form we've now seen for this company becomes a stored
-        # alias, so the NEXT brief that says "YC" resolves here instead of forking a second file.
         name_seen = _s(upd.get("company_name")).strip()
         if name_seen and not any(kg.company_slug(_s(a)) == kg.company_slug(name_seen)
                                  for a in aliases):
@@ -1248,9 +1267,11 @@ def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities:
         for a in aliases:
             a_slug = kg.safe_slug(kg.company_slug(_s(a))) if a else None
             if a_slug:
-                company_index["by_alias"].setdefault(a_slug, path)
-        if domain:
-            company_index["by_domain"].setdefault(domain, path)
+                company_index["by_alias"].setdefault(a_slug, set()).add(path)
+        indexed_domain = _company_domain_of({"domain": domain})
+        company_index["domains"][path] = indexed_domain
+        if indexed_domain:
+            company_index["by_domain"].setdefault(indexed_domain, path)
 
         existing_urls = {_url_of(n) for n in existing_news if _url_of(n)}
         existing_texts = set(existing_news)
@@ -1271,7 +1292,7 @@ def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities:
                 formatted = text
             existing_news.insert(0, formatted)
         for cu in upd.get("context_updates", []):
-            context = (context + "\n" + cu).strip() if context else cu
+            context = context if cu in context.splitlines() else (context + "\n" + cu).strip() if context else cu
         # Cap context to the on-disk limit, keeping the most-recent tail at a line boundary
         # (knowledge_files.rs:2666-2671) so the file doesn't grow unbounded.
         if len(context) > kg.MAX_COMPANY_CONTEXT_CHARS:
@@ -1280,16 +1301,10 @@ def _apply(extracted: dict, now: datetime | None = None, *, maintain_identities:
             context = context[nl + 1:] if nl != -1 else context[start:]
         if upd.get("news"):
             last_news_update = iso[:10]
-        # `about` is the company's durable identity paragraph — what it builds, who founded it, the
-        # market. REPLACE, not append: it is the one thing a later, richer research pass (or a user
-        # correction) should be able to say better, and appending would grow it every run. Callers
-        # decide whether their `about` is an upgrade (persist_prep asks company_knowledge first);
-        # this writer just does what it's told, exactly like profile_patch on a person.
+        # Check thin research and owner precedence against the current file under the graph lock.
         new_about = _s(upd.get("about")).strip()
-        # …with ONE floor under it: a `user_edit` About is a correction the user made by hand, and a
-        # pipeline never overwrites it. An empty About, or one owned by any pipeline, is fair game.
-        if new_about and about and existing_by == "user_edit" \
-                and _s(upd.get("updated_by")).strip() != "user_edit":
+        if about and (upd.get("about_if_empty") or (
+                existing_by == "user_edit" and _s(upd.get("updated_by")).strip() != "user_edit")):
             new_about = ""
         if new_about:
             about = new_about[:kg.MAX_COMPANY_CONTEXT_CHARS]

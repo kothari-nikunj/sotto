@@ -1,17 +1,16 @@
-"""Accepted offer selection and actual queue admission remain bound to original owner proof."""
 import hashlib
 import json
 from datetime import timedelta
 import pytest
 
 import runtime_owner_meeting_prep_request as tool
-from test_runtime_owner_loop_close import context, IDENTITY, ROOT, WHEN, THREAD, capability
+from test_runtime_owner_loop_close import context, IDENTITY, ROOT, WHEN, THREAD, capability, meeting_clock
 from test_requested_brief import rec
 import pending_offer
 from test_runtime_owner_skill_request import route_proof
 
-__all__ = ['context', 'rec']
-
+__all__ = ['context', 'rec', 'meeting_clock']
+pytestmark = pytest.mark.usefixtures('meeting_clock')
 
 def request(event='d' * 64, anchor='offered-message', operation='admit', stamp=None):
     args = {'reply_to_message_id': anchor, 'provider_sent_at_ms': stamp, 'provider_message_id': 'actual-provider-yes'}

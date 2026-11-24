@@ -21,9 +21,11 @@ export interface OwnerBriefRequest {
   actionId: string; eventId: string; payloadHash: string; text: string; admittedAtMs: number;
   providerThreadId: string; args: OwnerBriefRequestArgs;
 }
+export const ownerBriefRequestRejectionSchema = z.enum(['event_conflict', 'pending_delivery', 'needs_context', 'unavailable']);
+export type OwnerBriefRequestRejection = z.infer<typeof ownerBriefRequestRejectionSchema>;
 const responseSchema = z.discriminatedUnion('status', [ownerBriefRequestReceiptSchema,
   z.object({version: z.literal(1), status: z.literal('not_found')}).strict(),
-  z.object({version: z.literal(1), status: z.literal('rejected'), code: z.enum(['event_conflict', 'pending_delivery', 'needs_context', 'unavailable'])}).strict(),
+  z.object({version: z.literal(1), status: z.literal('rejected'), code: ownerBriefRequestRejectionSchema}).strict(),
 ]);
 export function createOwnerBriefRequestClient(options: OwnerToolClientOptions) {
   const transport = createOwnerToolTransport(options, '/runtime/owner-brief-request');

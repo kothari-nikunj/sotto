@@ -15,7 +15,7 @@ here is named `user-<slug>`, and nothing without that prefix is yours to touch.
 > **How this runs on Sotto:** the routine tools are native tools — `owner_routines` (list),
 > `owner_routine_propose` → `owner_routine_create` (create), `owner_routine_adjust_propose` →
 > `owner_routine_adjust_confirm` (move), and `owner_routine_cancel` (remove). The receiver owns the
-> schedule, the fence checks and the delivery destination.
+> schedule and the fence checks. The destination is fixed by the receiver. Never name or guess a channel.
 
 ## The fence (read once, obey always)
 
@@ -68,20 +68,13 @@ here is named `user-<slug>`, and nothing without that prefix is yours to touch.
    > has been open. Read the current canonical loops. Keep it under 10 lines."
    Keep it one short paragraph. No dates ("this Friday") — it recurs. No sending instructions. The
    result is read-only and model-produced.
-4. **Propose before creating — ONE message.** Slug the subject: lowercase, hyphens, ≤24 chars
+4. **Propose before creating.** Slug the subject: lowercase, hyphens, ≤24 chars
    (`user-open-loops-friday`). Call `owner_routine_propose` with that name, the schedule and the
-   prompt; the owner receives the exact proposal — schedule in plain words + what it will do + where
-   it lands:
-   > "Every Friday at 4:00pm your time, I'll send you a summary of your open loops grouped by
-   > person — who you owe, who you're waiting on, how long each has been open. It'll arrive here.
-   > Want me to set that up?"
-   Create **only** on a separate clear yes, with `owner_routine_create` (it takes no arguments and
-   creates exactly the most recent accepted proposal). If they tweak it, re-propose the changed line
-   (don't re-explain).
-5. **The destination is fixed by the receiver** — this conversation. Never name or guess a channel
-   yourself.
-6. **Confirm in one line**, with the words, not the schedule object: "Done — *open-loops summary*,
-   every Friday at 4pm, delivered here. Say *stop the Friday summary* any time."
+   prompt. The runtime delivers the exact proposal, including the schedule, the instructions, and
+   this conversation as the destination. Finish the turn there. If the owner tweaks it, propose
+   the changed schedule or prompt.
+5. On a separate clear yes, call `owner_routine_create` with no arguments. The runtime binds
+   the accepted proposal and replies after recording the change.
 
 ### LIST — "what routines do I have"
 
@@ -94,14 +87,16 @@ objects or routine ids:
 If there are none: "No personal routines yet — tell me one in a sentence and I'll set it up
 (*every Friday at 4, summarize my open loops by person*)." If asked about the briefs themselves, say
 in one line that the morning/evening briefs, the weekly pulse and the watchers are Sotto's own
-schedule and are changed via *set up Sotto* — then stop.
+schedule. Point to Activity to view it or the setup page to change it.
 
 ### ADJUST — "move my Friday routine to 5"
 
 `owner_routines`, match the one routine, then `owner_routine_adjust_propose` with its exact
-`routine_id` and the new schedule. The task, zone and destination stay the same. Apply it only after
-a separate clear yes with `owner_routine_adjust_confirm`. Changing what a routine does is a replace:
-cancel, then create — say it as one change, not two.
+`routine_id` and the new schedule. The runtime shows the previous and proposed
+schedules. Apply the adjustment only after a separate clear yes with
+`owner_routine_adjust_confirm`. To replace the routine’s instructions, explain that cancellation
+and creation are separate steps. Get an explicit cancellation request and use the normal creation
+review for the new routine.
 
 ### REMOVE — "stop the Friday summary"
 
@@ -109,7 +104,7 @@ cancel, then create — say it as one change, not two.
    proceed. **Several** → ask which, showing them the way LIST does. **None** → say so; don't guess.
 2. `owner_routine_cancel` with that exact routine ID. The owner's explicit request is the
    authorization; no extra confirmation is needed.
-3. Confirm what went: "Removed — the Friday 4pm open-loops summary. Nothing else changed."
+3. The runtime confirms the cancellation from its receipt.
 
 ## Notes
 
@@ -121,7 +116,7 @@ cancel, then create — say it as one change, not two.
   redeploy never eats a routine and a routine never shadows the schedule.
 - **Single user.** These are the account owner's routines; there is no per-person scoping and no
   sharing. Everything a routine can see, the owner can already see.
-- Deliver as **Sotto**. One short line before doing the work at most —
-  the proposal and the confirmation are the deliverables here.
+- Use plain language for lists and clarifications. Let the runtime deliver each proposal and
+  confirmation.
 - Routine *suggestions* (Sotto proposing a routine from an observed rhythm) are not this skill's job
   — the weekly pulse may offer one, and it lands here as a normal CREATE with the same proposal step.

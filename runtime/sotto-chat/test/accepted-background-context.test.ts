@@ -5,6 +5,8 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {MockLanguageModelV4} from 'ai/test';
 import {OperationalJournal} from '../src/journal/index.js';
+import {projectConversationContext,DELIVERED_UNTHREADED_WINDOW_MS} from '../src/background-context.js';
+import type {ModelRequest} from '../src/conversation.js';
 import {ReceiptedDelivery} from '../src/delivery.js';
 import {routeDigest, type RouteIdentity} from '../src/route-proof.js';
 import {createSottoAgentRuntime} from '../src/agent/runtime.js';
@@ -21,13 +23,15 @@ async function fixture(mode='valid', output=text, answer='yes') {
  const targets=new Map([['owner',{threadId:'thread',transport:{send:async()=>{sends++;return {acceptance:mode==='unknown'?'unknown' as const:'accepted' as const,providerMessageIds:mode==='unknown'?[]:mode==='multipart'?['p1','p2']:['p1'],providerSentAtMs:sentAt};}}}]]);
  const delivery=new ReceiptedDelivery(journal,targets,identity);
  const request={dispatch_id:'background',target:'owner',text:mode==='oversized'?'x'.repeat(16001):output,attempt:1,...(mode==='legacy'?{}:{source_revision:revision})};
- await delivery.sendText(request);
+ if(mode==='gallery')await delivery.sendGalleryBytes({dispatch_id:request.dispatch_id,target:request.target,summary:'Gallery caption',
+  images:Array.from({length:4},(_,index)=>({name:`0${index+1}.png`,bytes:Buffer.from([index+1])}))});
+ else await delivery.sendText(request);
  if(mode==='aged')journal.db.prepare('UPDATE dispatches SET updated_at=updated_at-900001,created_at=created_at-900001').run();
  const route=routeDigest(identity,'thread');
- const inbound={channel:'photon',eventId:'yes',accountId:'account',senderId:'owner',isDirect:true,text:answer,providerSentAtMs:sentAt+50};
+ const inbound={channel:'photon' as const,eventId:'yes',accountId:'account',senderId:'owner',isDirect:true,text:answer,providerSentAtMs:sentAt+50};
  const event=journal.admitInbound({eventId:'yes',accountKey:'account',lineKey:'line',threadKey:'thread',channel:'photon',sender:'owner',
   payload:JSON.stringify({inbound,context:{threadId:'thread',destination:'owner',lineKey:'line'}}),continuation:{routeDigest:mode==='route'?'b'.repeat(64):route,providerSentAtMs:sentAt+50}}).event.id as string;
- return {directory,path,event,session,request,targets,get journal(){return journal;},get sends(){return sends;},
+ return {directory,path,event,session,request,targets,inbound,route,get journal(){return journal;},get sends(){return sends;},
   reopen(){journal.close();journal=new OperationalJournal(path);},close(){journal.close();rmSync(directory,{recursive:true,force:true});}};
 }
 
@@ -43,6 +47,38 @@ for(const mode of ['valid','restart','legacy','unknown','multipart','route','age
    assert.equal(f.journal.db.prepare('SELECT count(*) AS n FROM actions').get()!.n,0,'context grants no action authority');
   }finally{f.close();}
  });
+
+test('gallery projection requires a fresh frozen version and current dispatch proof', async () => {
+ const f = await fixture('gallery');
+ const request:ModelRequest = {text:'yes',messages:[f.inbound],threadId:'thread',ownerId:'owner',ownerRequestKey:f.event,
+  runId:'run',allowOwnerReminder:false,allowOwnerTask:false,allowOwnerPreference:false,allowOwnerRoutine:false,
+  allowOwnerGmailDraft:false,signal:new AbortController().signal};
+ const project = (session = f.session, route = f.route) =>
+  projectConversationContext(f.journal, request, session, false, route).acceptedGalleryContext;
+ try {
+  const dispatch = f.journal.getDispatch(f.request.dispatch_id)!;
+  const frozen = JSON.parse(String(f.journal.getInbound(f.event)!.continuation_json));
+  assert.equal(frozen.version, 2);
+  const eligible = {dispatch_id:f.request.dispatch_id,message_id:'p1',payload_hash:dispatch.payload_hash};
+  assert.deepEqual(project(), eligible);
+  const saveFrozen = (version:number) => f.journal.db.prepare('UPDATE inbound_events SET continuation_json=? WHERE id=?')
+   .run(JSON.stringify({...frozen,version}), f.event);
+  saveFrozen(1);
+  f.reopen();
+  assert.equal(project(), undefined, 'a recovered v1 selector cannot acquire gallery context');
+  saveFrozen(2);
+  assert.equal(project(Number(dispatch.created_at)), undefined, 'gallery predates the session');
+  assert.equal(project(f.session, 'b'.repeat(64)), undefined, 'the current route changed');
+  f.journal.db.prepare('UPDATE dispatches SET updated_at=updated_at-? WHERE id=?')
+   .run(DELIVERED_UNTHREADED_WINDOW_MS+1, f.request.dispatch_id);
+  assert.equal(project(), undefined, 'the accepted gallery is stale');
+  f.journal.db.prepare('UPDATE dispatches SET updated_at=? WHERE id=?')
+   .run(Number(dispatch.updated_at), f.request.dispatch_id);
+  assert.deepEqual(project(), eligible);
+  f.journal.db.prepare("UPDATE dispatch_attempts SET status='unknown' WHERE dispatch_id=?").run(f.request.dispatch_id);
+  assert.equal(project(), undefined, 'a provider attempt remains unresolved');
+ } finally {f.close();}
+});
 
 test('scheduled revision is immutable on retry and cannot backfill legacy receipts',async()=>{
  for(const mode of ['valid','legacy']) {

@@ -115,7 +115,8 @@ def test_verified_notice_sends_once_after_reopen_and_original_replay(context, re
     notice_id = rows(rec)[0]['id']
     rec = restart(rec, monkeypatch)
     sent = []
-    monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send', lambda *a: sent.append(a) or
+    # A receiver-written notice now forwards the handoff revision as reply context.
+    monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send', lambda *a, **context: sent.append(a) or
                         (True, '', {'acceptance': 'accepted', 'message_id': 'notice-ack'}))
     assert rec.OUTBOX._attempt(notice_id)
     assert len(sent) == 1

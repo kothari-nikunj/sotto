@@ -4,6 +4,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {RequestContext} from '@mastra/core/request-context';
+import { executeTool } from './helpers/execute-tool.js';
 import {MockLanguageModelV4} from 'ai/test';
 import {OperationalJournal} from '../src/journal/index.js';
 import {ConversationCoordinator,type ModelRequest} from '../src/conversation.js';
@@ -34,7 +35,7 @@ function fixture(cleanupInput:unknown={items:choices},display:CleanupList=list,u
  client.readback=async()=>{readbacks++;return {you_owe:3,waiting_on_them:0,source_revision:stateRevision};};
  const tools=createOwnerTaskTools({client,journal:()=>journal,sourceAuthority});
  const script=createRunScriptTool({mode:'chat',executeCommand:createTaskCommand(createOwnerTaskExecution({client,journal:()=>journal,sourceAuthority})),commandContext:(ctx,signal)=>({mode:ctx?.get('mode'),runId:ctx?.get('runId'),ownerRequestKey:ctx?.get('ownerRequestKey'),allowOwnerTask:ctx?.get('allowOwnerTask'),sourceRevision:ctx?.get('sourceRevision'),signal})});
- const callTool=async(name:'owner_task_list'|'owner_task_cleanup',input:unknown,request:ModelRequest)=>{const requestContext=new RequestContext();for(const [key,value]of Object.entries({mode:'chat',runId:request.runId,ownerRequestKey:request.ownerRequestKey,allowOwnerTask:request.allowOwnerTask,sourceRevision:stateRevision}))requestContext.set(key,value);contexts.push(requestContext);return tools[name].execute!(input as never,{requestContext,abortSignal:request.signal} as never);};
+ const callTool=async(name:'owner_task_list'|'owner_task_cleanup',input:unknown,request:ModelRequest)=>{const requestContext=new RequestContext();for(const [key,value]of Object.entries({mode:'chat',runId:request.runId,ownerRequestKey:request.ownerRequestKey,allowOwnerTask:request.allowOwnerTask,sourceRevision:stateRevision}))requestContext.set(key,value);contexts.push(requestContext);return executeTool(tools[name],input,request.signal,requestContext);};
  const coordinator=new ConversationCoordinator({journal,ownerPolicy:{channel:'photon',accountId:'account',ownerId:'owner'},ownerTaskTool:client,model:{generate:async request=>{if(phase==='list')await callTool('owner_task_list',unfiltered?{}:{anchor_keys:anchors},request);if(phase==='cleanup')await callTool('owner_task_cleanup',cleanupInput,request);return {text:String(contexts.at(-1)?.get('ownerTaskClarification')??'arbitrary model prose with the wrong numbering'),sourceRevision:stateRevision};}},postPrepared:async request=>{sent.push(request.text);return {acceptance:'accepted',messageId:'reply-'+sent.length};}});
  return {folder,get projections(){return projections;},get readbacks(){return readbacks;},get journal(){return journal;},reopen(){journal.close();journal=new OperationalJournal(join(folder,'journal.sqlite'));journal.recoverInterrupted();},client,sourceAuthority,tools,script,callTool,coordinator,calls,sent,contexts,set phase(value:string){phase=value;},revoke(){stateRevision='d'.repeat(64);},incomplete(){complete=false;},close:async()=>{await coordinator.close();journal.close();rmSync(folder,{recursive:true,force:true});}};
 }

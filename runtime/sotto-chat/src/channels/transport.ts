@@ -10,6 +10,9 @@ import { telegramTextParts } from './telegram-text.js';
 import type { Media, Receipt, Send } from "./types.js";
 
 export interface ChannelTransport { send(input: Send): Promise<Receipt> }
+function contactStopped(signal?: AbortSignal, validUntilMs?: number): boolean {
+  return signal?.aborted === true || (validUntilMs !== undefined && Date.now() >= validUntilMs);
+}
 function ids(result: unknown): string[] {
   // Both pinned adapters return an outbound message with its provider id at
   // the root. Nested content IDs may identify uploaded attachments or derived
@@ -38,7 +41,7 @@ async function attempt(run: () => Promise<unknown>, nativePhoton = false): Promi
   }
 }
 export function createTelegramTransport(adapter: Pick<TelegramAdapter, "postMessage">): ChannelTransport {
-  return { send: async ({ threadId, text: body = "", media = [], signal }) => {
+  return { send: async ({ threadId, text: body = "", media = [], signal, validUntilMs }) => {
     const files = normalizeMedia(media);
     if (files.length > 4 || files.some((m) => (!m.url && !m.data) || m.oversize)) return Promise.resolve({ acceptance: "rejected", providerMessageIds: [], reason: "invalid media manifest" });
     if (!body.trim() && !files.length) return Promise.resolve({ acceptance: "not_attempted", providerMessageIds: [], reason: "empty payload" });
@@ -46,12 +49,13 @@ export function createTelegramTransport(adapter: Pick<TelegramAdapter, "postMess
     if (!parts) return { acceptance: 'rejected', providerMessageIds: [], reason: 'Telegram text exceeds safe message limits' };
     const providerMessageIds: string[] = [];
     for (const raw of parts) {
-      if (signal?.aborted) return {acceptance: providerMessageIds.length ? 'unknown' : 'not_attempted',
-        providerMessageIds, reason: 'delivery cancelled before next provider contact'};
-      const receipt = await attempt(() => adapter.postMessage(threadId, {
+      const message: AdapterPostableMessage = {
         raw,
         attachments: files.map((m): ChatAttachment => ({ type: mediaType(m.mimeType), url: m.url || undefined, data: m.data ? Buffer.from(m.data) : undefined, mimeType: m.mimeType, name: m.filename, size: m.sizeBytes })),
-      } satisfies AdapterPostableMessage));
+      };
+      if (contactStopped(signal, validUntilMs)) return {acceptance: providerMessageIds.length ? 'unknown' : 'not_attempted',
+        providerMessageIds, reason: 'delivery cancelled before next provider contact'};
+      const receipt = await attempt(() => adapter.postMessage(threadId, message));
       // A contacted part with no new root receipt makes the entire immutable
       // dispatch uncertain. Stop here; the journal must hold it, never replay it.
       if (receipt.acceptance !== 'accepted' || providerMessageIds.includes(receipt.providerMessageIds[0]!))
@@ -83,16 +87,16 @@ function decodedPhotonDestination(adapter: PhotonAdapterLike, threadId: string, 
   return decoded;
 }
 export function createPhotonTransport(adapter: PhotonAdapterLike, options: PhotonTransportOptions = {}): ChannelTransport {
-  return { send: async ({ threadId, text: body = "", media = [], verbatim = false, signal }) => {
+  return { send: async ({ threadId, text: body = "", media = [], verbatim = false, signal, validUntilMs }) => {
     if (options.sharedProjectThread) {
       try { decodedPhotonDestination(adapter, threadId, options.sharedProjectThread); }
       catch { return Promise.resolve({ acceptance: 'rejected', providerMessageIds: [], reason: 'unbound shared destination' }); }
     }
     const cancelled = (): Receipt => ({acceptance: 'not_attempted', providerMessageIds: [], reason: 'cancelled before provider contact'});
-    if (signal?.aborted) return cancelled();
+    if (contactStopped(signal, validUntilMs)) return cancelled();
     try { body = !verbatim && options.formatText ? await options.formatText(body) : body; }
     catch { return Promise.resolve({acceptance: 'not_attempted', providerMessageIds: [], reason: 'Photon text formatting unavailable'}); }
-    if (signal?.aborted) return cancelled();
+    if (contactStopped(signal, validUntilMs)) return cancelled();
     // A formatter seam must not widen the immutable shared route binding.
     if (options.sharedProjectThread) {
       try { decodedPhotonDestination(adapter, threadId, options.sharedProjectThread); }
@@ -101,7 +105,10 @@ export function createPhotonTransport(adapter: PhotonAdapterLike, options: Photo
     const files = normalizeMedia(media);
     if (files.length > 4 || files.some((m) => (!m.url && !m.data) || m.oversize)) return Promise.resolve({ acceptance: "rejected", providerMessageIds: [], reason: "invalid gallery manifest" });
     if (!body.trim() && !files.length) return Promise.resolve({ acceptance: "not_attempted", providerMessageIds: [], reason: "empty payload" });
-    if (!files.length) return attempt(() => adapter.postMessage(threadId, body), true);
+    if (!files.length) {
+      if (contactStopped(signal, validUntilMs)) return cancelled();
+      return attempt(() => adapter.postMessage(threadId, body), true);
+    }
     let destination: iMessageThreadId;
     try { destination = decodedPhotonDestination(adapter, threadId, options.sharedProjectThread); }
     catch { return Promise.resolve({ acceptance: "rejected", providerMessageIds: [], reason: "invalid gallery destination" }); }
@@ -112,11 +119,11 @@ export function createPhotonTransport(adapter: PhotonAdapterLike, options: Photo
         return phone ? namespace.get(chatGuid, { phone }) : namespace.get(chatGuid);
       });
       const space = await resolveSpace(adapter.app, destination.chatGuid, destination.phone);
-      if (signal?.aborted) return cancelled();
       const parts: ContentInput[] = body.trim()
         ? [text(body), ...files.map(photonAttachment)]
         : files.map(photonAttachment);
       const content = group(...(parts as [ContentInput, ContentInput, ...ContentInput[]]));
+      if (contactStopped(signal, validUntilMs)) return cancelled();
       return attempt(() => adapter.app!.send(space as never, content), true);
     } catch {
       return {acceptance: 'unknown', providerMessageIds: [], reason: 'provider outcome uncertain'};

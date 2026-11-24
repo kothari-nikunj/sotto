@@ -176,7 +176,8 @@ def test_actual_authorized_transport_no_post_replay(monkeypatch, mode):
         refreshes.append(True)
         raise AssertionError('send cannot refresh and reissue')
     monkeypatch.setattr(credentials, 'refresh', refresh)
-    monkeypatch.setattr(api, '_shared_library', lambda: SimpleNamespace(token_path=lambda: 'synthetic-not-read'))
+    monkeypatch.setattr(api, '_shared_library',
+                        lambda: SimpleNamespace(token_path=lambda *, require_home: 'synthetic-not-read'))
     original = HTTPAdapter.send
     def local_send(self, request, **kwargs):
         attempts.append((request.method, request.url))
@@ -210,9 +211,28 @@ def test_final_original_writer_get_cannot_rebase(sending, monkeypatch):
             sending[2].recipient = 'Other <other@example.com>'
         return original(**kwargs)
     monkeypatch.setattr(sending[2], 'get', changing)
-    assert sending[-1](body)['status'] == 'unknown'
+    # The final read happens before any send, so the refusal is definite, never "unknown".
+    assert sending[-1](body) == {'version': 1, 'status': 'rejected', 'code': 'target_changed'}
     assert not sending[2].posts
-    assert sending[-1]({**body, 'operation': 'inspect'})['status'] == 'unknown'
+    assert sending[-1]({**body, 'operation': 'inspect'})['status'] == 'rejected'
+    assert sending[-1](body)['code'] == 'target_changed' and not sending[2].posts
+
+
+def test_send_authority_revoked_at_the_last_check_is_a_definite_refusal(sending, monkeypatch):
+    """The authority check inside the Gmail sender runs just before contact, so it can refuse."""
+    import inspect
+    body = send_request(sending)
+    original = tool._authority
+    final = []
+    def revoked(*args, **kwargs):
+        if kwargs.get('sending') and any(f.function == '_gmail_send' for f in inspect.stack()):
+            final.append(1)
+            raise tool.RefusalError('send_permission_unavailable')
+        return original(*args, **kwargs)
+    monkeypatch.setattr(tool, '_authority', revoked)
+    assert sending[-1](body) == {'version': 1, 'status': 'rejected', 'code': 'send_permission_unavailable'}
+    assert final == [1] and not sending[2].posts
+    assert sending[-1]({**body, 'operation': 'inspect'})['status'] == 'rejected'
 
 
 def test_post_send_revocation_prevents_private_readback(sending, monkeypatch):

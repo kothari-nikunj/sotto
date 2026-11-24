@@ -2,7 +2,7 @@ import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import type { OperationalJournal, ExplicitOwnerLoopAuthority } from '../journal/index.js';
 import { readAuthority, SourceAuthorityChanged, type SourceAuthorityReader } from '../agent/source-authority.js';
-import { stableActionIdentity, ActionHeldError } from './action-gate.js';
+import { stableActionIdentity, ActionHeldError, OneMessageRequiredError } from './action-gate.js';
 import { ownerRoutineToolArgsSchema, ownerRoutineToolKind, routineProposalArgsSchema, routineAdjustProposalSchema } from './owner-routine-tool-contract.js';
 import type { OwnerRoutineToolClient } from './owner-routine-tool-client.js';
 export function createOwnerRoutineTools(options: {
@@ -40,7 +40,7 @@ export function createOwnerRoutineTools(options: {
   const execute = async (input: unknown, context: Context) => {
     const { journal, authority, eventId } = trusted(context);
     if (context.requestContext?.get('allowOwnerRoutine') !== true)
-      throw new Error('Owner routine requires one owner message');
+      throw new OneMessageRequiredError();
     const args = ownerRoutineToolArgsSchema.parse(input);
     journal.ownerReminderToolAdmission(authority,eventId,true);
     await sourceCurrent(context);

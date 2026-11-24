@@ -30,15 +30,67 @@ import argparse
 import os
 import sys
 from datetime import datetime, timezone
+from glob import glob
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import jsonstore  # noqa: E402
 from timeutil import _now_local, configured_tz  # noqa: E402  (the user's local date)
 
 
 def _path(kind: str) -> str:
     date = _now_local(configured_tz() or "+00:00").strftime("%Y-%m-%d")
     return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "briefs", f"{date}.{kind}.delivered")
+
+
+def named_path(day: str, kind: str) -> str:
+    return os.path.join(os.environ.get("SOTTO_DATA", "/data"), "briefs", f"{day}.{kind}.named.json")
+
+
+def accepted_named(day: str, kind: str) -> dict:
+    record = jsonstore.read(named_path(day, kind), {})
+    return record if isinstance(record, dict) and type(record.get("accepted_at")) in (int, float) else {}
+
+
+def accept_named(effect: dict, accepted_at: float) -> None:
+    path = named_path(effect["day"], effect["edition"])
+    with jsonstore.lock(path):
+        if accepted_at > accepted_named(effect["day"], effect["edition"]).get("accepted_at", 0):
+            jsonstore.write_atomic(path, {"accepted_at": accepted_at,
+                                         "anchor_keys": effect["anchor_keys"],
+                                         "loop_versions": effect["loop_versions"]})
+
+
+def told_before(day: str, kind: str) -> dict:
+    """The nearest earlier accepted brief carries unchanged overdue asks across missed briefs."""
+    root = os.path.dirname(named_path(day, kind))
+    editions = ("evening", "morning")
+    dates = {os.path.basename(path).split(".", 1)[0]
+             for path in glob(os.path.join(root, "????-??-??.*.named.json"))}
+    for earlier in sorted(dates, reverse=True):
+        if earlier > day:
+            continue
+        for edition in editions if earlier < day else (("morning",) if kind == "evening" else ()):
+            if record := accepted_named(earlier, edition):
+                return record.get("loop_versions") or {}
+    return {}
+
+
+def told_versions(rows: list, shown: list, today: str, told) -> dict:
+    """anchor_key -> loop_version of every OVERDUE loop the user has been told at its current
+    version: the ones this brief showed, plus earlier-told ones that have not changed since. A loop
+    shown before its deadline passed is not recorded, so its first overdue brief still names it.
+    The next brief reads this back (`told_before`) for `ledger_io.told_unchanged`."""
+    from delivery_effects import loop_version  # noqa: PLC0415
+    shown_keys = {str(r.get("anchor_key") or "") for r in shown}
+    day, out = str(today or "")[:10], {}
+    for row in rows:
+        key, version = str(row.get("anchor_key") or ""), loop_version(row)
+        deadline = str(row.get("deadline") or "")[:10]
+        if key and deadline and day and deadline < day and (
+                key in shown_keys or (told or {}).get(key) == version):
+            out[key] = version
+    return out
 
 
 def _stamp_digest_window() -> None:

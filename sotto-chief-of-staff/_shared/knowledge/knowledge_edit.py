@@ -60,7 +60,7 @@ CLI (runs in the skills tree, where PyYAML + the libs live; invoked by the recei
   knowledge_edit.py --slug <slug> --op correct --fact-id <id> --text "..."
   knowledge_edit.py --slug <slug> --op archive --fact-id <id>
   knowledge_edit.py --slug <slug> --op add --text "..." [--memory-type context]
-  knowledge_edit.py --slug <slug> --op add-identifier --identifier "+1 (310) 924-5269"
+  knowledge_edit.py --slug <slug> --op add-identifier --identifier "+1 (310) 555-0144"
   knowledge_edit.py --slug <slug> --op company-about --text "..."   (knowledge/companies/<slug>.md)
   knowledge_edit.py --op loop --anchor <anchor_key> --to resolved|dismissed
   knowledge_edit.py --op loop-add --text "..." [--contact "Name"] [--identifier a@b.com]
@@ -74,7 +74,7 @@ CLI (runs in the skills tree, where PyYAML + the libs live; invoked by the recei
 
 `add-identifier` is the one identifier a HUMAN supplies. Every other identifier in the graph arrived
 from Apple Contacts or an email header, so a person who only ever texts from an unsaved number has
-none — and reads as "+1 (310) 924-5269" in every brief. Naming it once attaches it to their file and
+none — and reads as "+1 (310) 555-0144" in every brief. Naming it once attaches it to their file and
 the shared identity resolver names them everywhere at once: their 1:1 thread, the label of any group
 they are in, and each line they send in it. It refuses an identifier that already belongs to someone
 else rather than moving it, because two files sharing an identifier is precisely what
@@ -106,9 +106,10 @@ sys.path.insert(0, os.path.join(_HERE, "..", "lib"))
 sys.path.insert(0, os.path.join(_HERE, "..", "scripts"))   # ledger_io
 sys.path.insert(0, _HERE)                                   # knowledge.py, its sibling
 
-from cleanup_selection import all_open_selection, complete_open_selection, explicit_displayed_reference, short_numbered_completion  # noqa: E402
+from cleanup_selection import validate_resolve_many_args, all_open_selection, complete_open_selection, explicit_displayed_reference, short_numbered_completion  # noqa: E402
 import knowledge as kg  # noqa: E402
 import knowledge_correction as correction  # noqa: E402
+import signal_closes  # noqa: E402
 from ledger_provenance import UnknownProvenanceError, classify_ledger_sources, digest_frontmatter  # noqa: E402
 
 DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
@@ -310,7 +311,7 @@ def op_add_identifier(slug: str, identifier: str, now: datetime | None = None) -
     """Teach the graph that a phone number or address belongs to someone it already knows.
 
     THE GAP THIS CLOSES: a text from a number in neither Apple Contacts nor the graph shows up in
-    briefs as "+1 (310) 924-5269", and there was no way to say who that is. Every other identifier
+    briefs as "+1 (310) 555-0144", and there was no way to say who that is. Every other identifier
     Sotto holds arrived from Contacts or from an email header — this is the one a human supplies.
     Once added, the shared identity resolver names them everywhere at once: their 1:1 thread, the
     label of any group they're in, and the sender line of each message they send in it.
@@ -1094,8 +1095,7 @@ def op_source_loop_tool(args, proof, *, now, inspect=False, authority):
     def content(row):
         return {k:v for k,v in row.items() if k not in ('_path','source_loop_correction','content_provenance','proof_transition')}
     def receipt(old, record, replacement=None):
-        # The original canonical digest excludes provenance/path; exclude only this private
-        # receipt field additionally so retaining its post digest is not self-referential.
+        # The digest excludes this receipt field.
         common = {'version':1,'status':'committed', **{key:proof[key] for key in
                   ('action_id','event_id','payload_hash','args_hash')}, 'operation':args['operation']}
         if replacement is None:
@@ -1146,10 +1146,11 @@ def op_source_loop_tool(args, proof, *, now, inspect=False, authority):
             if inspect:
                 return None
             matches = [row for row in rows if row.get('anchor_key') == args['anchor']]
-            if len(matches) != 1 or matches[0].get('status','open') not in cr.ACTIVE:
+            reopen = args.get('to')=='open'
+            if len(matches)!=1 or not (signal_closes.is_signal_close(matches[0]) if reopen else matches[0].get('status','open') in cr.ACTIVE):
                 raise OwnerLoopToolRefusalError('target_unavailable')
             old = matches[0]
-            if old.get('source_loop_correction') is not None:
+            if (old.get('source_loop_correction') or {}).get('status') not in(None,'committed'):
                 raise OwnerLoopToolRefusalError('target_unavailable')
             try:
                 sources = sorted(source_loop_sources(old))
@@ -1185,18 +1186,18 @@ def op_source_loop_tool(args, proof, *, now, inspect=False, authority):
                                              'version':args['loop_version'],'identity':args['loop_identity']}}
             terminal = dict(old)
             target = args['to'] if args['operation']=='correct' else 'dismissed'
-            cr._terminate(terminal, target, 'user_'+target if args['operation']=='correct' else 'user_retargeted',
-                          cr._to_user_zone(now).strftime('%Y-%m-%d'))
+            day = cr._to_user_zone(now).strftime('%Y-%m-%d')
+            signal_closes.reopen(terminal, day) if reopen else cr._terminate(terminal, target, 'user_'+target if args['operation']=='correct' else 'user_retargeted', day)
             if 'replacement' in record:
                 terminal['retargeted_to'] = record['replacement']['anchor_key']
             record['terminal'] = content(terminal)
             old['source_loop_correction'] = record
             intent_started = True
             cr._persist(old, source_loop_correction=record)
-        # Intent is already fsynced. Retire source before any replacement is made visible.
-        target = args['to'] if args['operation']=='correct' else 'dismissed'
-        if old.get('status') in cr.ACTIVE:
+        # Intent is fsynced; retire source before replacement.
+        if content(old) == record['original']:
             guard(record['sources'])
+            [old.pop(k) for k in set(content(old))-set(record['terminal'])]
             old.update(record['terminal'])
             cr._persist(old, source_loop_correction=record)
         replacement = None
@@ -2280,33 +2281,6 @@ def _named_loop_selection(phrase):
     return _loop_contact_name(match[1] if match else phrase), description, match is not None, words
 
 
-def validate_resolve_many_args(args):
-    if (type(args) is not dict or set(args)-{'allow_partial'}!={'operation','source_revision','selection_mode','items'} or ('allow_partial' in args and args['allow_partial'] is not True)
-            or args['operation']!='resolve_many' or type(args['source_revision']) is not str
-            or args['selection_mode'] not in ('named_people','owner_tasks')
-            or re.fullmatch(r'[a-f0-9]{64}',args['source_revision']) is None
-            or type(args['items']) is not list or not 1<=len(args['items'])<=20):
-        raise ValueError('multi resolve arguments invalid')
-    names,anchors=set(),set()
-    for item in args['items']:
-        if type(item) is not dict or set(item) not in ({'name','correction'},{'name','anchor_key','loop_version','loop_identity','correction'}):
-            raise ValueError('multi resolve row invalid')
-        for key,bound in (('name',500),('anchor_key',256),('correction',16000)):
-            if key not in item:
-                continue
-            value=item[key]
-            if type(value) is not str or not value or value!=value.strip() or len(value)>bound or any(ord(c)<32 or 127<=ord(c)<=159 or c in '\u2028\u2029' or 0xD800<=ord(c)<=0xDFFF for c in value):
-                raise ValueError('multi resolve text invalid')
-        if item['correction']!=item['name'] or item['name'].casefold() in names or item.get('anchor_key') in anchors:
-            raise ValueError('multi resolve selection invalid')
-        names.add(item['name'].casefold())
-        if 'anchor_key' not in item:
-            continue
-        anchors.add(item['anchor_key'])
-        if any(type(item[k]) is not str or re.fullmatch(r'[a-f0-9]{64}',item[k]) is None for k in ('loop_version','loop_identity')):
-            raise ValueError('multi resolve proof invalid')
-
-
 class _CleanupSourceUnavailableError(OwnerLoopToolRefusalError):
     def __init__(self, *, global_unavailable):
         super().__init__('source_unavailable')
@@ -2375,13 +2349,14 @@ def cleanup_list(args, *, now, authority):
         return value
 
 
-def op_admitted_loop_cleanup(args, proof, *, now, inspect=False, authority):
+def op_admitted_loop_cleanup(args, proof, *, now, inspect=False, authority, delivered_select=None):
     """One real owner event retains each original local edit without replaying uncertainty."""
     import jsonstore
     import preferences
     import retune_apply
     import retune_scan
     from datetime import datetime, timedelta, date, timezone
+    from delivered_tasks import task_label_digest
     from delivery_effects import loop_version, loop_identity
     from ledger_provenance import source_loop_sources, digest_frontmatter
     cr = _load_continuity()
@@ -2418,6 +2393,10 @@ def op_admitted_loop_cleanup(args, proof, *, now, inspect=False, authority):
             if out['status']=='applied':
                 post = progress['post']
                 out.update(post_digest=digest_frontmatter(post),loop_status=post['status'])
+                if direct and args['selection_mode'] == 'delivered':
+                    title = ' — '.join(filter(None, (post.get('contact_name'), post.get('summary') or post.get('ask'))))
+                    if title.strip():
+                        out['label'] = ' '.join(title.split())[:240]
                 if not direct and item['action']=='snooze':
                     out['snoozed_until']=post['snoozed_until']
             elif out['status']=='refused':
@@ -2487,7 +2466,7 @@ def op_admitted_loop_cleanup(args, proof, *, now, inspect=False, authority):
         if len(matches)!=1 or matches[0].get('status','open') not in cr.ACTIVE:
             target_unavailable('anchor-selection')
         row=matches[0]
-        if direct:
+        if direct and args['selection_mode'] != 'delivered':
             def named(r):
                 if args['selection_mode']=='owner_tasks':
                     return _owner_task_phrase_matches(r,item['name'])
@@ -2520,7 +2499,8 @@ def op_admitted_loop_cleanup(args, proof, *, now, inspect=False, authority):
             if kind!='owner' or provenance_sources:
                 target_unavailable('provenance-unavailable')
         _cleanup_authority(authority,revision,sources)
-        if loop_version(row)!=listed['loop_version'] or loop_identity(row)!=listed['loop_identity']:
+        if (loop_version(row)!=listed['loop_version'] or loop_identity(row)!=listed['loop_identity']
+                or any(k in listed and task_label_digest(row)!=listed[k] for k in ('sent_task_digest','task_label_digest'))):
             raise OwnerLoopToolRefusalError('target_changed')
         if not direct:
             # Accepted age/surface evidence is historical; only current label/direction bind the chosen target.
@@ -2540,6 +2520,18 @@ def op_admitted_loop_cleanup(args, proof, *, now, inspect=False, authority):
         if type(records) is not dict:
             raise EditError('cleanup receipts unavailable')
         saved=records.get(proof['event_id'])
+        if direct and args['selection_mode'] == 'delivered':
+            if saved is not None:
+                bound = saved.get('args', {}).get('items', [])
+                if [{'name': it['name'], 'correction': it['correction']} for it in bound] != args['items']:
+                    raise OwnerLoopToolRefusalError('event_conflict')
+            elif inspect:
+                return None
+            else:
+                bound = delivered_select() if delivered_select else None
+                if bound is None:
+                    raise OwnerLoopToolRefusalError('target_unavailable')
+            args = {**args, 'items': bound}
         if saved is not None:
             check_saved(saved)
             if 'receipt' not in saved:

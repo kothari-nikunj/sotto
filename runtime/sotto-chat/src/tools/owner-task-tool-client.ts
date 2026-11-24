@@ -103,6 +103,7 @@ export function createOwnerTaskToolClient(options: OwnerToolClientOptions & {rea
     else if(args.operation==='resolve_many'){if(receipt.operation!=='resolve_many')throw new Error('Resolve readback unavailable');for(const item of receipt.items)if(item.status==='applied'&&all.some(row=>row.anchor_key===item.anchor_key))throw new Error('Resolve readback unavailable');}
     else if(args.operation==='add'){if(receipt.operation!=='add'||args.direction===undefined)throw new Error('Task readback unavailable');const lane=args.direction==='you'?result.you_owe:result.waiting_on_them;if(all.filter(row=>row.anchor_key===receipt.anchor_key).length!==1||!lane.some(row=>row.anchor_key===receipt.anchor_key))throw new Error('Task readback unavailable');}
     else if(args.operation==='keep'){const matches=[...all,...(result.parked??[])].filter(row=>row.anchor_key===args.anchor);if(matches.length!==1||matches[0]!.loop_identity!==args.loop_identity)throw new Error('Correction readback unavailable');}
+    else if(args.operation==='correct'&&args.to==='open'){if(all.filter(row=>row.anchor_key===args.anchor).length!==1)throw new Error('Correction readback unavailable');}
     else if(all.some(row=>row.anchor_key===args.anchor))throw new Error('Correction readback unavailable');
     if(args.operation==='retarget') {
       if(receipt.operation!=='retarget')throw new Error('Correction readback unavailable');

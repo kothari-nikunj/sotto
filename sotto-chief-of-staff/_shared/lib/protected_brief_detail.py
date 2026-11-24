@@ -14,12 +14,14 @@ import re
 import stat
 import time
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from brief_detail_selection import accepted_day, MAX_MATCHES
-from datetime import datetime, timezone
-
-from retained_brief_proof import gallery_payload_hash, valid as valid_proof
+_LIBRARY = Path(__file__).resolve().parent
+if str(_LIBRARY) not in sys.path:
+    sys.path.insert(0, str(_LIBRARY))
+from brief_detail_selection import accepted_day, MAX_MATCHES  # noqa: E402
+from retained_brief_proof import gallery_payload_hash, valid as valid_proof  # noqa: E402
 
 MAX_OUTBOX = 4 * 1024 * 1024
 MAX_MANIFEST = 128 * 1024
@@ -29,7 +31,7 @@ MAX_DISCOVERY_ARTIFACTS = 32
 MAX_DISCOVERY_BYTES = 64 * 1024 * 1024
 _HEX24 = re.compile(r'\A[a-f0-9]{24}\Z')
 _HEX64 = re.compile(r'\A[a-f0-9]{64}\Z')
-_KNOWLEDGE = str(Path(__file__).resolve().parents[1] / 'knowledge')
+_KNOWLEDGE = str(_LIBRARY.parent / 'knowledge')
 if _KNOWLEDGE not in sys.path:
     sys.path.insert(0, _KNOWLEDGE)
 
@@ -97,6 +99,137 @@ def _private_json(root, parts, limit, budget=None):
         raise UnavailableError('private JSON unavailable') from error
 
 
+def outbox_rows(data_root):
+    outbox = _private_json(data_root, ('events', 'outbox.json'), MAX_OUTBOX)
+    rows = outbox.get('rows') if isinstance(outbox, dict) else None
+    if not isinstance(rows, list) or len(rows) > MAX_ROWS or any(not isinstance(row, dict) for row in rows):
+        raise UnavailableError('outbox rows unavailable')
+    return rows
+
+
+def retained_candidate(payload):
+    presentation = payload.get('presentation') if isinstance(payload, dict) else None
+    text_artifact = payload.get('retained_text_artifact') if isinstance(payload, dict) else None
+    proof = (presentation.get('retained_text_proof') if isinstance(presentation, dict)
+             else text_artifact.get('retained_text_proof') if isinstance(text_artifact, dict) else None)
+    expected_versions = (1, 2) if isinstance(presentation, dict) else (3,)
+    if (not isinstance(proof, dict) or set(proof) != {
+            'version', 'source_revision', 'route_digest', 'content_sha256',
+            'gallery_payload_sha256', 'image_sha256s'}
+            or type(proof['version']) is not int or proof['version'] not in expected_versions
+            or any(not isinstance(proof[key], str) or re.fullmatch(r'[a-f0-9]{64}', proof[key]) is None
+                   for key in ('source_revision', 'route_digest', 'content_sha256',
+                               'gallery_payload_sha256'))
+            or not isinstance(proof['image_sha256s'], list)
+            or len(proof['image_sha256s']) != (0 if proof['version'] == 3 else 4)
+            or any(not isinstance(item, str) or re.fullmatch(r'[a-f0-9]{64}', item) is None
+                   for item in proof['image_sha256s'])):
+        return None
+    return proof
+
+
+def contact_scope(payload):
+    return retained_candidate(payload) or notification_candidate(payload) or payload.get('task_snapshot')
+
+
+def notification_label(label):
+    return label == 'event'
+
+
+def notification_candidate(payload):
+    if not notification_label(payload.get('label')) or payload.get('presentation'):
+        return None
+    decisions = payload.get('decision_ids') or []
+    if not isinstance(decisions, list) or len(decisions) != 1 or not isinstance(decisions[0], str) or not re.fullmatch(r'(?:[a-f0-9]{16}|[a-f0-9]{64})', decisions[0]):
+        return None
+    references = [effect.get('request_reference') for effect in payload.get('effects') or []
+                  if effect.get('notification_id') == decisions[0] and effect.get('kind') == 'eligibility']
+    if len(references) != 1 or not isinstance(references[0], dict):
+        return None
+    # A Gmail message ID identifies immutable message contents. Editable local messages
+    # need their own retained content version before they can use this rating path.
+    source, ident = references[0].get('source'), references[0].get('id')
+    scope = payload.get('notification_feedback_scope')
+    if not isinstance(scope, dict):
+        return None
+    revision, route = scope.get('source_revision'), scope.get('route_digest')
+    if (source != 'gmail' or not isinstance(ident, str) or not re.fullmatch(r'[^\x00-\x1f\x7f\ud800-\udfff]{1,512}', ident)
+            or not all(isinstance(value, str) and re.fullmatch(r'[a-f0-9]{64}', value)
+                       for value in (revision, route))):
+        return None
+    return {'source_revision': revision, 'route_digest': route, 'decision_id': decisions[0],
+            'source': source, 'source_ref': hashlib.sha256(f'{source}:{ident}'.encode()).hexdigest()}
+
+
+def accepted_notification(payload, receipt, retained_at_contact, retained_now):
+    candidate = notification_candidate(payload)
+    if (not candidate or not retained_at_contact or not retained_now or not isinstance(receipt, dict)
+            or receipt.get('acceptance') != 'accepted' or type(receipt.get('route_proof_version')) is not int
+            or receipt['route_proof_version'] != 1 or receipt.get('route_digest') != candidate['route_digest']
+            or not isinstance(receipt.get('message_id'), str) or not 0 < len(receipt['message_id']) <= 512
+            or receipt.get('message_ids') != [receipt['message_id']]):
+        return {}
+    body = json.dumps({'text': payload['body']}, ensure_ascii=False, separators=(',', ':')).encode()
+    return {'notification_feedback': candidate} if receipt.get('payload_hash') == hashlib.sha256(body).hexdigest() else {}
+
+
+def _notification_binding(row, scope):
+    receipt = row.get('receipt')
+    if not isinstance(receipt, dict):
+        return None
+    proof = receipt.get('notification_feedback')
+    accepted_at = receipt.get('accepted_at')
+    if (row.get('status') != 'delivered' or row.get('acceptance') != 'accepted'
+            or receipt.get('acceptance') != 'accepted' or type(receipt.get('route_proof_version')) is not int
+            or receipt['route_proof_version'] != 1
+            or not isinstance(proof, dict)
+            or proof.get('source') != 'gmail'
+            or not re.fullmatch(r'(?:[a-f0-9]{16}|[a-f0-9]{64})', str(proof.get('decision_id') or ''))
+            or not _HEX64.fullmatch(str(proof.get('source_ref') or ''))
+            or any(not _HEX64.fullmatch(str(scope.get(k) or '')) or proof.get(k) != scope[k]
+                   for k in ('source_revision', 'route_digest'))
+            or receipt.get('route_digest') != scope['route_digest']
+            or not _HEX64.fullmatch(str(receipt.get('payload_hash') or ''))
+            or not isinstance(receipt.get('message_id'), str) or not receipt['message_id']
+            or receipt.get('message_ids') != [receipt['message_id']]
+            or type(accepted_at) not in (int, float) or not math.isfinite(accepted_at)):
+        return None
+    identity = [row['id'], accepted_at, receipt['message_id'], receipt['payload_hash'], proof]
+    version = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return {**proof, 'archive_version': version}
+
+
+def notification_bindings(data_root, scope, references):
+    """Index current accepted notification receipts once. Ambiguous dispatches stay unavailable."""
+    try:
+        rows = outbox_rows(data_root)
+    except UnavailableError:
+        return {}
+    result = {}
+    for row in rows:
+        dispatch = row.get('id')
+        if isinstance(dispatch, str) and (ref := 'notification:' + dispatch) in references:
+            result[ref] = None if ref in result else _notification_binding(row, scope)
+    return result
+
+
+def notification_feedback_receipt(data_root, args, admitted_at_ms, window_ms):
+    """Project one accepted notification's content-free proof from the existing outbox."""
+    try:
+        matches = [row for row in outbox_rows(data_root) if row.get('id') == args['dispatch_id']]
+    except UnavailableError:
+        return None
+    if len(matches) != 1:
+        return None
+    proof = _notification_binding(matches[0], args)
+    receipt = matches[0].get('receipt') or {}
+    if (not proof or receipt.get('payload_hash') != args['payload_hash']
+            or receipt.get('message_id') != args['provider_message_id']
+            or not 0 <= admitted_at_ms - receipt['accepted_at'] * 1000 <= window_ms):
+        return None
+    return proof
+
+
 def validate_selector(selector):
     if type(selector) is not dict or type(selector.get('offset')) is not int or type(selector.get('limit')) is not int:
         raise ValueError('invalid selector')
@@ -108,6 +241,15 @@ def validate_selector(selector):
         if type(selector['artifact_id']) is not str or _HEX24.fullmatch(selector['artifact_id']) is None:
             raise ValueError('invalid artifact')
         return 'exact'
+    if keys == {'gallery_receipt', 'offset', 'limit'}:
+        proof = selector['gallery_receipt']
+        if (type(proof) is not dict or set(proof) != {'dispatch_id', 'message_id', 'payload_hash'}
+                or not all(isinstance(value, str) for value in proof.values())
+                or not re.fullmatch(r'[a-f0-9]{16,64}', proof['dispatch_id'])
+                or not 0 < len(proof['message_id']) <= 512
+                or not _HEX64.fullmatch(proof['payload_hash'])):
+            raise ValueError('invalid gallery receipt')
+        return 'gallery'
     if keys == {'latest', 'offset', 'limit'}:
         if selector['latest'] is not True:
             raise ValueError('invalid latest')
@@ -250,10 +392,21 @@ def read(data_root, selector, *, source_revision, route_digest, zone=timezone.ut
             or not isinstance(route_digest, str) or _HEX64.fullmatch(route_digest) is None):
         return {'status': 'unavailable'}
     try:
-        outbox = _private_json(data_root, ('events', 'outbox.json'), MAX_OUTBOX)
-        rows = outbox.get('rows') if isinstance(outbox, dict) else None
-        if not isinstance(rows, list) or len(rows) > MAX_ROWS or any(not isinstance(row, dict) for row in rows):
-            raise UnavailableError('outbox rows unavailable')
+        rows = outbox_rows(data_root)
+        if mode == 'gallery':
+            proof = selector['gallery_receipt']
+            matches = [row for row in rows if row.get('id') == proof['dispatch_id']]
+            receipt = matches[0].get('receipt') if len(matches) == 1 else None
+            artifact = receipt.get('visual_artifact_id') if isinstance(receipt, dict) else None
+            if (not isinstance(artifact, str) or not _HEX24.fullmatch(artifact)
+                    or receipt.get('message_id') != proof['message_id']
+                    or receipt.get('message_ids') != [proof['message_id']]
+                    or receipt.get('payload_hash') != proof['payload_hash']):
+                return {'status': 'withheld', 'coverage': 'accepted_artifacts_only'}
+            verified = _verified_artifact(data_root, artifact, rows, source_revision, route_digest)
+            if not verified or verified[0].get('kind') != 'brief':
+                return {'status': 'withheld', 'coverage': 'accepted_artifacts_only'}
+            return _page(artifact, verified[0], selector)
         if mode == 'exact':
             artifact = selector['artifact_id']
             if not any(isinstance(row.get('receipt'), dict) and (row['receipt'].get('visual_artifact_id') or row['receipt'].get('text_artifact_id')) == artifact for row in rows):

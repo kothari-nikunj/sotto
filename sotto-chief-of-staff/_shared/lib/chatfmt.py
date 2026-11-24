@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import re
 
-from message_targets import strip_invalid_links
+from message_targets import HTML_COMMENT_RE, strip_invalid_links
 
-_MARKER_RE = re.compile(r"<!--.*?-->", re.S)
+_MARKER_RE = HTML_COMMENT_RE
 _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*$", re.M)
 _BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
 _HRULE_RE = re.compile(r"^\s{0,3}([-*_])\s*(?:\1\s*){2,}$", re.M)
@@ -108,8 +108,9 @@ def to_imessage(text, *, normalize_style=True) -> str:
         t = re.sub(rf"(?<![\w/]){marker}(\S(?:[^\n]*?\S)?){marker}(?!\w)", r"\1", t)
     t = re.sub(r"^[ \t]*[-*+]\s+", "• ", t, flags=re.M)
     t = re.sub(r"[ \t]+$", "", t, flags=re.M)
-    # Consecutive short list entries need one line each, not separate paragraphs.
-    t = re.sub(r"(?<=\n)\n+(?=• )", "", t)
+    # Consecutive short list entries need one line each, not separate paragraphs; the blank line
+    # between a heading and its first entry stays.
+    t = re.sub(r"(?m)^(• [^\n]*)\n\n+(?=• )", r"\1\n", t)
     return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
@@ -125,4 +126,4 @@ def compact_handled(text) -> str:
         return text
     stop = match.end() + end.start()
     entries = [line.strip().lstrip("• ") for line in text[match.end():stop].splitlines() if line.strip()]
-    return text[:match.end()] + "\n" + "\n".join("• " + entry for entry in entries) + "\n\n" + text[stop:]
+    return text[:match.end()] + "\n\n" + "\n".join("• " + entry for entry in entries) + "\n\n" + text[stop:]

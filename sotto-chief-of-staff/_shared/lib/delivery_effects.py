@@ -18,24 +18,21 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 import jsonstore  # noqa: E402
+from ledger_provenance import ref_fields  # noqa: E402
+from timeutil import source_observed_time  # noqa: E402
 
 MAX_PENDING_SECONDS = 4 * 3600
 FRESH_NUDGE_VALID_SECONDS = 30 * 60
 CALENDAR_MIN_FRESH_SECONDS = 600
 POST_MEETING_VALID_SECONDS = 30 * 60
 PREP_LOCATION_MAX_CHARS = 512
-# These classes already carry a semantic deadline at admission: missed calls use the event
-# funnel's 240-minute envelope, while calendar changes expire at the affected meeting. Applying
-# the generic message-freshness deadline here would silently shorten both contracts to 30 minutes.
+# Missed calls and calendar changes have their own deadlines.
 FRESH_NUDGE_EXEMPT_CLASSES = frozenset({'missed_call', 'calendar_change'})
 LOOP_FIELDS = ('anchor_key', 'status', 'summary', 'ask', 'source_refs', 'contact_identifier',
                'canonical_id', 'contact_name', 'group_id', 'source_thread_id', 'source_message_id',
                'created_at', 'snoozed_until', 'resolution_mode', 'action_type', 'channel',
                'meeting_time', 'deadline', 'due')
-# The obligation's identity: what makes it THIS debt rather than a restatement of it. Summary,
-# ask and deadline are wording (Learn restates them); `source_refs` is evidence (the follow-up merge
-# appends to it) — neither belongs here, or a loop that gained wording or evidence between compose
-# and delivery would lose its count for exactly the day it moved.
+# Stable identity for delivery counts, independent of later wording and source references.
 LOOP_IDENTITY_FIELDS = ('anchor_key', 'created_at', 'action_type', 'origin_key', 'source',
                         'source_thread_id', 'source_message_id')
 
@@ -66,6 +63,8 @@ def stage(effects, decision_ids=None, run_id=None, result=None, research_evidenc
                 # The outbox/run identity is durable before provider I/O and survives effect
                 # retries even on legacy accepted transports that return no provider message ID.
                 effect['delivery_id'] = ident
+            if effect.get('kind') == 'brief_named':
+                merged[:] = [item for item in merged if item.get('kind') != 'brief_named']
             if effect not in merged:
                 merged.append(effect)
         doc['decision_ids'] = sorted(set(doc.get('decision_ids', [])) | set(decision_ids or []))
@@ -300,6 +299,14 @@ def request_reference(event):
     return {'source': source, 'id': str(ident)} if ident else None
 
 
+def request_references(row):
+    refs = row.get('source_refs') or []
+    refs = [refs] if isinstance(refs, dict) else list(refs)
+    if row.get('source_message_id'):
+        refs.append({'sourceType': row.get('channel'), 'sourceId': row['source_message_id']})
+    return {(source_for_event({'source': source}), ident) for source, ident, _ in map(ref_fields, refs) if source or ident}
+
+
 def request_closed(reference, loops=None):
     """A held original message cannot revive its settled obligations.
 
@@ -309,18 +316,10 @@ def request_closed(reference, loops=None):
     if not reference:
         return False
     import ledger_io
-    matches = []
-    for row in (loops if loops is not None else _loops()).values():
-        refs = row.get('source_refs') or []
-        if isinstance(refs, dict):
-            refs = [refs]
-        refs = [r for r in refs if isinstance(r, dict)]
-        if row.get('source_message_id'):
-            refs = [*refs, {'sourceType': row.get('channel'), 'sourceId': row['source_message_id']}]
-        if any(source_for_event({'source': r.get('sourceType') or r.get('source_type') or r.get('source')}) == reference['source']
-               and str(r.get('sourceId') or r.get('source_id') or r.get('id') or '') == reference['id'] for r in refs):
-            matches.append(row)
-    return bool(matches) and all(r.get('status') in ledger_io.TERMINAL for r in matches)
+    key = (reference['source'], reference['id'])
+    matches = [row for row in (loops if loops is not None else _loops()).values()
+               if key in request_references(row)]
+    return bool(matches) and all(row.get('status') in ledger_io.TERMINAL for row in matches)
 
 
 def for_bundle(bundle):
@@ -349,9 +348,9 @@ def for_bundle(bundle):
             deadline = relevance_deadline
         if (deadline is None and unsolicited and not row.get('deferred_class')
                 and delivery_class not in FRESH_NUDGE_EXEMPT_CLASSES):
-            observed = instant(event.get('timestamp') or event.get('date'))
+            observed = source_observed_time(event)
             if observed is not None:
-                deadline = observed + FRESH_NUDGE_VALID_SECONDS
+                deadline = observed.timestamp() + FRESH_NUDGE_VALID_SECONDS
         if deadline is None and event.get('source') == 'meeting_end':
             ended = instant(event.get('end') or event.get('timestamp'))
             deadline = ended + POST_MEETING_VALID_SECONDS if ended else None
@@ -380,8 +379,8 @@ def for_bundle(bundle):
         if event.get('intention_id'):
             effect['intention_id'] = event['intention_id']
         if source in ('imessage', 'whatsapp', 'gmail'):
-            effect['event'] = {k: event[k] for k in ('source', 'timestamp', 'date', 'threadId',
-                'thread_id', 'chat_guid', 'chat_id', 'group_id', 'handle', 'contact_jid',
+            effect['event'] = {k: event[k] for k in ('source', 'timestamp', 'timestamp_utc', 'date', 'threadId',
+                'thread_id', 'chat_guid', 'chat_id', 'group_id', 'is_group_chat', 'is_from_me', 'handle', 'contact_jid',
                 'phone', 'email', 'from', 'to', 'source_id', 'id') if k in event}
             effect['event']['source'] = source
         effects.append(effect)
@@ -391,6 +390,7 @@ def for_bundle(bundle):
 def valid(effects, now=None):
     now = time.time() if now is None else now
     from source_context import allowed
+    from signal_closes import notice_valid
     loops = None
     sender_allowed = None
     conversation = None   # the local snapshot, parsed at most once per call (it is multi-MB)
@@ -408,9 +408,13 @@ def valid(effects, now=None):
             if not all(allowed(source) for source in effect.get('sources', [])):
                 return False
             continue
-        if effect.get('kind') == 'parking_notice':
+        if effect.get('kind') in ('parking_notice', 'closure_notice'):
             loops = _loops() if loops is None else loops
-            if not parking_notice_valid(effect, now, rows=loops):
+            if effect['kind'] == 'parking_notice':
+                eligible = parking_notice_valid(effect, now, rows=loops)
+            else:
+                eligible = notice_valid(loops.get(effect.get('anchor_key')), effect, now)
+            if not eligible:
                 return False
             continue
         if effect.get('kind') == 'loop_surfaced':
@@ -492,8 +496,10 @@ def valid(effects, now=None):
             from personal_context import conversation_snapshot, current_conversation
             if conversation is None:
                 conversation = conversation_snapshot()
-            event_time = instant(effect.get('observed_until') or event.get('timestamp') or event.get('date'))
-            if event_time and any(m.get('is_from_me') and (instant(m.get('ts')) or 0) > event_time
+            observed = source_observed_time(event)
+            event_time = instant(effect.get('observed_until')) or (observed.timestamp() if observed else None)
+            if event_time and any((m.get('is_from_me') or effect.get('superseded_by_inbound'))
+                                  and (instant(m.get('ts')) or 0) > event_time
                                   for m in current_conversation(event,
                                       now=datetime.fromtimestamp(now, timezone.utc),
                                       candidates=conversation)):
@@ -534,7 +540,7 @@ def parking_notice_valid(effect, now=None, *, rows=None):
 
 
 def finalize(effects, receipt):
-    """Apply only our effect kinds. Replays must succeed without another provider send."""
+    """Replay effects without another provider send."""
     if not receipt.get('accepted_at'):
         return False
     for effect in effects:
@@ -545,6 +551,9 @@ def finalize(effects, receipt):
                 pending = state['pending'].get(effect['key'], {})
                 if pending.get('run_id') == effect.get('run_id'):
                     state['pending'].pop(effect['key'], None)
+        elif kind == 'brief_named':
+            import brief_marker
+            brief_marker.accept_named(effect, receipt['accepted_at'])
         elif kind == 'prep_location_update':
             occurrence = meeting_occurrence(effect['calendar_event_id'], effect['calendar_start'])
             with proactive_state(meeting_day(effect['calendar_start'])) as state:
@@ -596,6 +605,10 @@ def finalize(effects, receipt):
             sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'morning-brief/scripts'))
             import continuity_resolve
             if not continuity_resolve.acknowledge_parking_notice(effect, receipt['accepted_at']):
+                return False
+        elif kind == 'closure_notice':
+            import signal_closes
+            if not signal_closes.acknowledge(effect, receipt['accepted_at']):
                 return False
         elif kind == 'loop_surfaced':
             sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'morning-brief/scripts'))

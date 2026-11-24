@@ -23,7 +23,7 @@ def graph(tmp_path,monkeypatch):
         monkeypatch.syspath_prepend(str(PACK/part))
     import knowledge as kg
     monkeypatch.setenv('SOTTO_DATA',str(tmp_path))
-    person=kg.PersonFile(canonical_id='dana',name='Dana',company='Cedar',identifiers=['dana@cedar.com'],
+    person=kg.PersonFile(canonical_id='dana',name='Dana',company='Cedar',identifiers=['dana@cedr.test'],
         facts={'old-clinic':kg.FactMeta(text='Discussed clinic procurement in the older meeting.',
             source='gmail',source_ref='old-thread',conf=0.95,first='2020-01-01',last='2020-01-01')})
     people=tmp_path/'knowledge/people';people.mkdir(parents=True)
@@ -47,7 +47,7 @@ def call(root,argv=None,authority=None):
 
 def tree(root):
     return {str(path.relative_to(root)):hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in root.rglob('*') if path.is_file() and not path.name.endswith('.lock')}
+            for path in root.rglob('*') if path.is_file() and not path.name.startswith('mcp-access-') and not path.name.endswith('.lock')}
 
 
 def test_person_history_uses_captured_grants_not_inherited_environment(tmp_path):
@@ -81,7 +81,7 @@ def test_person_obligation_history_projects_real_google_grants_without_contacts_
     spec.loader.exec_module(resolver)
     for anchor in ('pricing', 'checklist', 'bridge-contacts'):
         row = {'anchor_key':anchor, 'status':'open', 'action_type':'follow_up',
-               'contact_name':'Dana', 'contact_identifier':'dana@cedar.com', 'canonical_id':'dana',
+               'contact_name':'Dana', 'contact_identifier':'dana@cedr.test', 'canonical_id':'dana',
                'summary':anchor, 'ask':anchor, 'created_at':'2026-10-18',
                'source':'gmail', 'channel':'gmail', 'source_thread_id':'promise-thread',
                'source_refs':[{'sourceType':'gmail', 'sourceId':'promise-mail'}]}
@@ -145,7 +145,7 @@ def test_interactive_read_bounds_unicode_and_editable_assertions(graph):
     assert len(json.dumps(result).encode()) <= 48 * 1024
     assert result['omitted']['assertions'] > 0
 
-    dana = kg.PersonFile(canonical_id='dana', name='Dana', identifiers=['dana@cedar.com'],
+    dana = kg.PersonFile(canonical_id='dana', name='Dana', identifiers=['dana@cedr.test'],
         facts={f'f-{n}': kg.FactMeta(text='条' * 4000 + ' only if approved.', source='user_edit')
                for n in range(12)})
     (people/'legacy-dana.md').write_text(kg.serialize_person_file(dana))
@@ -179,7 +179,7 @@ def test_interactive_relevance_precedes_person_cap(graph, days):
 def test_interactive_coverage_and_editable_share_budget(graph):
     import knowledge as kg
     root, _ = graph
-    person = kg.PersonFile(canonical_id='dana', name='Dana', identifiers=['dana@cedar.com'],
+    person = kg.PersonFile(canonical_id='dana', name='Dana', identifiers=['dana@cedr.test'],
         facts={f'f-{n}': kg.FactMeta(text='条' * 4000 + ' only if approved.', source='user_edit')
                for n in range(12)})
     (root/'knowledge/people/legacy-dana.md').write_text(kg.serialize_person_file(person))
@@ -193,7 +193,7 @@ def test_interactive_coverage_and_editable_share_budget(graph):
 def test_interactive_editable_reports_selector_omissions_in_both_shapes(graph):
     import knowledge as kg
     root, _ = graph
-    person = kg.PersonFile(canonical_id='dana', name='Dana', identifiers=['dana@cedar.com'],
+    person = kg.PersonFile(canonical_id='dana', name='Dana', identifiers=['dana@cedr.test'],
         facts={f'f-{n:02d}': kg.FactMeta(text=f'Short owner correction {n}.', source='user_edit')
                for n in range(20)})
     (root/'knowledge/people/legacy-dana.md').write_text(kg.serialize_person_file(person))
@@ -763,7 +763,7 @@ def test_person_history_permission_projection_does_not_disclose_withheld_existen
     resolver=importlib.util.module_from_spec(spec);spec.loader.exec_module(resolver)
     for index in range(3):
         resolver._persist({'anchor_key':f'private-{index}','status':'open','action_type':'follow_up',
-            'canonical_id':'dana','contact_identifier':'dana@cedar.com','ask':'PRIVATE-WITHHELD-TASK',
+            'canonical_id':'dana','contact_identifier':'dana@cedr.test','ask':'PRIVATE-WITHHELD-TASK',
             'source':'gmail','channel':'gmail','source_thread_id':'private-thread',
             'source_refs':[{'sourceType':'gmail','sourceId':f'private-message-{index}'}],'created_at':'2026-10-18'})
         assert read()==empty
@@ -807,7 +807,7 @@ def test_topic_outcome_carries_measured_gaps_only_under_captured_source_grants(g
     directory = root / 'knowledge/continuity'
     directory.mkdir()
     row = {'anchor_key': 'clinic-approval', 'canonical_id': 'dana', 'contact_name': 'Dana',
-        'contact_identifier': 'dana@cedar.com', 'status': 'resolved', 'action_type': 'follow_up',
+        'contact_identifier': 'dana@cedr.test', 'status': 'resolved', 'action_type': 'follow_up',
         'source': 'gmail', 'channel': 'gmail', 'source_thread_id': 'original-thread',
         'ask': 'Clinic approval follow-up', 'created_at': '2026-10-18',
         'source_refs': [{'sourceType': 'gmail', 'sourceId': 'original'}],
@@ -843,10 +843,10 @@ def test_topic_outcome_carries_measured_gaps_only_under_captured_source_grants(g
     assert len(json.dumps({key: value for key, value in history.items() if key != 'learning'}).encode()) <= 18 * 1024
     assert len(json.dumps(history).encode()) <= 23 * 1024
     assert len(json.dumps(result).encode()) <= 48 * 1024
-    # A withheld source checkpoint's existence and numbers cannot change the projection.
+    # Withheld source checkpoints cannot change the projection.
     save({'gmail': window, 'whatsapp': {**window, 'excluded_page_count': 999}})
     assert call(root, ['--topic', 'clinic'], authority) == result
-    # Malformed permitted coverage remains explicit unknown, without losing exact closure evidence.
+    # Malformed coverage is unknown and preserves closure evidence.
     checkpoint.write_text('{broken')
     unknown = call(root, ['--topic', 'clinic'], authority)['obligation_history']
     assert unknown['learning']['sources']['gmail'] == {'checkpoint': 'unknown'}
@@ -867,7 +867,7 @@ def test_person_learning_uses_captured_google_grants_and_withholds_checkpoint_ex
     checkpoint = root / 'knowledge/history-state.json'
     no_sources = lambda: {'complete': True, 'revision': REVISION,
                          'google_sources': [], 'bridge_sources': []}
-    args = ['--person', 'dana@cedar.com', '--person-coverage']
+    args = ['--person', 'dana@cedr.test', '--person-coverage']
     empty = call(root, args, no_sources)
     checkpoint.write_text(json.dumps({'sources': {'gmail': {'complete': True, 'pages': 123}}}))
     before = tree(root)
@@ -890,7 +890,7 @@ def test_topic_receiver_keeps_large_closure_evidence_with_separate_coverage_budg
     refs = lambda source: [{'sourceType': source, 'sourceId': str(i), 'snippet': 'Clinic ' + 'x' * 1193}
                            for i in range(4)]
     row = {'anchor_key': 'large-clinic-approval', 'canonical_id': 'dana', 'contact_name': 'Dana',
-        'contact_identifier': 'dana@cedar.com', 'status': 'resolved', 'action_type': 'follow_up',
+        'contact_identifier': 'dana@cedr.test', 'status': 'resolved', 'action_type': 'follow_up',
         'source': 'gmail', 'channel': 'gmail', 'source_thread_id': 'original-thread',
         'ask': 'Clinic ' + 'a' * 1593, 'created_at': '2026-10-18', 'source_refs': refs('gmail'),
         'source_snippet': 's' * 1200, 'resolution': 'replied',
@@ -919,7 +919,7 @@ def test_topic_receiver_keeps_large_closure_evidence_with_separate_coverage_budg
 
 def test_facts_only_receiver_scope_and_real_read(graph):
     root, _ = graph
-    argv = ['--person', 'dana@cedar.com', '--person-coverage', '--facts-only']
+    argv = ['--person', 'dana@cedr.test', '--person-coverage', '--facts-only']
     assert read.validate(body(argv)) == argv
     result = call(root, argv)
     assert 'obligation_history' not in result

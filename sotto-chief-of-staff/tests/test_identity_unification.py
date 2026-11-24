@@ -31,8 +31,8 @@ def _load(name, relpath):
 
 ku = _load("ku_identity", "_shared/knowledge/knowledge_update.py")
 
-CONTACTS = [{"name": "Sarah Chen", "phones": ["+1 (415) 555-1234"], "emails": ["sarah@acme.com"]},
-            {"name": "Bob Woo", "phones": ["+1 (628) 555-1234"], "emails": []}]
+CONTACTS = [{"name": "Sarah Chen", "phones": ["+1 (415) 555-0107"], "emails": ["sarah@acme.com"]},
+            {"name": "Bob Woo", "phones": ["+1 (628) 555-0100"], "emails": []}]
 LOOKUP = rl.build_contact_lookup(CONTACTS)
 
 
@@ -60,7 +60,7 @@ def test_escalation_unifies_email_and_imessage_via_contacts():
     now = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
     recent = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
     local = {"contacts": CONTACTS,
-             "imessage": [{"handle": "+14155551234", "is_from_me": False, "timestamp": recent,
+             "imessage": [{"handle": "+14155550107", "is_from_me": False, "timestamp": recent,
                            "text": "any update?"}]}
     resolved = rl.resolve_contact_names(local)
     emails = [rl._trim_email({"from": 'S. Chen <sarah@acme.com>', "subject": "update?",
@@ -80,20 +80,20 @@ def test_no_last7_fallback_misattribution():
 
 
 def test_whatsapp_contacts_name_beats_push_name():
-    assert rl.resolve_whatsapp_name("14155551234@s.whatsapp.net", "sar 🌸", LOOKUP) == "Sarah Chen"
+    assert rl.resolve_whatsapp_name("14155550107@s.whatsapp.net", "sar 🌸", LOOKUP) == "Sarah Chen"
     # No Contacts match → the push name is better than a raw number.
     assert rl.resolve_whatsapp_name("447700900000@s.whatsapp.net", "Nige", LOOKUP) == "Nige"
 
 
 def test_push_name_beats_lossy_last10_for_foreign_numbers():
-    # +81 80-1234-5678 (Japan) shares its trailing 10 digits with a US contact +1 801-234-5678.
+    # +81 80-1234-5678 (Japan) shares its trailing 10 digits with a US contact +1 801-555-0147.
     # The lossy last-10 fallback used to run BEFORE partner_name, renaming Kenji "Dan Utah".
-    lookup = rl.build_contact_lookup([{"name": "Dan Utah", "phones": ["+1 801-234-5678"]}])
-    assert rl.resolve_whatsapp_name("818012345678@s.whatsapp.net", "Kenji Sato", lookup) == "Kenji Sato"
+    lookup = rl.build_contact_lookup([{"name": "Dan Utah", "phones": ["+1 801-555-0147"]}])
+    assert rl.resolve_whatsapp_name("818015550147@s.whatsapp.net", "Kenji Sato", lookup) == "Kenji Sato"
     # Exact-form Contacts matches still beat the push name (Contacts stays authoritative there).
-    assert rl.resolve_whatsapp_name("18012345678@s.whatsapp.net", "danny boy", lookup) == "Dan Utah"
+    assert rl.resolve_whatsapp_name("18015550147@s.whatsapp.net", "danny boy", lookup) == "Dan Utah"
     # No push name cannot authorize borrowing a different country's contact.
-    assert rl.resolve_whatsapp_name("818012345678@s.whatsapp.net", "", lookup) == "+818012345678"
+    assert rl.resolve_whatsapp_name("818015550147@s.whatsapp.net", "", lookup) == "+818015550147"
 
 
 def test_unknown_lid_senders_do_not_collapse_into_one_thread():
@@ -122,25 +122,25 @@ def test_lid_jid_never_renders_as_fake_phone():
 # ── group sender attribution ──────────────────────────────────────────────────
 
 def test_imessage_group_lines_attributed_to_resolved_sender():
-    msgs = [{"handle": "+14155551234", "is_from_me": False, "timestamp": "2026-07-08 09:00:00",
+    msgs = [{"handle": "+14155550107", "is_from_me": False, "timestamp": "2026-07-08 09:00:00",
              "text": "lunch?", "is_group_chat": True, "chat_guid": "g1",
-             "group_participants": ["+14155551234", "+16285551234"]},
-            {"handle": "+17075550000", "is_from_me": False, "timestamp": "2026-07-08 09:01:00",
+             "group_participants": ["+14155550107", "+16285550100"]},
+            {"handle": "+17075550100", "is_from_me": False, "timestamp": "2026-07-08 09:01:00",
              "text": "who dis", "is_group_chat": True, "chat_guid": "g1"},
-            {"handle": "+14155551234", "is_from_me": True, "timestamp": "2026-07-08 09:02:00",
+            {"handle": "+14155550107", "is_from_me": True, "timestamp": "2026-07-08 09:02:00",
              "text": "in!", "is_group_chat": True, "chat_guid": "g1"}]
     threads = rl._group_messages_into_threads(msgs, "imessage", LOOKUP)
     assert len(threads) == 1
     out = rl._format_thread_as_text(threads[0], "imessage")
     assert "[THEY SENT — Sarah Chen] lunch?" in out
-    assert "[THEY SENT — +1 (707) 555-0000] who dis" in out     # factual number beats a guess
+    assert "[THEY SENT — +1 (707) 555-0100] who dis" in out     # factual number beats a guess
     assert "[USER SENT] in!" in out
 
 
 def test_whatsapp_group_lines_use_sender_jid_and_stay_bare_without_it():
     msgs = [{"contact_jid": "120363000@g.us", "partner_name": "Team", "is_from_me": False,
              "timestamp": "2026-07-08 09:00:00", "text": "standup in 5", "is_group_chat": True,
-             "chat_guid": "120363000@g.us", "sender_jid": "14155551234@s.whatsapp.net"},
+             "chat_guid": "120363000@g.us", "sender_jid": "14155550107@s.whatsapp.net"},
             {"contact_jid": "120363000@g.us", "partner_name": "Team", "is_from_me": False,
              "timestamp": "2026-07-08 09:01:00", "text": "brt", "is_group_chat": True,
              "chat_guid": "120363000@g.us"}]
@@ -166,15 +166,15 @@ def test_contacts_seed_one_canonical_id_across_phone_and_email():
     sarah = next(e for e in seeded if e["display_name"] == "Sarah Chen")
     assert sarah["confidence"] == "high"
     by_ident, _ = rl.build_canonical_resolver(seeded)
-    assert by_ident[rl._normalize_identifier("+14155551234")]["canonical_id"] == sarah["canonical_id"]
+    assert by_ident[rl._normalize_identifier("+14155550107")]["canonical_id"] == sarah["canonical_id"]
     assert by_ident[rl._normalize_identifier("sarah@acme.com")]["canonical_id"] == sarah["canonical_id"]
 
 
 def test_resolve_contact_names_attaches_same_cid_on_both_channels():
     local = {"contacts": CONTACTS,
-             "imessage": [{"handle": "+14155551234", "is_from_me": False,
+             "imessage": [{"handle": "+14155550107", "is_from_me": False,
                            "timestamp": "2026-07-08 09:00:00", "text": "hey"}],
-             "whatsapp": [{"contact_jid": "14155551234@s.whatsapp.net", "partner_name": "sar",
+             "whatsapp": [{"contact_jid": "14155550107@s.whatsapp.net", "partner_name": "sar",
                            "is_from_me": False, "timestamp": "2026-07-08 09:00:00", "text": "yo"}]}
     out = rl.resolve_contact_names(local)
     im, wa = out["imessage"][0], out["whatsapp"][0]
@@ -187,19 +187,19 @@ def test_graph_index_names_an_unsaved_phone_thread():
     # name instead of a raw number (medium confidence upgrades ONLY a phone-like fallback).
     local = {"contacts": CONTACTS,
              "contact_index": [{"canonical_id": "c_aaaa00000001", "display_name": "Dana Roe",
-                                "identifiers": ["+13105550000"], "confidence": "medium"}],
-             "imessage": [{"handle": "+13105550000", "is_from_me": False,
+                                "identifiers": ["+13105550100"], "confidence": "medium"}],
+             "imessage": [{"handle": "+13105550100", "is_from_me": False,
                            "timestamp": "2026-07-08 09:00:00", "text": "hi"}]}
     out = rl.resolve_contact_names(local)
     assert out["imessage"][0]["resolved_name"] == "Dana Roe"
     # …but a medium identity never overrides a name Contacts resolved.
-    local["contact_index"][0]["identifiers"] = ["+14155551234"]
+    local["contact_index"][0]["identifiers"] = ["+14155550107"]
     out = rl.resolve_contact_names(local)
     assert out["imessage"][0]["resolved_name"] == "Dana Roe" or True  # (identifier moved)
     local2 = {"contacts": CONTACTS,
               "contact_index": [{"canonical_id": "c_aaaa00000001", "display_name": "Wrong Name",
-                                 "identifiers": ["+14155551234"], "confidence": "medium"}],
-              "imessage": [{"handle": "+14155551234", "is_from_me": False,
+                                 "identifiers": ["+14155550107"], "confidence": "medium"}],
+              "imessage": [{"handle": "+14155550107", "is_from_me": False,
                             "timestamp": "2026-07-08 09:00:00", "text": "hi"}]}
     out2 = rl.resolve_contact_names(local2)
     assert out2["imessage"][0]["resolved_name"] == "Sarah Chen"
@@ -230,7 +230,7 @@ def test_migrate_people_dir_rekeys_and_merges(tmp_path, monkeypatch):
     # One person split across two legacy name-slug files (the "Sarah" vs "Sarah Chen" fragmentation).
     cid = kg.default_canonical_id("Sarah Chen", ["sarah@acme.com"])
     with open(os.path.join(people, "sarah.md"), "w") as f:
-        f.write(f"---\nschema: 1\ncanonical_id: {cid}\nname: Sarah\nidentifiers: ['+14155551234']\n"
+        f.write(f"---\nschema: 1\ncanonical_id: {cid}\nname: Sarah\nidentifiers: ['+14155550107']\n"
                 "updated_at: ''\nupdated_by: t\nfacts: {}\n---\n")
     with open(os.path.join(people, "sarah-chen.md"), "w") as f:
         f.write(f"---\nschema: 1\ncanonical_id: {cid}\nname: Sarah Chen\nidentifiers: [sarah@acme.com]\n"
@@ -244,7 +244,7 @@ def test_migrate_people_dir_rekeys_and_merges(tmp_path, monkeypatch):
     files = sorted(os.listdir(people))
     assert f"{cid}.md" in files and "sarah.md" not in files and "sarah-chen.md" not in files
     merged = kg.parse_person_file(open(os.path.join(people, f"{cid}.md")).read())
-    assert set(merged.identifiers) == {"+14155551234", "sarah@acme.com"}  # phone+email in ONE file
+    assert set(merged.identifiers) == {"+14155550107", "sarah@acme.com"}  # phone+email in ONE file
     # Bob got a generated cid filename; second run is a no-op.
     assert kg.find_person_file(identifier="bob@x.com") is not None
     assert kg.migrate_people_dir() == {"moved": 0, "merged": 0}
@@ -359,17 +359,17 @@ def test_normalize_local_wires_contact_index_through(tmp_path):
 # ── one resolver, both paths (the "raw phone numbers in a group label" regression) ───────────────
 
 _GRAPH_ONLY = {
-    "contacts": [{"name": "Sarah Chen", "phones": ["+1 (415) 555-1234"], "emails": ["sarah@acme.com"]}],
+    "contacts": [{"name": "Sarah Chen", "phones": ["+1 (415) 555-0107"], "emails": ["sarah@acme.com"]}],
     # Two people the GRAPH knows (they email him) who are NOT saved in Apple Contacts.
     "contact_index": [
         {"canonical_id": "c1", "display_name": "Dev Patel",
-         "identifiers": ["+14042474568", "dev@acme.test"], "confidence": "medium"},
+         "identifiers": ["+14045550145", "dev@acme.test"], "confidence": "medium"},
         {"canonical_id": "c2", "display_name": "Priya Rao",
-         "identifiers": ["+14086663190", "priya@acme.test"], "confidence": "medium"},
+         "identifiers": ["+14085550146", "priya@acme.test"], "confidence": "medium"},
     ],
     "imessage": [
-        {"handle": "+14042474568", "chat_guid": "iMessage;+;chat9", "is_group_chat": True,
-         "group_participants": ["+14042474568", "+14086663190"],
+        {"handle": "+14045550145", "chat_guid": "iMessage;+;chat9", "is_group_chat": True,
+         "group_participants": ["+14045550145", "+14085550146"],
          "text": "lunch Thursday or Friday? come see the new office",
          "timestamp": "2026-08-11 09:00:00", "is_from_me": False},
     ],
@@ -380,7 +380,7 @@ _GRAPH_ONLY = {
 
 def test_a_group_label_uses_the_same_resolver_the_1to1_path_uses():
     """THE BUG, from a real brief: a 2-person group rendered as
-    '+1 (404) 247-4568 & +1 (408) 666-3190' while both people were named correctly in their own 1:1
+    '+1 (404) 555-0145 & +1 (408) 555-0146' while both people were named correctly in their own 1:1
     threads. Cause: the 1:1 path resolved through the graph+Contacts resolver, the GROUP label
     resolved through Apple Contacts alone. One job, two implementations, two answers."""
     local = rl.resolve_contact_names(_GRAPH_ONLY)
@@ -401,9 +401,9 @@ def test_apple_contacts_still_outrank_the_graph_in_a_group_label():
     local = dict(_GRAPH_ONLY)
     local["contact_index"] = _GRAPH_ONLY["contact_index"] + [
         {"canonical_id": "c3", "display_name": "S. Chen (work)",
-         "identifiers": ["+14155551234"], "confidence": "medium"}]
+         "identifiers": ["+14155550107"], "confidence": "medium"}]
     local["imessage"] = [dict(_GRAPH_ONLY["imessage"][0],
-                              group_participants=["+14155551234", "+14042474568"])]
+                              group_participants=["+14155550107", "+14045550145"])]
     resolved = rl.resolve_contact_names(local)
     t = rl._group_messages_into_threads(resolved["imessage"], "imessage",
                                         rl.build_contact_lookup(local["contacts"]),
@@ -428,12 +428,12 @@ def test_an_lid_participant_is_never_resolved_by_normalized_digits():
         "contacts": [], "whatsapp": [
             {"contact_jid": "12345678901234@lid", "chat_guid": "99@g.us", "is_group_chat": True,
              "sender_jid": "12345678901234@lid",
-             "group_participants": ["12345678901234@lid", "14042474568@s.whatsapp.net"],
+             "group_participants": ["12345678901234@lid", "14045550145@s.whatsapp.net"],
              "text": "hi", "timestamp": "2026-08-11 09:00:00", "is_from_me": False}],
         "contact_index": [{"canonical_id": "c9", "display_name": "Wrong Person",
                            "identifiers": ["+11234567890"], "confidence": "medium"},
                           {"canonical_id": "c1", "display_name": "Dev Patel",
-                           "identifiers": ["+14042474568"], "confidence": "medium"}],
+                           "identifiers": ["+14045550145"], "confidence": "medium"}],
         "imessage": [], "calls": [], "whatsapp_calls": [],
         "deferred_unread_imessage": [], "deferred_unread_whatsapp": [],
     }
@@ -469,12 +469,12 @@ def _load_script(rel, name):
 
 se = _load_script(os.path.join("_shared", "scripts", "style_extract.py"), "style_extract_idu")
 
-CONTACT = {"name": "Dana Wells", "emails": ["dana@acmecorp.test"], "phones": ["+14155552211"]}
+CONTACT = {"name": "Dana Wells", "emails": ["dana@acmecorp.test"], "phones": ["+14155550108"]}
 
 
 def test_all_three_id_mints_agree_byte_for_byte():
     """Formula drift between the three generators IS the fork — pinned here so it fails loudly."""
-    for c in (CONTACT, {"name": "Leo Fry", "emails": [], "phones": ["+12065551234"]}):
+    for c in (CONTACT, {"name": "Leo Fry", "emails": [], "phones": ["+12065550102"]}):
         want = kg.default_canonical_id(c["name"], c["emails"])
         seeded = rl.seed_contact_index_from_contacts([c])[0]["canonical_id"]
         styled = se._seed_contact_index([c])[0][0]["canonical_id"]
@@ -486,12 +486,12 @@ def test_resolver_adopts_the_graph_cid_on_any_identifier_overlap():
     when the card has a new email the file never saw (the exact drift that used to fork)."""
     local = {
         "contacts": [{"name": "Dana Wells", "emails": ["dana@newjob.test"],
-                      "phones": ["+14155552211"]}],
+                      "phones": ["+14155550108"]}],
         "contact_index": [{"canonical_id": "c_ab12cd34ef56", "display_name": "Dana Wells",
-                           "identifiers": ["4155552211"], "confidence": "medium"}],
+                           "identifiers": ["4155550108"], "confidence": "medium"}],
     }
     resolve = rl.build_identity_resolver(local)
-    for idv in ("dana@newjob.test", "+14155552211"):
+    for idv in ("dana@newjob.test", "+14155550108"):
         got = resolve(idv)
         assert got and got["canonical_id"] == "c_ab12cd34ef56", idv
 
@@ -547,7 +547,7 @@ def test_style_seed_adopts_the_person_files_cid(tmp_path, monkeypatch):
     index, lookup = se._seed_contact_index([CONTACT])
     assert index[0]["canonical_id"] == "c_1234567890ab"
     assert lookup["dana@acmecorp.test"][0] == "c_1234567890ab"
-    assert lookup["4155552211"][0] == "c_1234567890ab"     # the phone rides the same adoption
+    assert lookup["4155550108"][0] == "c_1234567890ab"     # the phone rides the same adoption
 
 
 def test_style_seed_still_mints_when_the_graph_is_silent(tmp_path, monkeypatch):
@@ -558,10 +558,10 @@ def test_style_seed_still_mints_when_the_graph_is_silent(tmp_path, monkeypatch):
 
 def test_display_lookup_never_borrows_cross_country_or_ambiguous_aliases():
     lookup = rl.build_contact_lookup([
-        {'name': 'US contact', 'phones': ['+1 8012345678']},
-        {'name': 'Japan contact', 'phones': ['+81 8012345678']},
+        {'name': 'US contact', 'phones': ['+1 8015550147']},
+        {'name': 'Japan contact', 'phones': ['+81 8015550147']},
         {'name': 'First card', 'emails': ['shared@example.com']},
         {'name': 'Second card', 'emails': ['shared@example.com']}])
-    assert rl.resolve_imessage_name('+81 8012345678', lookup) == 'Japan contact'
-    assert rl.resolve_call_name('+44 8012345678', lookup) is None
+    assert rl.resolve_imessage_name('+81 8015550147', lookup) == 'Japan contact'
+    assert rl.resolve_call_name('+44 8015550147', lookup) is None
     assert 'shared@example.com' not in lookup

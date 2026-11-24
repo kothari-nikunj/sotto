@@ -5,12 +5,15 @@ import pytest
 import meeting_context as context
 
 
-def test_meeting_evidence_folded_into_existing_email_loop_stays_linked(monkeypatch):
+@pytest.mark.parametrize('singleton', [False, True])
+def test_meeting_evidence_folded_into_existing_email_loop_stays_linked(monkeypatch, singleton):
     monkeypatch.setattr(context, 'allowed', lambda source: True)
     row = {'source_thread_id': 'email:thread', 'source_snippet': 'An older email quote',
            'source_refs': [{'source': 'granola', 'source_id': 'meeting-1',
                             'snippet': 'Dana: I will send the deck.'}],
            'ask': 'send the deck', 'action_type': 'waiting_on', 'status': 'open'}
+    if singleton:
+        row['source_refs'], = row['source_refs']
     result = context.obligations('meeting-1', [row])
     assert len(result) == 1
     assert result[0]['direction'] == 'they_owe_you'

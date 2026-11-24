@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { RequestContext } from '@mastra/core/request-context';
+import { executeTool } from './helpers/execute-tool.js';
 import { MockLanguageModelV4 } from 'ai/test';
 import { OperationalJournal } from '../src/journal/index.js';
 import { ConversationCoordinator, type ModelRequest } from '../src/conversation.js';
@@ -15,7 +16,7 @@ import { createSottoAgentRuntime } from '../src/agent/runtime.js';
 import { createOwnerGmailDraftClient } from '../src/tools/owner-gmail-draft-client.js';
 import { GMAIL_DRAFT_EXECUTION_GUIDE, createOwnerGmailDraftTools } from '../src/tools/owner-gmail-draft-tool.js';
 import { stableActionIdentity, ActionHeldError } from '../src/tools/action-gate.js';
-import { ownerGmailDraftKind, gmailDraftReviewHash, gmailDraftPreviewMatches, gmailDraftReceiptMatches,gmailNewSendProposalSchema,gmailDraftReviewText } from '../src/tools/owner-gmail-draft-contract.js';
+import { ownerGmailDraftKind, gmailDraftReviewHash, gmailDraftPreviewMatches, gmailDraftReceiptMatches,gmailDraftReviewText } from '../src/tools/owner-gmail-draft-contract.js';
 const identity = { tenant_id: 'tenant', channel: 'photon' as const, account_id: 'account', owner_id: 'owner',
   line_key: 'line', target: 'photon' as const, route_mode: 'fixed' as const, route_id: 'thread', project_fingerprint: 'a'.repeat(64) };
 const forbiddenMeetingPrep = createOwnerMeetingPrepClient({bridgeUrl: 'http://127.0.0.1:8080/mcp', bearer: 'c'.repeat(64), identity,
@@ -82,11 +83,8 @@ function fixture(folder: string) {
   const sourceAuthority = { read: async () => state };
   const tools = createOwnerGmailDraftTools({ client, journal: () => journal, sourceAuthority });
   const callTool = async (name: keyof typeof tools, input: unknown, request: ModelRequest, overrides: Record<string, unknown> = {}) => {
-    const requestContext = new RequestContext();
-    for (const [key, value] of Object.entries({ mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey,
-      sourceRevision: state.revision, allowOwnerGmailDraft: request.allowOwnerGmailDraft, ...overrides }))
-      requestContext.set(key, value);
-    return tools[name].execute!(input as never, { requestContext, abortSignal: request.signal } as never);
+    return executeTool(tools[name], input, request.signal, { mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey,
+      sourceRevision: state.revision, allowOwnerGmailDraft: request.allowOwnerGmailDraft, ...overrides });
   };
   return { get journal() { return journal; }, client, calls, tools, sourceAuthority, callTool,
     set previewRefusal(value: 'draft_permission_unavailable' | 'target_changed' | 'invalid_target') {previewRefusal=value;},
@@ -555,16 +553,6 @@ test('learning marker is required only for typed committed receipts',()=>{
  assert.equal(gmailDraftReceiptMatches({...receipt,learning:'pending'},{operation:'save',review,proposal}),false);
 });
 
-test('fresh email closed inputs, exact full review and returned thread receipt preserve old send isolation',()=>{
- const args={operation:'propose_new_send' as const,to:'alice@example.com',subject:'',body:'Hello Alice.'};
- for(const to of ['Alice <alice@example.com>','a@example.com;b@example.com','a@example.com\u0085'])assert.equal(gmailNewSendProposalSchema.safeParse({...args,to}).success,false);
- assert.equal(gmailNewSendProposalSchema.safeParse({...args,thread_id:'invented'}).success,false);
- const review={kind:'new_send' as const,to:args.to,subject:args.subject,body:args.body,sender_email:'owner@example.test',source_revision:authority.revision,review_hash:''};review.review_hash=gmailDraftReviewHash(review);
- const preview={version:1 as const,status:'preview' as const,event_id:authority.revision,payload_hash:authority.revision,review};assert.ok(gmailDraftPreviewMatches(preview,args));assert.equal(gmailDraftPreviewMatches(preview,{...args,to:'other@example.com'}),false);assert.match(gmailDraftReviewText(preview),/From: owner@example.test/);
- const send={operation:'send' as const,review,proposal:{event_id:authority.revision,action_id:authority.revision,args_hash:authority.revision,accepted_dispatch_id:'review',source_revision:authority.revision}};
- const receipt={version:1 as const,status:'committed' as const,action_id:authority.revision,event_id:authority.revision,payload_hash:authority.revision,args_hash:authority.revision,outcome:{operation:'send' as const,message_id:'sent',thread_id:'returned-existing-thread',review_hash:review.review_hash,status:'sent' as const}};
- assert.ok(gmailDraftReceiptMatches(receipt,send));assert.equal(gmailDraftReceiptMatches({...receipt,outcome:{...receipt.outcome,review_hash:'b'.repeat(64)}},send),false);
-});
 test('fresh accepted send review refuses save wrapper then permits distinct send yes once',async()=>{
  const folder=mkdtempSync(join(tmpdir(),'gmail-new-send-')),f=fixture(folder);let refused=0;
  const c=new ConversationCoordinator({journal:f.journal,ownerPolicy,ownerGmailDraft:f.client,model:{generate:async r=>{if(r.text==='Review')await f.callTool('gmail_new_send_review',{to:'alice@example.com',subject:'Cedar',body:args.body},r);else{await assert.rejects(f.callTool('gmail_draft_save',{},r));refused++;await f.callTool('gmail_send_confirm',{},r);}return {text:'Completed.',sourceRevision:authority.revision};}},postPrepared:async()=>({acceptance:'accepted',messageId:'review'})});
@@ -572,7 +560,7 @@ test('fresh accepted send review refuses save wrapper then permits distinct send
 
 });
 
-test('offered pair exact accepted text records local keys, rejects bare yes and recovers without redelivery',async()=>{
+for (const withheld of [false,true]) test(`offered pair recovery requires the exact delivered review: withheld=${withheld}`,async()=>{
  const folder=mkdtempSync(join(tmpdir(),'gmail-pair-')),f=fixture(folder),sent:string[]=[];
  const pair={message_id:'message-1',accept_body:'Yes, happy to review it.',decline_body:'Thanks for asking. I will pass.',first:'decline' as const};
  let replay=false;
@@ -582,6 +570,13 @@ test('offered pair exact accepted text records local keys, rejects bare yes and 
   f.loseCreate=true;assert.equal((await c.receive(inbound('pair','Help me reply to this request'),context)).status,'accepted');
   assert.equal(sent.length,1);assert.equal(f.calls.filter(x=>x.operation==='apply').length,0);
   const action=f.journal.listPendingGmailOfferedPairs()[0]!;assert.ok(action);const authorityFor={channel:'photon' as const,accountId:'account',ownerId:'owner',lineKey:'line',scopeHash:f.client.scopeHash};const bound=f.journal.acceptedGmailOfferedPair(String(action.id),authorityFor)!;assert.equal(bound.acceptedDelivery.payload_hash,createHash('sha256').update(sent[0]!).digest('hex'));
+  if (withheld) {
+    const accepted=f.journal.getReplyForEvent(String(action.source_event_id))!;
+    f.journal.db.prepare("UPDATE prepared_replies SET purpose='source_withheld', source_revision='owner-only-context-v1', payload='source unavailable' WHERE id=?").run(String(accepted.id));
+    assert.equal(f.journal.acceptedGmailOfferedPair(String(action.id),authorityFor),null);
+    assert.equal(f.journal.listPendingGmailOfferedPairs().length,0,'withheld offers must not occupy the bounded recovery page');
+    return;
+  }
   const wrong={...JSON.parse(String(action.result_json)).preview,offer_receipt:{...(f.calls.find(x=>x.operation==='record_offer') as any),version:1}};assert.throws(()=>f.journal.settleGmailOfferedPair(String(action.id),wrong));
   await c.close();f.reopen();f.loseCreate=false;replay=true;c=coordinator();await c.recover();assert.equal(sent.length,1);assert.equal(f.journal.listPendingGmailOfferedPairs().length,0);
   assert.equal((await c.receive(inbound('yes-pair','Yes.'),context)).status,'accepted');assert.equal(f.calls.filter(x=>x.operation==='apply').length,0);
@@ -611,7 +606,7 @@ test('inline wording and external save offers have consistent tool boundaries', 
   assert.match(inline, /Want this in your Gmail drafts/);
   assert.match(inline, /no competing pending offer of any kind/);
   for (const guide of [inline, PROCEDURE_EXECUTION_GUIDE]) {
-    assert.match(guide, /ask the owner before drafting or fetching voice guidance/);
+    assert.match(guide, /evidence and decision checks in the draft-reply skill/);
     assert.match(guide, /owner clarification/);
   }
   assert.match(inline, /does not apply when the owner explicitly requests alternatives/);

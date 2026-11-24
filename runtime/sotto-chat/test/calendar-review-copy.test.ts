@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {calendarReviewHash, calendarReviewSchema, calendarReviewText, validCalendarReview, type CalendarPreview} from '../src/tools/owner-calendar-contract.js';
+import {guardUnrecordedCalendarReply, calendarReviewHash, calendarReviewSchema, calendarReviewText, validCalendarReview, type CalendarPreview} from '../src/tools/owner-calendar-contract.js';
 const revision='a'.repeat(64);
 const common={calendar_id:'primary',event_id:revision,etag:'v1',summary:'Planning',html_link:'',source_revision:revision,notifications:'all',review_hash:revision};
 function preview(raw: unknown): CalendarPreview {
@@ -50,4 +50,9 @@ test('calendar all-day series review keeps exclusive end, response and before/af
   assert.match(calendarReviewText(rsvp),/When: All day, Oct 15, 2026; ends before Oct 17, 2026\nYour address: owner@example.com\nResponse: Accepted → Tentative/);
   assert.match(calendarReviewText(rsvp),/Your comment before: Yes\nYour comment after: May be late/);
   assert.match(calendarReviewText(rsvp),/The organizer and guests will be notified\. Mark tentative for the entire series\?/);
+});
+
+test('a calendar recap may quote the record of an earlier creation', () => {
+  const recap = 'Added Planning to your calendar.\nOct 15, 2026, 2:00 PM to 2:30 PM (UTC-07:00)';
+  assert.equal(guardUnrecordedCalendarReply(recap, false, 'What did you add to my calendar?'), recap);
 });

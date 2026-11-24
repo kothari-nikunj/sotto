@@ -7,7 +7,7 @@ No API key, browser download, service, native build, or model is required.
 
 It uses pinned [Mozilla Readability](https://github.com/mozilla/readability)
 (`0.6.0`, Apache-2.0) with [LinkeDOM](https://github.com/WebReflection/linkedom)
-(`0.18.13`, ISC). The latter supplies an inert HTML DOM without a browser's
+(`0.18.15`, ISC). The latter supplies an inert HTML DOM without a browser's
 script execution or resource loader. A lockfile pins transitive dependencies.
 The package is separate from `sotto-chat` so upgrades do not change chat's dependency tree.
 

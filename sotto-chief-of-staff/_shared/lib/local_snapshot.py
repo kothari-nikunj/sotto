@@ -66,6 +66,8 @@ def _merge_local_snapshot(local: dict, snapshot: dict) -> dict:
     prior_observed = cached.get("_source_observed_at") or {}
     prior_status = cached.get("source_status") or {}
     live_stamp = incoming.get("generated_at") or datetime.now(timezone.utc).isoformat()
+    coverage = incoming.get("source_coverage") if isinstance(incoming.get("source_coverage"), dict) else {}
+    failures = {}
     stale, unavailable = [], []
     for source, fields in SOURCE_FIELDS.items():
         known = source in status or source in prior_status or any(k in incoming or k in cached for k in fields)
@@ -78,10 +80,16 @@ def _merge_local_snapshot(local: dict, snapshot: dict) -> dict:
             status[source] = "disabled"
             availability[source] = "disabled"
             continue
+        # A failed read (timeout, busy worker, crash, query error) arrives as `degraded` with the
+        # empty fallback. It is not an observation: it never replaces the last good rows.
+        report = coverage.get(source) if isinstance(coverage.get(source), dict) else {}
+        failed_read = choice in ("partial", "degraded") and (
+            report.get("status") in ("failed", "unread")
+            or choice == "degraded" and not any(incoming.get(k) for k in fields))
         # A partial/degraded read can still contain the freshest rows. Keep every valid field it
         # explicitly returned, including an empty list, but never blend in cached sibling fields:
         # one source timestamp cannot truthfully age a mixture of fresh and cached observations.
-        if choice in ("partial", "degraded"):
+        if choice in ("partial", "degraded") and not failed_read:
             for field in fields:
                 value = incoming.get(field)
                 valid = (isinstance(value, dict) if field == "screen_time"
@@ -115,6 +123,12 @@ def _merge_local_snapshot(local: dict, snapshot: dict) -> dict:
         observed[source] = previous_stamp
         status[source] = choice or "unavailable"
         availability[source] = "unavailable"
+        if failed_read:
+            # The Bridge answered but this source's read failed: the brief names the failure time
+            # and the age of the carried rows, instead of "the Bridge was unreachable".
+            failures[source] = {"failed_at": live_stamp, "last_good_at": previous_stamp,
+                                "reason": _s(report.get("failure_category")) or "failed", "carried": carried}
+            continue
         if carried and previous_stamp:
             stale.append(previous_stamp)
         elif previous_stamp:
@@ -125,6 +139,10 @@ def _merge_local_snapshot(local: dict, snapshot: dict) -> dict:
         result["_source_availability"] = availability
     if observed:
         result["_source_observed_at"] = observed
+    if failures:
+        result["_source_failed"] = failures
+    else:
+        result.pop("_source_failed", None)
     if stale:
         result["_local_stale_since"] = min(stale)
     if unavailable and not stale:
@@ -132,7 +150,7 @@ def _merge_local_snapshot(local: dict, snapshot: dict) -> dict:
     return project_local(result)
 
 
-def _save_local_snapshot(local: dict) -> dict:
+def _save_local_snapshot(local: dict, *, require_write: bool = False) -> dict:
     """One locked writer: preserve per-source freshness and never revive disabled sources."""
     import jsonstore
     from source_context import bridge_request_epoch, project_local, record_bridge_status
@@ -170,7 +188,9 @@ def _save_local_snapshot(local: dict) -> dict:
             if old.endswith(".json") and old[:10] < cutoff:
                 os.remove(os.path.join(arch_dir, old))
     except (OSError, ValueError, TypeError, jsonstore.Unreadable):
-        pass  # a broken cache never makes live context unavailable
+        if require_write:
+            raise
+        # A broken cache never makes live context unavailable.
     return merged
 
 

@@ -68,6 +68,8 @@ def _db(root):
             db.execute('ALTER TABLE jobs ADD COLUMN handoff_attempts INTEGER NOT NULL DEFAULT 0')
         if 'provider_recoveries' not in columns:
             db.execute('ALTER TABLE jobs ADD COLUMN provider_recoveries INTEGER NOT NULL DEFAULT 0')
+        if 'prep_refresh' not in columns:
+            db.execute('ALTER TABLE jobs ADD COLUMN prep_refresh INTEGER NOT NULL DEFAULT 0')
         if 'admission' not in columns:
             db.execute('ALTER TABLE jobs ADD COLUMN admission TEXT')
         if 'feedback' not in columns:
@@ -565,8 +567,12 @@ def event_item_key(event) -> str:
     return 'event:' + hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
 
 
+class AdmissionWindowClosedError(Exception):
+    """New work has no useful delivery time left."""
+
+
 def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, priority=20,
-            item_keys=None, retry_terminal=False, shared_fixed_brief_wake=False, feedback=None, admission=None):
+            item_keys=None, retry_terminal=False, shared_fixed_brief_wake=False, feedback=None, admission=None, require_live_window=False):
     """Commit before acknowledging ingress/removing a held item. Replays keep one ID."""
     wake_name = None
     if shared_fixed_brief_wake:
@@ -596,6 +602,8 @@ def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, pr
                 if prior['admission'] != admission_json:
                     raise ValueError('work admission conflict')
                 return job_id
+            if require_live_window and time.time() >= valid_until:
+                raise AdmissionWindowClosedError
         if db.execute('SELECT 1 FROM routine_slots WHERE job_id=?', (job_id,)).fetchone():
             raise RuntimeError('routine slot requires protected admission')
         fixed = db.execute('SELECT name,last_work_status FROM fixed_slots WHERE job_id=?',
@@ -606,10 +614,7 @@ def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, pr
             raise RuntimeError('fixed brief wake identity changed')
         if fixed and wake_name != fixed['name']:
             raise RuntimeError('fixed slot requires protected admission')
-        # Terminal rows are evidence that this admitted request exhausted its bounded attempt
-        # budget (or deadline). A scheduler replay must not silently mint another budget forever.
-        # An ingress path with a real repeated request can opt in explicitly; that atomically starts
-        # a fresh admission while successful and in-flight identities remain deduplicated.
+        # Only an explicit new request may restart an exhausted attempt budget.
         terminal = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
         if (fixed or wake) and terminal is None:
             prior_status = fixed['last_work_status'] if fixed else wake['last_work_status']
@@ -661,7 +666,7 @@ def enqueue(root, kind, payload, key=None, not_before=None, valid_until=None, pr
         if terminal and terminal['status'] in ('failed', 'expired'):
             db.execute('''UPDATE jobs SET kind=?,payload=?,status='pending',created=?,due=?,
                        valid_until=?,priority=?,attempts=0,owner=NULL,lease_until=NULL,result=NULL,
-                       handoff_attempts=0,provider_recoveries=0,error=NULL,finished=NULL,feedback=? WHERE id=?''',
+                       handoff_attempts=0,provider_recoveries=0,prep_refresh=0,error=NULL,finished=NULL,feedback=? WHERE id=?''',
                        (kind, encoded, now, now if not_before is None else not_before,
                         valid_until, priority, json.dumps(feedback) if feedback else None, job_id))
             if fixed:
@@ -742,12 +747,17 @@ def _check_fixed_authority(db, authority_digest, schedule_digest=None):
 
 
 def fixed_slot(root, *, authority_digest, name, wall_slot):
-    """Read content-free fixed admission evidence; absence is not proof of a prior delivery."""
+    """Read a fixed slot with its live work status or retained disposition after pruning."""
     slot_hash = _fixed_hash(_fixed_identity(name, 'name'), _fixed_identity(wall_slot, 'wall slot'))
     _fixed_digest(authority_digest, 'schedule authority')
     with _db(root) as db:
         _check_fixed_authority(db, authority_digest)
-        row = db.execute('SELECT * FROM fixed_slots WHERE slot_hash=?', (slot_hash,)).fetchone()
+        row = db.execute('''SELECT f.slot_hash,f.name,f.job_id,f.work_key_digest,f.admitted,
+                            CASE WHEN j.status='leased' AND j.result IS NOT NULL THEN 'result_saved'
+                                 ELSE coalesce(j.status,f.last_work_status) END AS last_work_status,
+                            f.revision
+                            FROM fixed_slots f LEFT JOIN jobs j ON j.id=f.job_id
+                            WHERE f.slot_hash=?''', (slot_hash,)).fetchone()
         return dict(row) if row else None
 
 
@@ -882,7 +892,7 @@ def _decode(row):
     return out
 
 
-def claim(root, owner, now=None):
+def claim(root, owner, now=None, *, terminal_feedback=None):
     """At most two workers and one maintenance worker; aged maintenance gets the next free slot."""
     now = time.time() if now is None else now
     with _db(root) as db:
@@ -905,23 +915,10 @@ def claim(root, owner, now=None):
         db.execute("DELETE FROM jobs WHERE finished IS NOT NULL AND finished < ?", (now - RETENTION_SECONDS,))
         db.execute("""UPDATE jobs SET status=CASE WHEN result IS NULL THEN 'pending' ELSE 'ready' END,
                    owner=NULL WHERE status='leased' AND lease_until<=?""", (now,))
-        db.execute('''UPDATE fixed_slots SET last_work_status=(
-                       SELECT j.status FROM jobs j WHERE j.id=fixed_slots.job_id)
-                     WHERE job_id IN (SELECT id FROM jobs WHERE owner IS NULL
-                                      AND status IN ('pending','ready'))
-                       AND last_work_status IN ('leased','result_saved')''')
-        db.execute('''UPDATE fixed_brief_wakes SET last_work_status=(
-                       SELECT j.status FROM jobs j WHERE j.id=fixed_brief_wakes.job_id)
-                     WHERE job_id IN (SELECT id FROM jobs WHERE owner IS NULL
-                                      AND status IN ('pending','ready'))
-                       AND last_work_status IN ('leased','result_saved')''')
-        db.execute("""UPDATE jobs SET status='expired',payload='{}',result=NULL,
-                   finished=?,owner=NULL WHERE status IN ('pending','ready')
+        db.create_function('terminal_feedback', 3, terminal_feedback or (lambda feedback, _p, _r: feedback))
+        db.execute("""UPDATE jobs SET status='expired',feedback=terminal_feedback(feedback,payload,result),
+                   payload='{}',result=NULL,finished=?,owner=NULL WHERE status IN ('pending','ready')
                    AND valid_until IS NOT NULL AND valid_until<=?""", (now, now))
-        db.execute("""UPDATE fixed_slots SET last_work_status='expired'
-                   WHERE job_id IN (SELECT id FROM jobs WHERE status='expired')""")
-        db.execute("""UPDATE fixed_brief_wakes SET last_work_status='expired'
-                   WHERE job_id IN (SELECT id FROM jobs WHERE status='expired')""")
         active = db.execute("SELECT priority FROM jobs WHERE status='leased'").fetchall()
         if len(active) >= MAX_WORKERS:
             return None
@@ -949,21 +946,13 @@ def claim(root, owner, now=None):
                 break
             diagnostic = ('composition attempts exhausted' if row['result'] is None
                           else 'delivery handoff attempts exhausted')
-            db.execute("""UPDATE jobs SET status='failed',payload='{}',result=NULL,error=?,
-                       finished=?,owner=NULL,lease_until=NULL WHERE id=?""",
+            db.execute("""UPDATE jobs SET status='failed',feedback=terminal_feedback(feedback,payload,result),
+                       payload='{}',result=NULL,error=?,finished=?,owner=NULL,lease_until=NULL WHERE id=?""",
                        (diagnostic, now, row['id']))
-            db.execute("UPDATE fixed_slots SET last_work_status='failed' WHERE job_id=?",
-                       (row['id'],))
-            db.execute("UPDATE fixed_brief_wakes SET last_work_status='failed' WHERE job_id=?",
-                       (row['id'],))
         db.execute("""UPDATE jobs SET status='leased',owner=?,lease_until=?,
                    attempts=attempts+?,handoff_attempts=handoff_attempts+? WHERE id=?""",
                    (owner, now + LEASE_SECONDS, int(row['result'] is None),
                     int(row['result'] is not None), row['id']))
-        db.execute("UPDATE fixed_slots SET last_work_status=? WHERE job_id=?",
-                   ('result_saved' if row['result'] is not None else 'leased', row['id']))
-        db.execute("UPDATE fixed_brief_wakes SET last_work_status=? WHERE job_id=?",
-                   ('result_saved' if row['result'] is not None else 'leased', row['id']))
         return _decode(db.execute('SELECT * FROM jobs WHERE id=?', (row['id'],)).fetchone())
 
 
@@ -973,6 +962,36 @@ def renew(root, job_id, owner, now=None):
                           ((time.time() if now is None else now) + LEASE_SECONDS, job_id, owner)).rowcount == 1
 
 
+def tighten_deadline(root, job_id, owner, deadline, *, meeting_start=None):
+    with _db(root) as db:
+        return db.execute("""UPDATE jobs SET valid_until=min(coalesce(valid_until,?),?),
+                          feedback=CASE WHEN ? IS NULL THEN feedback ELSE json_set(feedback,'$.prep_meeting_start',
+                              min(coalesce(json_extract(feedback,'$.prep_meeting_start'),?),?)) END
+                          WHERE id=? AND owner=? AND status='leased'""",
+                          (deadline, deadline, meeting_start, meeting_start, meeting_start, job_id, owner)).rowcount == 1
+
+
+def start_prep_refresh(root, job_id, owner):
+    with _db(root) as db:
+        return db.execute("""UPDATE jobs SET prep_refresh=2 WHERE id=? AND owner=? AND status='leased'
+                          AND prep_refresh=1 AND result IS NULL""", (job_id, owner)).rowcount == 1
+
+
+def recover_prep(root, job_id, owner, reason, *, rebuild=False):
+    """Consume one refresh before contact. Never mint another after a crash or lost lease."""
+    now = time.time()
+    with _db(root) as db:
+        if rebuild and db.execute("""UPDATE jobs SET prep_refresh=1,status='pending',due=?,result=NULL,
+                owner=NULL,lease_until=NULL,error=? WHERE id=? AND owner=? AND status='leased'
+                AND prep_refresh=0 AND result IS NOT NULL AND valid_until>?""",
+                (now, reason, job_id, owner, now)).rowcount:
+            return 'pending'
+        changed = db.execute("""UPDATE jobs SET status='failed',payload='{}',result=NULL,finished=?,
+                owner=NULL,lease_until=NULL,error=? WHERE id=? AND owner=? AND status='leased'""",
+                (now, reason, job_id, owner)).rowcount
+        return 'failed' if changed else None
+
+
 def save_result(root, job_id, owner, result):
     """Keep the lease through the first handoff; the exact output is recoverable on expiry."""
     with _db(root) as db:
@@ -980,10 +999,6 @@ def save_result(root, job_id, owner, result):
                           WHERE id=? AND owner=? AND status='leased' AND result IS NULL""",
                           (json.dumps(result), job_id, owner)).rowcount:
             raise RuntimeError('work lease lost before result commit')
-        db.execute("UPDATE fixed_slots SET last_work_status='result_saved' WHERE job_id=?",
-                   (job_id,))
-        db.execute("UPDATE fixed_brief_wakes SET last_work_status='result_saved' WHERE job_id=?",
-                   (job_id,))
 
 
 def routine_slot_for_job(root, job_id):
@@ -1092,10 +1107,6 @@ def finish(root, job_id, owner, *, routine_handoff=None):
             db.execute('''UPDATE routine_slots SET completion_utc=?,handoff_kind=?,
                           handoff_digest=?,last_work_status='done' WHERE job_id=?''',
                        (completion_utc, handoff_kind, handoff_digest, job_id))
-        if changed:
-            db.execute("UPDATE fixed_slots SET last_work_status='done' WHERE job_id=?", (job_id,))
-            db.execute("UPDATE fixed_brief_wakes SET last_work_status='done' WHERE job_id=?",
-                       (job_id,))
         return changed == 1
 
 
@@ -1133,9 +1144,6 @@ def fail(root, job_id, owner, error, now=None, *, retry_provider=False, model_bu
                    payload=?,result=?,provider_recoveries=? WHERE id=?""",
                    (status, due, diagnostic, now if final else None, '{}' if final and not retired else row['payload'],
                     None if final else row['result'], recoveries, job_id))
-        db.execute('UPDATE fixed_slots SET last_work_status=? WHERE job_id=?', (status, job_id))
-        db.execute('UPDATE fixed_brief_wakes SET last_work_status=? WHERE job_id=?',
-                   (status, job_id))
         return status
 
 
@@ -1151,13 +1159,6 @@ def release(root, job_id, owner, now=None):
                           handoff_attempts=max(0, handoff_attempts - CASE WHEN result IS NOT NULL THEN 1 ELSE 0 END),
                           owner=NULL, lease_until=NULL, due=? WHERE id=? AND owner=? AND status='leased'
                           ''', (now, job_id, owner)).rowcount == 1
-        if changed:
-            db.execute('''UPDATE fixed_slots SET last_work_status=(
-                          SELECT status FROM jobs WHERE id=?) WHERE job_id=?''',
-                       (job_id, job_id))
-            db.execute('''UPDATE fixed_brief_wakes SET last_work_status=(
-                          SELECT status FROM jobs WHERE id=?) WHERE job_id=?''',
-                       (job_id, job_id))
         return changed
 
 

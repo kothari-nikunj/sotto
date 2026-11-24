@@ -42,7 +42,8 @@ def row():
 
 
 def events(root):
-    return [json.loads(line) for line in (root / "outcomes.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (root / "outcomes.jsonl").read_text().splitlines()]
+    return [row for row in rows if row["outcome"] != "loop_label"]  # owner labels: test_loop_labels
 
 
 def test_saved_transitions_are_content_free_and_idempotent(state):

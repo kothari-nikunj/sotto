@@ -48,7 +48,7 @@ test('pinned public Photon SDK send RPC contract over a synthetic loopback gRPC 
     assert.equal(lines.length, 1, 'fixture emits one bounded JSON result');
     assert.deepEqual(JSON.parse(lines[0]!), {
       ok: true,
-      sdk: { spectrum: '12.14.0', advanced: '2.4.0', niceGrpc: '2.1.18', grpc: '1.14.6' },
+      sdk: { spectrum: '12.16.0', advanced: '2.5.0', niceGrpc: '2.2.0', grpc: '1.14.7' },
       calls: { text: 2, multipart: 1, upload: 1 },
       successfulRootGuid: 'synthetic-root-message-guid',
       keysPresent: { text: true, multipart: true, upload: true },

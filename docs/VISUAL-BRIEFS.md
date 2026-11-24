@@ -12,13 +12,14 @@ a model omitting the schedule cannot turn a meeting-filled day into a thin text-
 The five-line preview includes the nearest remaining meetings and a slot for the nearest birthday,
 with further birthdays filling spare lines. Calendar dates and birthdays use the brief's local date.
 Explicit calendar mutes and source permissions are honored before this final pass.
-Agenda cards say **Coming up** when the brief's greeting is "Good evening" (composed from 5 PM
-local time, whatever the brief kind), with each row retaining its source-derived date; earlier
+Agenda cards say **Coming up** on the evening edition, which the receiver sets from the brief's
+label; only when no edition is supplied (a `render_cards.py` preview) does a "Good evening" greeting
+(composed from 5 PM local time) decide. Each row retains its source-derived date; other
 briefs keep **Your day**. Leading bold labels tolerate whitespace inside the emphasis
 markers, so a padded label does not print literal asterisks in Messages or on a card.
 
 Morning and evening cards cover needs-you, today, and calendar highlights. Every action, calendar event, and follow-up paragraph in the composed brief
-must fit; otherwise the whole brief stays text. Filtered-message tallies remain text-only. Meeting-prep cards quote relationship/founder background, business, signals/context, and question paragraphs. Each card allows up to 200 words, subject to measured readable-height validation; type never shrinks to fit. Briefs include a Follow-ups card with outstanding items before handled items when present. Individual nudges, pending consent or
+must fit; otherwise the whole brief stays text. Filtered-message tallies remain text-only. Meeting-prep cards show relationship context, then the questions to ask, followed by business and signals. If an introductory paragraph or a qualification would be lost, the owner receives the complete prep as text. Each card allows up to 200 words, subject to measured readable-height validation; type never shrinks to fit. Briefs include a Follow-ups card with outstanding items before handled items when present. Individual nudges, pending consent or
 procedure offers, and unsupported formats/channels remain text. A brief handoff question may ride
 the gallery only when its exact text is fully rendered in a card block; otherwise the brief stays
 text with reason `offer_not_visible`. There is no arbitrary text truncation or font
@@ -79,7 +80,11 @@ non-preview owner galleries inside seven days qualify. The manifest records the 
 fingerprint at render time. Changed or absent permission metadata withholds archived content and
 asks for a fresh consented read. Multiple date/topic matches require a choice. Text pages expose
 an explicit continuation offset; the response distinguishes composed text from original source
-transcripts. No extra model call, store, scheduler or new outward send is involved.
+transcripts. A fresh same-thread agreement can continue an inline draft offer when the
+immediately preceding gallery is proven by its accepted dispatch. Chat reads that exact
+artifact before selecting the offer. If the content is unavailable or more than one offer
+could apply, chat asks which offer the owner means. Agreement requests draft wording in
+chat and grants no permission to save or send it.
 
 Rendered files live in `$SOTTO_DATA/cache/visual-briefs/<content-id>/` with private permissions.
 They are delivery artifacts, not a second knowledge store. The receiver's existing retention

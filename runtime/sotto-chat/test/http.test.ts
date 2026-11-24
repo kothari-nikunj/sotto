@@ -203,7 +203,7 @@ test('gallery bytes require authentication, four canonical ordered PNGs, and own
     return { acceptance: 'accepted', message_id: 'group-id' };
   } });
   const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]);
-  const body = { dispatch_id: 'gallery-bytes-1', target: 'photon:+15550000000', summary: 'Résumé 📨 / 東京',
+  const body = { valid_until_ms: 123456, dispatch_id: 'gallery-bytes-1', target: 'photon:+15550000000', summary: 'Résumé 📨 / 東京',
     images: [1, 2, 3, 4].map(index => ({ name: `0${index}.png`, base64: png.toString('base64') })) };
   try {
     assert.equal((await f.request('/v1/send-gallery-bytes', body, 'bad')).status, 401);
@@ -215,7 +215,7 @@ test('gallery bytes require authentication, four canonical ordered PNGs, and own
       images: [{ ...body.images[0], base64: Buffer.from('not a png').toString('base64') }, ...body.images.slice(1)] })).status, 400);
     assert.equal(observed.length, 0);
     assert.equal((await f.request('/v1/send-gallery-bytes', body)).status, 200);
-    assert.deepEqual(observed, [{ dispatch_id: body.dispatch_id, target: body.target,
+    assert.deepEqual(observed, [{ valid_until_ms: body.valid_until_ms, dispatch_id: body.dispatch_id, target: body.target,
       summary: body.summary, images: body.images.map(image => ({ name: image.name, bytes: png })) }]);
   } finally { await f.close(); }
 });

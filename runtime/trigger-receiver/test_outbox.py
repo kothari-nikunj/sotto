@@ -99,6 +99,91 @@ def test_unknown_text_holds_across_restart_while_unrelated_text_delivers(tmp_pat
 
 
 
+def test_close_notice_holds_other_edition_while_provider_acceptance_is_uncertain(tmp_path):
+    box = _load_outbox()
+    box.HOOKS.update(data_root=lambda: str(tmp_path), json_transaction=_transaction)
+    notice = {'kind': 'closure_notice', 'anchor_key': 'task-1', 'closure_version': 'v1'}
+    for edition in ('morning', 'evening'):
+        box._enqueue(edition, box.KIND_BRIEF, {'effects': [notice]}, time.time(), '2026-11-08')
+    assert box._begin_send('morning')
+    assert isinstance(box._begin_send('evening'), dict)
+    box._settle('morning', False, 'response lost', 1, {'acceptance': 'unknown'})
+    assert not box._begin_send('evening')
+    box._definitive_receipt_failure('morning', 'not_attempted')
+    assert box._begin_send('morning')  # no replay of the superseded evening artifact
+
+
+def test_close_notice_holds_during_an_older_pending_delivery(tmp_path):
+    box = _load_outbox()
+    box.HOOKS.update(data_root=lambda: str(tmp_path), json_transaction=_transaction)
+    older = {'kind': 'closure_notice', 'anchor_key': 'task-1', 'loop_version': 'old-loop'}
+    current = {'kind': 'closure_notice', 'anchor_key': 'task-1',
+               'closure_version': 'new-closure', 'recorded_at': '2026-11-08T08:00:00+00:00'}
+    box._enqueue('before-upgrade', box.KIND_BRIEF, {'effects': [older]}, time.time(), '2026-11-08')
+    assert box._begin_send('before-upgrade')
+    box._enqueue('after-upgrade', box.KIND_BRIEF, {'effects': [current]}, time.time(), '2026-11-08')
+    assert isinstance(box._begin_send('after-upgrade'), dict)
+
+
+def test_accepted_close_supersedes_other_edition_and_keeps_unrelated_delivery(tmp_path):
+    box = _load_outbox()
+    notice = {'kind': 'closure_notice', 'anchor_key': 'task-1', 'closure_version': 'v1'}
+    sent, invalidated = [], []
+    reported = False
+
+    def accepted(payload):
+        nonlocal reported
+        if notice in payload['effects']:
+            reported = True
+
+    def send(body, target, key, attempt):
+        sent.append(key)
+        if key == 'morning':
+            assert not box._attempt('evening')
+            assert box._attempt('unrelated')
+        return True, '', {'acceptance': 'accepted'}
+
+    box.HOOKS.update(data_root=lambda: str(tmp_path), json_transaction=_transaction,
+                     local_today=lambda: '2026-11-08',
+                     valid=lambda payload: not reported or notice not in payload['effects'],
+                     on_delivered=accepted, on_invalid=lambda payload: invalidated.append(payload['run_id']),
+                     send=send)
+    for key, effects in [('morning', [notice]), ('evening', [notice]), ('unrelated', [])]:
+        box._enqueue(key, box.KIND_BRIEF, {'label': key, 'effects': effects, 'run_id': key},
+                     time.time(), '2026-11-08')
+    assert box._attempt('morning')
+    with _transaction(box.path(), {}) as doc:
+        box._find(box._rows(doc), 'evening')['next_at'] = 0
+    assert not box._attempt('evening')
+    assert sent == ['morning', 'unrelated']
+    assert invalidated == ['evening']
+
+
+def test_other_edition_recomposes_after_atomic_closure_overlap(tmp_path):
+    box = _load_outbox()
+    notice = {'kind': 'closure_notice', 'anchor_key': 'task-1', 'closure_version': 'v1'}
+    sent, invalidated = [], []
+
+    def send(body, target, key, attempt):
+        sent.append(key)
+        if key == 'morning':
+            assert not box._attempt('evening')
+            assert box.invalidated_claim('evening', '2026-11-08', 'evening')
+            assert box._attempt('evening-recomposed')
+            return False, 'response lost', {'acceptance': 'unknown'}
+        return True, '', {'acceptance': 'accepted'}
+
+    box.HOOKS.update(data_root=lambda: str(tmp_path), json_transaction=_transaction,
+                     local_today=lambda: '2026-11-08', valid=lambda _: True,
+                     on_invalid=lambda payload: invalidated.append(payload['run_id']), send=send)
+    for key, effects in [('morning', [notice]), ('evening', [notice]), ('evening-recomposed', [])]:
+        box._enqueue(key, box.KIND_BRIEF, {'label': key, 'effects': effects, 'run_id': key},
+                     time.time(), '2026-11-08')
+    assert not box._attempt('morning')
+    assert sent == ['morning', 'evening-recomposed']
+    assert invalidated == ['evening']
+
+
 def test_process_death_inside_effect_callback_consumes_budget_then_quarantines(tmp_path):
     box = _load_outbox()
     outbox_path = tmp_path / 'events' / 'outbox.json'
@@ -250,11 +335,13 @@ def test_delivery_readiness_holds_without_attempt_then_accepts_once_and_expiry_s
     box.HOOKS.update(data_root=lambda: str(tmp_path), json_transaction=_transaction,
         local_today=lambda: '2026-10-10', brief_gate=lambda *_: box.GATE_SEND,
         delivery_ready=lambda _: ready[0], on_delivered=lambda _: True,
-        send=lambda *args: (sent.append(args) or
+        retained_proof_current=lambda proof: proof == {'source_revision': 'a'*64, 'route_digest': 'b'*64},
+        send=lambda *args, source_revision: (sent.append(source_revision) or
             (True, 'accepted', {'acceptance': 'accepted', 'message_id': 'invented-1',
                                 'accepted_at': time.time()})))
     payload = {'label': 'onboarding:history-discovery:sotto-welcome-brief',
-               'body': 'Invented grounded discovery', 'target': 'owner', 'run_id': 'a' * 32}
+               'body': 'Invented grounded discovery', 'target': 'owner', 'run_id': 'a' * 32,
+               'prep_source_revision': 'a'*64, 'prep_route_digest': 'b'*64}
     assert box.deliver(payload) is False
     row = json.loads(Path(box.path()).read_text())['rows'][0]
     assert row['attempts'] == 0 and sent == []
@@ -278,6 +365,7 @@ def test_proved_background_text_forwards_composition_revision_without_replaying(
         return True, '', {'acceptance':'accepted','message_id':'pulse-accepted'}
     box.HOOKS.update(data_root=lambda:str(tmp_path), json_transaction=_transaction,
         local_today=lambda:'2026-10-13', valid=lambda payload:True, brief_gate=lambda *_:box.GATE_SEND,
+        retained_proof_current=lambda proof: proof == {'source_revision': 'b'*64, 'route_digest': 'c'*64},
         send=send, on_delivered=lambda payload:None)
     payload = {'label':'skill:'+'a'*64+':relationship-pulse','body':'I can draft a reply to Jackson Stokes.',
         'target':'owner','prep_source_revision':'b'*64,'prep_route_digest':'c'*64}

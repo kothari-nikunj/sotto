@@ -4,12 +4,16 @@ import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 import threading
+import time
 from urllib.parse import urlencode, urlsplit, parse_qs
 
 import pytest
 
 import client_mcp as mcp
+import client_mcp_audit
+import client_mcp_catalog as mcp_catalog
 import client_oauth as oauth
 import dashboard
 
@@ -34,6 +38,8 @@ def server(tmp_path, monkeypatch):
     reads = []
     def backend(name, args):
         reads.append((name, args))
+        if name == 'sotto_email_search':
+            client_mcp_audit.touch('gmail', 'PRIVATE backend value')
         return {'status': 'complete', 'sources': []}
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -150,7 +156,6 @@ def test_complete_hosted_login_refresh_revoke_and_existing_client(server):
     native, _ = mcp.create_grant(root, 'Existing native client', list(mcp.TOOLS), 1)
     assert read(call, native)[0] == 200
     # Tokens and authorization codes must never be stored in clear.
-    from pathlib import Path
     contents = (Path(root) / 'config/mcp-clients/oauth.sqlite3').read_bytes()
     for val in (*tokens.values(), result['code']):
         if isinstance(val, str) and val.startswith(('sotto_oauth_', result['code'])):
@@ -215,6 +220,39 @@ def test_no_host_header_trust_and_no_automatic_authority(server):
     assert reads == []
 
 
+def test_owner_only_connections_page_shows_durable_content_free_reads(server):
+    call, root, _ = server
+    client, result, cookie, _ = flow(server)
+    _, tokens = exchange(call, token_request(client, result['code']))
+    args = {'query': 'PRIVATE needle'}
+    auth = {'Authorization': 'Bearer ' + tokens['access_token'],
+            'Accept': 'application/json, text/event-stream'}
+    reply = call(mcp.PATH, 'POST', {'jsonrpc': '2.0', 'id': 22, 'method': 'tools/call',
+        'params': {'name': 'sotto_email_search', 'arguments': args}}, auth)
+    assert reply[0] == 200
+    logs = Path(root) / 'logs'
+    path = None
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        for path in logs.glob('mcp-access-*.jsonl'):
+            if path.stat().st_size:
+                break
+        else:
+            time.sleep(0.01)
+            continue
+        break
+    assert path is not None and path.stat().st_size
+    row = json.loads(path.read_text())
+    assert row['tool'] == 'sotto_email_search' and row['bytes'] > 0 and row['sources'] == ['gmail']
+    assert row['outcome'] == 'ok' and len(row['client']) == 12 and 'PRIVATE' not in path.read_text()
+    assert 'sotto_email_search' not in call('/client-oauth/connections')[2]
+    with mcp._RECENT_LOCK:
+        mcp._RECENT.clear()
+    page = call('/client-oauth/connections', headers={'Cookie': cookie})[2]
+    assert 'sotto_email_search' in page and row['client'] in page and 'gmail' in page
+    assert tokens['access_token'] not in page and 'PRIVATE' not in page
+
+
 def test_owner_disconnect_and_oauth_revocation(server):
     call, root, _ = server
     client, result, cookie, consent = flow(server)
@@ -242,9 +280,17 @@ def test_expiry_and_frozen_tool_scope(server, monkeypatch):
     assert exchange(call, token_request(client, result['code']))[0] == 400
     client, result, _, _ = flow(server)
     _, tokens = exchange(call, token_request(client, result['code']))
-    monkeypatch.setitem(mcp.TOOLS, 'future_tool', mcp.tool('Not approved'))
+    # A new consent stores read:all, so a read tool added later needs no reconnect...
+    monkeypatch.setitem(mcp.TOOLS, 'future_tool', mcp.read_tool('Future', 'A new read tool'))
+    monkeypatch.setattr(mcp_catalog, 'REVIEWED_READ_TOOLS', mcp_catalog.REVIEWED_READ_TOOLS | {'future_tool'})
     grant = oauth.authenticate(root, tokens['access_token'], dashboard.session_by_digest)
-    assert 'future_tool' not in grant['tools']
+    assert 'future_tool' in grant['tools']
+    with oauth.store(root) as db:
+        assert db.execute('SELECT tools FROM connections WHERE revoked=0').fetchone()[0] == '["read:all"]'
+        # ...but a connection approved with an explicit list keeps exactly that list.
+        db.execute('UPDATE connections SET tools=?', ('["sotto_person"]',))
+    grant = oauth.authenticate(root, tokens['access_token'], dashboard.session_by_digest)
+    assert grant['tools'] == ['sotto_person']
     with oauth.store(root) as db:
         db.execute("UPDATE tokens SET expires=0 WHERE kind='access'")
     assert read(call, tokens['access_token'])[0] == 401

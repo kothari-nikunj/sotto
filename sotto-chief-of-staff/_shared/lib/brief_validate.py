@@ -362,7 +362,7 @@ _NAME_WORD_RE = re.compile(r"^[A-Z][A-Za-z'’.-]*$")
 
 def is_name_shaped(name: str) -> bool:
     """A person's name is one to three capitalized, digit-free words. Everything else that lands in
-    `contact_name` — a meeting title ("Board sync"), an email prefix ("nikunj.k17") — is a machine
+    `contact_name` — a meeting title ("Board sync"), an email prefix ("casey.k17") — is a machine
     label the brief has no reason to print verbatim, so it can never be the evidence token. Public
     because continuity_resolve asks the same question before resolving a counterpart against the
     knowledge graph: a machine label is not a person, and must never adopt a person's identity."""
@@ -416,7 +416,7 @@ def _brief_marker_ids(markdown: str) -> set:
 def _evidence_tokens(entry: dict) -> list:
     """The prose strings that prove the brief named an entry which has NO identifier to prove it
     with — the only case still reduced to arguing from words. A FULL name (two or three words) or a
-    distinctive non-name label ("FPV / Piston", which can never be demanded of a brief but, when the
+    distinctive non-name label ("HBR / Piston", which can never be demanded of a brief but, when the
     brief printed it, means the ask was told). Never a lone first name: "Sam" in a line about Sam
     Patel is not evidence about the other Sam, and treating it as evidence silently deleted his
     overdue ask from both the printed lines and the count."""
@@ -475,22 +475,22 @@ def _next_day(today: str) -> str:
         return ""
 
 
-def is_urgent(entry: dict, today: str = "") -> bool:
+def is_urgent(entry: dict, today: str = "", told=None) -> bool:
     """Overdue, due within 24 hours, or already chased without an answer — UNTIL the hand-off
     question has been asked. `today` is the brief's own user-local date ("YYYY-MM-DD"); without one
     only the chase clock can speak, because a deadline means nothing without a day to compare it to.
 
-    THE HAND-OFF ENDS URGENCY. A `waiting_on` never expires, and a chased one is urgent forever, so
-    a debt Sotto had chased its full two times held a named line in EVERY brief from then on — the
-    wall this contract deleted, rebuilding itself one row at a time. Once the hand-off question has
-    been DELIVERED (`handoff_asked_at`, stamped by continuity_resolve's `--finalize-handoff`) the
-    user has been asked and it is their move: the loop drops to the count line and `/app#loops` and
-    stays there until they resolve it, drop it, or say keep waiting (which clears the stamp)."""
+    THE HAND-OFF ENDS URGENCY: a chased `waiting_on` never expires, so it held a line in EVERY
+    brief. Once the hand-off question is DELIVERED (`handoff_asked_at`, set by
+    `--finalize-handoff`) it is the user's move: the loop stays in the count line and `/app#loops`
+    until they act (keep or snooze clears the stamp) or the other side promises. So does `told`
+    (loop versions already named) for an unchanged overdue debt you owe."""
     if not isinstance(entry, dict):
         return False
     if entry.get('resolution_mode') == 'birthday_greeting':
         return False
-    if str(entry.get("handoff_asked_at") or "").strip():
+    if str(entry.get("handoff_asked_at") or "").strip() or (
+            told and __import__("ledger_io").told_unchanged(entry, today, told)):
         return False
     try:
         if int(entry.get("chased_count") or 0) >= 1:
@@ -502,27 +502,27 @@ def is_urgent(entry: dict, today: str = "") -> bool:
     return bool(deadline and tomorrow and deadline <= tomorrow)
 
 
-def _printable(entry: dict, today: str = "") -> bool:
+def _printable(entry: dict, today: str = "", told=None) -> bool:
     """Can this open loop earn its own named line? Urgent AND carrying an honest token to name it
     with. Everything else is the count line's — see `unsurfaced_open_loops`."""
-    return is_urgent(entry, today) and bool(_ledger_token(entry))
+    return is_urgent(entry, today, told) and bool(_ledger_token(entry))
 
 
-def missing_open_loops(brief_markdown: str, action_ledger: list, today: str = "") -> list:
+def missing_open_loops(brief_markdown: str, action_ledger: list, today: str = "", told=None) -> list:
     """The PRINTABLE open/waiting ledger entries the brief never names — the raw list behind rule
     (g), exposed so compose_brief's backstop can render exactly the misses this rule flags."""
     return [e for e in open_entries(action_ledger)
-            if _printable(e, today) and not _surfaced(e, brief_markdown)]
+            if _printable(e, today, told) and not _surfaced(e, brief_markdown)]
 
 
-def unsurfaced_open_loops(brief_markdown: str, action_ledger: list, today: str = "") -> list:
+def unsurfaced_open_loops(brief_markdown: str, action_ledger: list, today: str = "", told=None) -> list:
     """Every open loop the brief neither NAMED nor is about to PRINT — exactly what the single count
     line stands for. Not merely the non-urgent ones: an URGENT row with no honest token (a machine
     label for a name, a summary of short words) can never be printed either, and used to be in
     neither list — shown nowhere, counted nowhere, gone. The two lists are complementary by
     construction, so every open row lands in precisely one of surfaced / printed / counted."""
     return [e for e in open_entries(action_ledger)
-            if not _printable(e, today) and not _surfaced(e, brief_markdown)]
+            if not _printable(e, today, told) and not _surfaced(e, brief_markdown)]
 
 
 def _deterministic_lines(markdown: str, sections) -> list:
@@ -572,7 +572,7 @@ def _dropped_historical_task_hint(entry: dict, today: str) -> str:
 
 
 def _check_open_ledger_coverage(markdown: str, action_ledger: list, today: str = "",
-                                deterministic_sections=()) -> list:
+                                deterministic_sections=(), told=None) -> list:
     printed = _deterministic_loop_anchors(markdown, deterministic_sections)
     return [f"dropped-open-loop: URGENT open ledger item '{_ledger_token(e)}' "
             f"(loop {e.get('anchor_key')}, recorded {str(e.get('created_at') or '')[:10] or 'date unknown'}) "
@@ -580,7 +580,7 @@ def _check_open_ledger_coverage(markdown: str, action_ledger: list, today: str =
             f"Saved ask: {_one_line(e.get('ask'))}. Show this exact task with its original date "
             f"or Already Handled with evidence; keep distinct asks separate"
             f"{_dropped_historical_task_hint(e, today)}"
-            for e in missing_open_loops(markdown, action_ledger, today)
+            for e in missing_open_loops(markdown, action_ledger, today, told)
             if str(e.get('anchor_key') or '') not in printed]
 
 
@@ -765,13 +765,13 @@ def _check_already_nudged(markdown: str, nudged_senders) -> list:
 def validate(brief_markdown: str, action_items: list, rendered_source_text: str,
              first_run: bool = False, action_ledger: list | None = None,
              today: str = "", allowed_identifiers=None, already_nudged=None,
-             deterministic_sections=(), reviewed_task_keys=(), verified_loop_recipients=None) -> list:
+             deterministic_sections=(), reviewed_task_keys=(), verified_loop_recipients=None, told=None) -> list:
     """Pure: run every machine-checkable brief rule; return a list of one-line violation strings
     (empty = clean). Never raises on malformed input — a validator crash must not cost a brief.
     `first_run` marks the one-time onboarding brief, whose mandated trailing offer line is allowed
     past the Coming Up cap (see _check_coming_up_length). `action_ledger` is the open-loop ledger the
-    brief was built from (rule g); omit it and that rule simply doesn't run. `today` is the brief's
-    user-local date, which is what makes a deadline urgent or not. `allowed_identifiers` is the
+    brief was built from (rule g); omit it and that rule simply doesn't run. `today` and `told`
+    feed `is_urgent`. `allowed_identifiers` is the
     compose-time tap-target allowlist (rule e2); omit it and that rule doesn't run either.
     `already_nudged` is the list of sender names Sotto nudged the user about today (rule h); omit
     it and that rule doesn't run. `deterministic_sections` names the section headings the composer
@@ -793,7 +793,7 @@ def validate(brief_markdown: str, action_items: list, rendered_source_text: str,
         unreviewed = [row for row in action_ledger or []
                       if not isinstance(row, dict) or row.get('anchor_key') not in reviewed_task_keys]
         violations += _check_open_ledger_coverage(brief_markdown, unreviewed, today,
-                                                  deterministic_sections)
+                                                  deterministic_sections, told)
         violations += _check_marked_loop_wording(brief_markdown, unreviewed, today)
         violations += _check_no_open_loop_inventory(brief_markdown, deterministic_sections)
         violations += _check_already_nudged(brief_markdown, already_nudged)

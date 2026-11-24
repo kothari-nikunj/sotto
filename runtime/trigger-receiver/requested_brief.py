@@ -5,6 +5,11 @@ import math
 from pathlib import Path
 import re
 
+from shared_lib import load_shared_lib
+
+_ACCEPTED = load_shared_lib('accepted_briefs', anchor=__file__)
+_DELIVERY_BODY = load_shared_lib('message_targets', anchor=__file__).delivery_body
+
 LABEL = re.compile(r'^requested:([a-f0-9]{32}):sotto-(morning|evening)-brief$')
 
 
@@ -62,36 +67,19 @@ def accepted_artifact(root, day, kind, allowed):
     Pre-binding legacy artifacts are intentionally not guessed. Revoked or missing provenance
     needs fresh composition; historical content must not bypass today's source permissions.
     """
-    root = Path(root)
-    try:
-        rows = json.loads((root / 'events/outbox.json').read_text())['rows']
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-    accepted = {r['id'] for r in rows if isinstance(r, dict) and r.get('status') == 'delivered'
-                and r.get('day') == day and (r.get('payload') or {}).get('label', '').endswith(
-                    ':sotto-' + kind + '-brief')}
-    if not accepted:
-        return None
     candidates = []
-    for path in (root / 'events/work-inputs').glob('brief-*/artifact.json'):
-        try:
-            artifact = json.loads(path.read_text())
-            if (not accepted.intersection(artifact.get('_delivery_run_ids', []))
-                    or not isinstance(artifact.get('brief_text'), str)
-                    or not artifact['brief_text'].strip()):
-                continue
-            if artifact.get('_composition_direction'):
-                continue
-            sources = artifact.get('_source_permissions')
-            if not isinstance(sources, list) or not all(isinstance(s, str) and allowed(s) for s in sources):
-                continue
-            # Offers are transactional: never replay an old actionable question.
-            if any(artifact.get(key) for key in ('_review_candidate', '_review_question', '_parking_notices')):
-                continue
-            stamp = float(artifact.get('composed_at') or 0)
-            if not math.isfinite(stamp) or stamp <= 0:
-                continue
-            candidates.append(artifact)
-        except (OSError, ValueError, TypeError, AttributeError):
+    for reference, artifact, _, _, _ in _ACCEPTED.bindings(root, delivery_body=_DELIVERY_BODY):
+        if reference != f'{day}_{kind}' or artifact.get('_composition_direction'):
             continue
-    return max(candidates, key=lambda a: float(a.get('composed_at') or 0), default=None)
+        if not _ACCEPTED.permitted_sources(artifact, allowed):
+            continue
+        # Offers are transactional: never replay an old actionable question.
+        if any(artifact.get(key) for key in ('_review_candidate', '_review_question', '_parking_notices', '_contextual_offer')):
+            continue
+        try:
+            stamp = float(artifact.get('composed_at') or 0)
+        except (ValueError, TypeError):
+            continue
+        if math.isfinite(stamp) and stamp > 0:
+            candidates.append((stamp, artifact))
+    return max(candidates, key=lambda pair: pair[0], default=(0, None))[1]

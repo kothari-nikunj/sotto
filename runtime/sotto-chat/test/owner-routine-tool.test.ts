@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { RequestContext } from '@mastra/core/request-context';
+import { executeTool } from './helpers/execute-tool.js';
 import { MockLanguageModelV4 } from 'ai/test';
 import { OperationalJournal } from '../src/journal/index.js';
 import { ConversationCoordinator, type ModelRequest } from '../src/conversation.js';
@@ -95,11 +95,8 @@ function fixture(folder: string) {
   const sourceAuthority = { read: async () => state };
   const tools = createOwnerRoutineTools({ client, journal: () => journal, sourceAuthority });
   const callTool = async (name: keyof typeof tools, input: unknown, request: ModelRequest, overrides: Record<string, unknown> = {}) => {
-    const requestContext = new RequestContext();
-    for (const [key, value] of Object.entries({ mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey,
-      sourceRevision: state.revision, allowOwnerRoutine: request.allowOwnerRoutine, ...overrides }))
-      requestContext.set(key, value);
-    return tools[name].execute!(input as never, { requestContext, abortSignal: request.signal } as never);
+    return executeTool(tools[name], input, request.signal, { mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey,
+      sourceRevision: state.revision, allowOwnerRoutine: request.allowOwnerRoutine, ...overrides });
   };
   return { get journal() { return journal; }, client, calls, tools, sourceAuthority, callTool,
     set previewRefusal(value: 'routine_limit' | 'routine_conflict' | 'unsupported_definition') {previewRefusal=value;},

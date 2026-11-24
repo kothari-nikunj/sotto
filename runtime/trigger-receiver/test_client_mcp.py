@@ -105,7 +105,7 @@ def test_ungranted_tool_cannot_call_backend(access):
 def test_invalid_tool_inputs_never_reach_readers(access, name, arguments):
     result = mcp.dispatch(request(name=name, arguments=arguments), access[2],
                           lambda *_: pytest.fail('invalid arguments reached backend'))
-    assert result['error']['code'] == -32602
+    assert result['result']['isError'] is True
 
 
 def test_notifications_and_unknown_methods_cannot_read(access):
@@ -274,11 +274,11 @@ def test_status_offline_and_failed_health_leave_search_window_unknown():
 def test_google_mcp_calls_use_actual_read_owner_projection(tmp_path, monkeypatch, name, args, responses, source):
     from test_receiver import rec
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
-    # The receiver owns credential-root resolution (including compatible pilots).
-    # MCP must use its authority result rather than repeat an environment check.
+    # The receiver owns credential-root resolution.
+    # MCP uses its authority result, not an environment check.
     monkeypatch.delenv('SOTTO_HOME', raising=False)
     monkeypatch.setenv('SOTTO_USER_EMAIL', 'owner@example.test')
-    monkeypatch.setattr(rec, '_runtime_source_authority', lambda: {
+    monkeypatch.setattr(rec, '_runtime_source_authority', lambda **_: {
         'complete': True, 'revision': REVISION, 'bridge_sources': [], 'google_sources': [source]})
     api = rec._sotto_adapter('google_api')
     original = api.read_owner
@@ -293,7 +293,7 @@ def test_google_mcp_calls_use_actual_read_owner_projection(tmp_path, monkeypatch
     assert result['source'] == source
     assert len(calls) == len(responses)
     assert result['observation']['status'] == ('partial' if name == 'sotto_email_search' else 'ok')
-    monkeypatch.setattr(rec, '_runtime_source_authority', lambda: {
+    monkeypatch.setattr(rec, '_runtime_source_authority', lambda **_: {
         'complete': True, 'revision': REVISION, 'bridge_sources': [], 'google_sources': []})
     with pytest.raises(RuntimeError):
         backend.read(rec, name, args)
@@ -303,7 +303,7 @@ def test_google_mcp_calls_use_actual_read_owner_projection(tmp_path, monkeypatch
 def test_calendar_original_reader_enforces_window_before_provider(tmp_path, monkeypatch):
     from test_receiver import rec
     monkeypatch.setenv('SOTTO_HOME', str(tmp_path))
-    monkeypatch.setattr(rec, '_runtime_source_authority', lambda: {
+    monkeypatch.setattr(rec, '_runtime_source_authority', lambda **_: {
         'complete': True, 'revision': REVISION, 'google_sources': ['calendar']})
     api = rec._sotto_adapter('google_api')
     original = api.read_owner
@@ -341,8 +341,8 @@ def test_stdio_survives_one_broken_http_response(access, monkeypatch, tmp_path, 
 def test_backend_preserves_bridge_coverage_and_checks_consent():
     calls = []
     authority = {'complete': True, 'revision': REVISION, 'bridge_sources': ['imessage']}
-    r = SimpleNamespace(_runtime_source_authority=lambda: authority,
-        RELAY=SimpleNamespace(mcp_call=lambda req, **kw: calls.append(req) or
+    r = SimpleNamespace(_runtime_source_authority=lambda **_: authority,
+        RELAY=SimpleNamespace(bridge_connected=bool, mcp_call=lambda req, **kw: calls.append(req) or
               {'result': {'content': [{'type': 'text', 'text': '{"partial":true,"matches":[]}'}]}}),
         _source_context=lambda: SimpleNamespace(unwrap_tool_result=lambda v: json.loads(v['content'][0]['text'])))
     args = {'query': 'Cedar', 'sources': ['imessage'], 'since': 1, 'until': 2}
@@ -390,7 +390,7 @@ def test_stdio_http_real_canonical_readers_and_no_writes(graph, monkeypatch):
     private.write_text(json.dumps({'token': token}))
     private.chmod(0o600)
     monkeypatch.setattr(rec, 'DATA', str(root))
-    monkeypatch.setattr(rec, '_runtime_source_authority', lambda: {
+    monkeypatch.setattr(rec, '_runtime_source_authority', lambda **_: {
         'complete': True, 'revision': REVISION, 'bridge_sources': [], 'google_sources': ['gmail']})
     monkeypatch.setattr(rec, '_spawn_env', lambda _: {**os.environ, 'SOTTO_DATA': str(root)})
     monkeypatch.setattr(rec, '_find_sotto_script', lambda *parts: str(PACK.joinpath(*parts)))
@@ -455,8 +455,7 @@ def test_email_limit_error_is_actionable_and_never_echoes_query(access):
     seen = []
     result = mcp.dispatch(request(name='sotto_email_search', arguments={'query': 'PRIVATE', 'max': 40}),
                           access[2], lambda *args: seen.append(args))
-    assert result['error']['code'] == -32602
-    assert 'max: use an integer from 1 to 20' in result['error']['message']
+    assert result['result']['structuredContent']['detail'] == 'max: use an integer from 1 to 20'
     assert 'PRIVATE' not in json.dumps(result) and seen == []
     result = mcp.dispatch(request(name='sotto_email_search', arguments={'query': 'PRIVATE', 'max': 20}),
                           access[2], lambda *args: seen.append(args) or {'items': []})
@@ -468,16 +467,15 @@ def test_local_future_window_is_recoverable_not_source_outage(access, monkeypatc
     result = mcp.dispatch(request(name='sotto_search_local', arguments={
         'query': 'PRIVATE', 'sources': ['imessage'], 'since': 1762128000, 'until': 1793664000}),
         access[2], lambda *_: pytest.fail('invalid future window reached Bridge'))
-    assert result['error']['code'] == -32602
-    assert 'ending no later than now' in result['error']['message']
+    value = result['result']
+    assert value['structuredContent']['reason'] == 'invalid_window' and 'later than now' in value['content'][0]['text']
     assert 'PRIVATE' not in json.dumps(result)
 
 
 def test_company_bad_cursor_is_recoverable_without_private_echo(access):
     result = mcp.dispatch(request(name='sotto_company', arguments={'company': 'Cedar', 'cursor': 'PRIVATE'}),
                           access[2], lambda *_: pytest.fail('invalid cursor reached reader'))
-    assert result['error']['code'] == -32602
-    assert 'next_cursor' in result['error']['message'] and 'PRIVATE' not in json.dumps(result)
+    assert 'next_cursor' in result['result']['structuredContent']['detail'] and 'PRIVATE' not in json.dumps(result)
 
 
 def test_call_logs_are_content_free_and_distinguish_unavailable(access, capsys):
@@ -615,7 +613,7 @@ def test_extended_source_catalog_routes_only_explicit_grants(access, name, argum
 def test_extended_source_inputs_refuse_before_backend(access, name, arguments):
     result = mcp.dispatch(request(name=name, arguments=arguments), access[2],
         lambda *_: pytest.fail('invalid source arguments reached backend'))
-    assert result['error']['code'] == -32602
+    assert result['result']['isError'] is True
 
 
 def test_source_status_distinguishes_client_readers_from_source_availability(access):

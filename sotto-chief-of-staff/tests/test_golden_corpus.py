@@ -32,8 +32,8 @@ KEY_B = "cd" * 32
 
 # Real identities the synthetic volume knows. Two colleagues share acmecorp.test; a third is
 # elsewhere; one address appears ONLY inside message prose (the residual-sweep case).
-DANA_PHONE = "+14155552211"
-MARCUS_PHONE = "+12069994970"
+DANA_PHONE = "+14155550108"
+MARCUS_PHONE = "+12065550143"
 DANA_EMAIL = "dana@acmecorp.test"
 LEO_EMAIL = "leo@acmecorp.test"
 MARCUS_EMAIL = "marcus@betaworks.test"
@@ -99,7 +99,7 @@ def seed_data(root: str) -> str:
         json.dump([
             {"id": "m1", "threadId": "t-1", "from": f"Dana Wells <{DANA_EMAIL}>", "to": USER_EMAIL,
              "subject": "Redlines for AcmeCorp", "snippet": "Can you sign off before noon?",
-             "body": f"Leo Fry is copied at {LEO_EMAIL}. Call me on 415-555-2211.",
+             "body": f"Leo Fry is copied at {LEO_EMAIL}. Call me on 415-555-0108.",
              "date": "2026-08-09T09:00:00+00:00", "labelIds": ["INBOX"]},
             {"id": "m2", "threadId": "t-2", "from": f"Marcus Lee <{MARCUS_EMAIL}>", "to": USER_EMAIL,
              "subject": "Pricing", "snippet": "please confirm", "body": "Need the model by tomorrow.",
@@ -387,8 +387,8 @@ def test_gmail_wire_dates_parse_and_bucket(corpus):
     ms = str(int(datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc).timestamp() * 1000))
     dt3, kind3 = bgc._parse_any(ms)
     assert kind3 == "ISO" and (dt3.hour, dt3.minute) == (12, 0)
-    assert bgc._parse_any("4155552211")[0] is None             # a phone is not a clock
-    assert bgc._parse_any("2065551234")[0] is None
+    assert bgc._parse_any("4155550108")[0] is None             # a phone is not a clock
+    assert bgc._parse_any("2065550102")[0] is None
     m3 = next(e for e in corpus["days"]["day-00"]["inputs"]["google"]["emails"]
               if e.get("subject") == "Wire-format clock")      # header-dated mail reached its day
     assert m3["date"].startswith("{{") and m3["date"].endswith("}}")

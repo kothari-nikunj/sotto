@@ -68,7 +68,7 @@ DEFAULT_TTL_MIN = 180   # a question goes stale in three hours; a named constant
 DISMISS_RESOLVED = ("done", "handled", "already handled", "sorted", "taken care of")
 DISMISS_DROPPED = ("let it go", "drop it", "stop tracking this", "drop this loop")
 DECLINE_OFFER = ("no", "nah", "nope", "no thanks", "no thank you", "not now", "not yet",
-                 "skip", "skip it", "leave it", "forget it")
+                 "skip", "skip it", "leave it", "forget it", "hide")
 LOOP_KINDS = frozenset(("chase", "commitment", "handoff"))
 # accepted_at is the receiver's clock after the runtime send returns; the reply timestamp is the
 # provider's. A question accepted within this window of the reply may be what it answers.
@@ -304,7 +304,7 @@ def dismiss_reply(reply: str, **selectors) -> dict:
     """
     text = " ".join(reply.lower().rstrip(" .!…\t\r\n").split())
     offer = get_offer(**selectors)
-    if not offer:
+    if not offer or (text == 'hide' and offer.get('action') != 'contextual_draft'):
         return {"action": "no_offer", "reason": "no fresh offer", "loop_changed": False}
     if offer.get('ambiguous'):
         return {'action': 'clarify', 'reason': 'more than one delivered question is unanswered',
@@ -419,6 +419,11 @@ def main() -> None:
 def _accepted_records(state):
     return {key: value for key, value in state.get('accepted', {}).items()
             if (_parse(value.get('expires_at') if isinstance(value, dict) else value) or _now()) > _now()}
+
+
+def was_accepted(offer_id):
+    with jsonstore.lock(_path()):
+        return offer_id in _accepted_records(jsonstore.read(_path(), {}))
 
 
 def inspect_reply(event_id, proof_hash):

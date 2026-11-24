@@ -1,11 +1,4 @@
-"""Trusted, one-boot Linux lifecycle boundary for the supervised Sotto runtime.
-
-The root supervisor constructs this before starting any child in an exclusive
-container PID namespace. It retains the tenant flock for its whole life, proves
-the namespace is empty before launch, then owns exactly the Node and receiver
-role trees. It does not decide whether a send or fire was successful, and
-nothing it records can be saved for a later process to trust.
-"""
+"""Own the Linux tenant flock and supervised roles from empty startup to shutdown."""
 from __future__ import annotations
 
 import ctypes
@@ -377,8 +370,8 @@ class Lifecycle:
         self._lock_fd = None
         self._state = 'closed'
 
-    def _replacement_tree(self) -> list[_Process]:
-        """Inventory the two role UIDs without mistaking adopted grandchildren for outsiders."""
+    def _replacement_tree(self, *, allow_external_exec: bool = False) -> list[_Process]:
+        """Inventory both role trees, including adopted grandchildren."""
         for _attempt in range(2):
             processes = _processes()
             selected = []
@@ -386,11 +379,14 @@ class Lifecycle:
             for entry in processes.values():
                 if entry.pid in (1, self._pid):
                     continue
+                leader = self._replacement_leaders.get(entry.pid)
                 ancestry = set()
                 current = entry
                 while current.pid != self._pid:
                     if current.pid in ancestry or current.pid == 1:
                         raise LifecycleUnavailableError('process outside replacement tree')
+                    if allow_external_exec and current.ppid == 0 and leader is None:
+                        break
                     ancestry.add(current.pid)
                     parent = processes.get(current.ppid)
                     if parent is None:
@@ -399,7 +395,8 @@ class Lifecycle:
                     current = parent
                 if missing_parent:
                     break
-                leader = self._replacement_leaders.get(entry.pid)
+                if current.pid != self._pid:
+                    continue
                 if entry.uid not in (10000, self._native_uid) and not (
                         entry.uid == 0 and leader == (entry.starttime, 0)):
                     raise LifecycleUnavailableError('replacement UID outside boundary')
@@ -659,14 +656,14 @@ class Lifecycle:
                                     node_quiesce_signal=node_quiesce_signal)
         # Do not set quiescent: no provider-effect reconciliation exists here.
 
-    def check_replacement(self) -> None:
+    def check_replacement(self, *, allow_external_exec: bool = False) -> None:
         """A missing role leader is failure even if an adopted grandchild remains."""
         if self._state != 'replacement':
             raise LifecycleUnavailableError('replacement is not running')
         try:
             self._assert_lock()
             self._reap()
-            self._replacement_tree()
+            self._replacement_tree(allow_external_exec=allow_external_exec)
             for pid, (starttime, expected_uid) in self._replacement_leaders.items():
                 observed = _read_process(pid)
                 if (observed is None or observed.starttime != starttime

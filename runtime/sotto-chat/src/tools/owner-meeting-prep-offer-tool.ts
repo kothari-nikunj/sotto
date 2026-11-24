@@ -7,14 +7,18 @@ import {ownerMeetingPrepOfferArgsSchema, ownerMeetingPrepOfferKind, ownerMeeting
   ownerMeetingPrepOfferQuestion, ownerMeetingPrepOfferToolInputSchema} from './owner-meeting-prep-offer-contract.js';
 import type {OwnerMeetingPrepOfferClient} from './owner-meeting-prep-offer-client.js';
 
-export const MEETING_PREP_OFFER_GUIDE = 'Use this offer only for one current Calendar occurrence within the next 72 hours that has exactly one external invitee; verify its exact title, time, calendar ID and attendee email with current calendar_list/get results. If the owner has already asked directly for preparation, use the existing meeting-prep worker instead of making another offer. Then call owner_meeting_prep_offer with the exact calendar_id, event_id, start and attendee_email. It validates consent and source identity and returns one canonical question. Finish the turn with that exact review_text only; do not say preparation is queued or done. The offer activates only if that exact question is accepted by the provider. Wait for the owner to answer it before claiming full preparation is queued. Never research or send a proposal from this offer tool.';
+const inputSchema = ownerMeetingPrepOfferToolInputSchema.extend({
+  standalone: z.boolean().optional().describe('True only if the canonical offer question answers the whole owner message. False if any separate work or answer is needed.'),
+});
+
+export const MEETING_PREP_OFFER_GUIDE = 'Use this offer only for one current Calendar occurrence within the next 72 hours that has exactly one external invitee; verify its exact title, time, calendar ID and attendee email with current calendar_list/get results. If the owner has already asked directly for preparation, use the existing meeting-prep worker instead of making another offer. Use owner_meeting_prep_offer with standalone:true only when the offer question is the whole reply. For mixed requests, complete the requested work and answer the independent parts without staging an optional prep question. The runtime delivers the canonical offer after consent and identity checks; do not say preparation is queued or done. The offer activates only if that exact question is accepted by the provider. Wait for the owner to answer it before claiming full preparation is queued. Never research or send a proposal from this offer tool.';
 
 export function createOwnerMeetingPrepOfferTool(options: {
   client: OwnerMeetingPrepOfferClient;
   journal(): OperationalJournal | undefined;
   sourceAuthority: SourceAuthorityReader;
 }) {
-  type Context = {requestContext?:{get(key:string):unknown}; abortSignal?:AbortSignal};
+  type Context = {requestContext?:{get(key:string):unknown;set(key:string,value:string):void}; abortSignal?:AbortSignal};
   const trusted = (context:Context) => {
     const journal=options.journal(), runId=context.requestContext?.get('runId'), eventId=context.requestContext?.get('ownerRequestKey');
     if(!journal||context.requestContext?.get('mode')!=='chat'||typeof runId!=='string'||typeof eventId!=='string'||
@@ -31,11 +35,15 @@ export function createOwnerMeetingPrepOfferTool(options: {
       throw new SourceAuthorityChanged();
     return current.revision;
   };
-  const proposed=(question:string)=>({status:'proposed',review_text:question,needs_owner_confirmation:true,
-    instruction:'Finish this turn with the exact review_text only. The runtime sends that canonical offer question. Do not claim preparation is queued; wait for the owner to answer it.'});
   const execute=async(input:unknown,context:Context)=>{
     const {journal,authority,eventId}=trusted(context);
-    const toolInput=ownerMeetingPrepOfferToolInputSchema.parse(input);
+    const {standalone,...toolInput}=inputSchema.parse(input);
+    if(standalone===false || context.requestContext?.get('ownerPrepOfferHandoff')==='deferred')return {status:'deferred',instruction:'No offer was staged. Finish the owner’s requested work and answer the independent parts. For directly requested prep, use the meeting-prep worker.'};
+    const proposed=(question:string)=>{
+      if(standalone===true)context.requestContext?.set('ownerPrepOfferHandoff','settled');
+      return {status:'proposed',review_text:question,needs_owner_confirmation:true,
+        instruction:'The runtime delivers this exact question. Wait for the owner to answer before claiming preparation is queued.'};
+    };
     const revision=context.requestContext?.get('sourceRevision');
     await sourceCurrent(context,revision);
     const admitted=journal.ownerReminderToolAdmission(authority,eventId,true);
@@ -78,7 +86,7 @@ export function createOwnerMeetingPrepOfferTool(options: {
     owner_meeting_prep_offer:createTool({
       id:'owner_meeting_prep_offer',
       description:'Offer a full meeting-preparation briefing only for one exact Calendar occurrence within the next 72 hours with exactly one external invitee. Use only after current Calendar reads establish its exact calendar_id, event_id, start and invited email. If the owner has already asked directly for preparation, use the existing meeting-prep worker instead of creating another offer. The receiver independently revalidates consent, occurrence and invitee. This stages only a question; no research or prep is queued until the owner accepts that exact delivered question. Never invent an attendee, event or time.',
-      inputSchema:ownerMeetingPrepOfferToolInputSchema,
+      inputSchema,
       execute,
     }),
   };

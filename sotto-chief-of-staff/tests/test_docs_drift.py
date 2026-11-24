@@ -279,14 +279,8 @@ def test_explicit_timer_grace_matches_rules_and_prose():
 
 
 def test_delivery_outbox():
-    """The outbox's retry numbers, and the one it is not allowed to invent.
-
-    A queued nudge and a held nudge are the same nudge at two different moments, so they must age
-    out on the SAME clock: `outbox.NUDGE_MAX_AGE_MIN` mirrors `triage_event.VALVE_MAX_AGE_MIN` for
-    the same copy-plus-guard reason keys.py and the dashboard's mirrors exist — the receiver image
-    cannot import the skills tree, so the constant is duplicated exactly once and this is what keeps
-    the copies honest. The day-long expiries (a brief, the digest) are a date comparison against the
-    local day, not a number, so there is nothing here for them to drift from."""
+    """The outbox's retry numbers. A queued and a held nudge age out on the SAME clock: the receiver
+    image cannot import the skills tree, so `NUDGE_MAX_AGE_MIN` is copied once and guarded here."""
     _same("outbox.drain_interval_secs", R["outbox"]["drain_interval_secs"], ob.DRAIN_INTERVAL_SECS)
     _same("outbox.backoff_base_secs", R["outbox"]["backoff_base_secs"], ob.BACKOFF_BASE_SECS)
     _same("outbox.backoff_max_secs", R["outbox"]["backoff_max_secs"], ob.BACKOFF_MAX_SECS)
@@ -296,6 +290,11 @@ def test_delivery_outbox():
     _same("outbox.nudge_max_age_min (the funnel's own window)", ob.NUDGE_MAX_AGE_MIN,
           te.VALVE_MAX_AGE_MIN)
     _anchor("retries every minute")
+    grace, absent = R["outbox"]["unconfirmed_grace_min"], R["outbox"]["not_found_after_secs"]
+    _same("outbox.unconfirmed_grace_min", grace * 60, ob.UNCONFIRMED_GRACE_SECS)
+    _same("outbox.not_found_after_secs", absent, ob.NOT_FOUND_AFTER_SECS)
+    _anchor(f"window ends plus a {grace}-minute grace")
+    _anchor(f"has no record of {absent} seconds after contact")
     # The send seam's two "did this run actually do the work" checks share one window: the
     # composed archive (a body is a brief only if compose_brief archived one) and the Learn receipt.
     _same("outbox.composed_brief_max_age_hours", R["outbox"]["composed_brief_max_age_hours"] * 3600,
@@ -401,15 +400,15 @@ def test_account_broker_capacity_guards():
 
 
 def test_the_learn_step_is_one_command_with_a_receipt():
-    """Three loops (knowledge, preferences, style) rest on the Learn step, so the step is machinery:
-    learn_step.py runs the seven writers and leaves briefs/<day>.<kind>.learned.json, the receiver
+    """Three loops (knowledge, preferences, style) rest on the Learn step, so it's machinery:
+    learn_step.py runs each writer and leaves briefs/<day>.<kind>.learned.json, the receiver
     reads it on the ack, and retention ages it with the brief."""
     ls = _load("dd_learn_step", PACK, "_shared", "scripts", "learn_step.py")
     _same("learn.step_timeout_secs", R["learn"]["step_timeout_secs"], ls.STEP_TIMEOUT_SECS)
     _same("learn.commitments_timeout_secs", R["learn"]["commitments_timeout_secs"],
           ls.COMMITMENTS_TIMEOUT_SECS)
     assert [name for name, _rel, _b in ls.STEPS] == [
-        "knowledge", "continuity", "style", "drafts", "commitments", "granola", "contacts"], RULE
+        "knowledge", "continuity", "loopcheck", "style", "drafts", "commitments", "granola", "contacts"], RULE
     assert ls.receipt_path("2026-09-04", "morning").endswith("briefs/2026-09-04.morning.learned.json")
     assert isinstance(rt.accounts_for("briefs/2026-09-04.morning.learned.json"), rt.Rule), RULE
     _anchor("one command")
@@ -612,6 +611,7 @@ def test_loop_context_refresh_caps():
     _anchor(f"at most {lc.MAX_TARGETS} exact targets")
     _anchor(f"{lc.MAX_REQUESTS} requests, {lc.MAX_MESSAGES} messages and {lc.MAX_CONTEXT_CHARS:,} characters")
     _anchor(f"no new read after {lc.READ_BUDGET_SECONDS} seconds")
+    _anchor(f"{lc.RESERVED_NOT_OVERDUE} of the {lc.MAX_TARGETS} slots reserved")
 
 
 def test_attachment_caps():
@@ -650,6 +650,7 @@ def test_retention_ttls():
           rt.TRIAGE_VERDICT_DAYS)
     _same("retention.dashboard_audit_days", R["retention"]["dashboard_audit_days"],
           rt.DASHBOARD_AUDIT_DAYS)
+    _same("retention.mcp_audit_days", R["retention"]["mcp_audit_days"], rt.MCP_AUDIT_DAYS)
     _same("retention.draft_ledger_days", R["retention"]["draft_ledger_days"], rt.DRAFT_LEDGER_DAYS)
     _same("retention.brief_archive_days", R["retention"]["brief_archive_days"],
           rt.BRIEF_ARCHIVE_DAYS)
@@ -659,8 +660,7 @@ def test_retention_ttls():
     _same("retention.log_tail_mb", R["retention"]["log_tail_mb"],
           rt.LOG_TAIL_MAX_BYTES // (1024 * 1024))
     _same("retention.outcome_days", R["retention"]["outcome_days"], rt.OUTCOME_DAYS)
-    # …and no DROP_LINES_OLDER rule may exist without an island field: a rule added to the SWEEP
-    # and never drawn is exactly how `outcomes.jsonl` went unstated for a week.
+    # Each DROP_LINES_OLDER rule has a retention field in both playgrounds.
     stated = {rt.DELIVERY_RECEIPT_DAYS, rt.SEND_RECEIPT_DAYS, rt.TRIAGE_VERDICT_DAYS,
               rt.DASHBOARD_AUDIT_DAYS, rt.DRAFT_LEDGER_DAYS, rt.OUTCOME_DAYS}
     for rule in rt.SWEEP:
@@ -1224,9 +1224,7 @@ def test_both_runtimes_lock_preferences_on_the_same_sidecar():
 
 
 def test_receiver_marker_strip_matches_chatfmt():
-    """The receiver's send-seam marker strip is a VENDORED copy of chatfmt._MARKER_RE (its owner) —
-    the same two-runtimes contract keys.py lives under. If the owner's pattern ever changes, this
-    fails until the vendored copy moves with it."""
+    """The chat formatter and send seam share the HTML comment rule."""
     cf = _load("dd_chatfmt", PACK, "_shared", "lib", "chatfmt.py")
     assert rec._MARKER_RE.pattern == cf._MARKER_RE.pattern, (
         f"receiver._MARKER_RE ({rec._MARKER_RE.pattern!r}) drifted from its owner "

@@ -78,7 +78,8 @@ def test_mute_after_admission_skips_writer_and_leaves_unrelated_candidate(curren
         assert [item['id'] for item in items] == ['other']
         return [{'id': 'other', 'text': 'Bob needs your decision.', 'draft': '', 'decline': ''}]
     monkeypatch.setattr(notification, '_write', write)
-    assert notification.compose('event', admitted, now=now) == 'Bob needs your decision.'
+    assert notification.compose('event', admitted, now=now) == ('Bob needs your decision.\n\n'
+                                                                'Say “draft a reply to Bob Example” and I’ll write one.')
 
 
 @pytest.mark.parametrize('mute', [{'mute_people': ['Sarah Example']},
@@ -88,7 +89,8 @@ def test_new_mute_is_checked_on_serialized_delivery_retry(current_owner, monkeyp
     root, now = current_owner
     monkeypatch.setattr(notification, '_write', lambda *_: [
         {'id': '0', 'text': 'Sarah needs your decision.', 'draft': '', 'decline': ''}])
-    assert notification.compose('event', bundle(request()), now=now) == 'Sarah needs your decision.'
+    assert notification.compose('event', bundle(request()), now=now) == ('Sarah needs your decision.\n\n'
+        'Say “draft a reply to Sarah Example” and I’ll write one.')
     proof = staged(root)
     assert delivery_effects.valid(proof, now.timestamp())
     prefs(root, **mute)

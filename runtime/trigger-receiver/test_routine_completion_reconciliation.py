@@ -142,6 +142,48 @@ def test_unknown_outbox_and_done_job_hold_without_automatic_retry(tmp_path, monk
     assert cursor(tmp_path)['completed_count'] == 0
 
 
+@pytest.mark.parametrize('stored_receipt', ['current', 'old', 'missing_id'])
+def test_late_accepted_routine_receipt_reanchors_without_resend(tmp_path, monkeypatch, stored_receipt):
+    sends = []
+    lookups = []
+
+    def send(*_args):
+        sends.append(1)
+        return False, 'synthetic timeout', {'acceptance': 'unknown'}
+
+    def lookup(dispatch_id):
+        lookups.append(dispatch_id)
+        return {'acceptance': 'accepted', 'message_id': 'late-provider-receipt'}
+
+    job_id, _ = setup(tmp_path, monkeypatch, send=send)
+    rec._work_one(q.claim(tmp_path, 'fixture-worker'))
+    assert cursor(tmp_path)['pending_job_id'] == job_id
+    monkeypatch.setitem(rec.OUTBOX.HOOKS, 'gallery_receipt', lookup)
+    with rec.CONNECTORS.json_transaction(rec.OUTBOX.path(), default={'rows': []}) as doc:
+        doc['rows'][0]['next_at'] = 0
+    rec.OUTBOX.drain()
+    assert sends == [1]
+    assert lookups == [job_id]
+    if stored_receipt != 'current':
+        with rec.CONNECTORS.json_transaction(rec.OUTBOX.path(), default={'rows': []}) as doc:
+            doc['rows'][0]['acceptance_uncertain'] = True
+            if stored_receipt == 'missing_id':
+                del doc['rows'][0]['receipt']['message_id']
+    row = outbox_rows(tmp_path)[0]
+    assert row['effects_status'] == 'applied'
+    rec._reconcile_pending_routines()
+    rec._reconcile_pending_routines()
+    if stored_receipt == 'missing_id':
+        assert cursor(tmp_path)['pending_job_id'] == job_id
+        assert cursor(tmp_path)['completed_count'] == 0
+        return
+    assert row['receipt']['message_id'] == 'late-provider-receipt'
+    assert cursor(tmp_path)['pending_job_id'] is None
+    assert cursor(tmp_path)['completed_count'] == 1
+    if stored_receipt == 'current':
+        assert row['acceptance_uncertain'] is False
+
+
 def test_definite_no_contact_then_accepted_retry_reanchors(tmp_path, monkeypatch):
     calls = []
     def send(*_args):

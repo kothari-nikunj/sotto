@@ -152,6 +152,22 @@ def test_future_evidence_not_used():
     assert result == []
 
 
+@pytest.mark.parametrize('cached', [False, True])
+def test_replay_selects_latest_six_eligible_rows_before_checking_cached_bodies(cached):
+    from gmail_read import message_fields
+    cutoff = int(NOW.timestamp() * 1000)
+    messages = [{**raw(str(n)), 'internalDate': str(cutoff + n)} for n in range(-7, 7)]
+    service = Service(messages)
+    eligible = messages[2:8]
+    known = [dict(gg.normalize_email(message_fields(row), message_fields(row)), _body_complete=True)
+             for row in eligible]
+    result, receipt = run(service=service, known_messages=known if cached else [],
+                          known_threads={'original-thread': {'messages': messages}} if cached else {})
+    assert [row['id'] for row in result] == [str(n) for n in range(-5, 1)]
+    assert not receipt['complete'] and receipt['reused_threads'] == int(cached)
+    assert len(service.calls) == (0 if cached else 1)
+
+
 def test_merge_never_changes_inbound_direction_or_duplicates_id():
     before = {'id': 'inbound', 'body': '', 'isSent': False, 'labelIds': ['INBOX']}
     after = dict(before, body='Fresh evidence', _loop_context=True)
@@ -276,7 +292,8 @@ def test_targeted_archived_reply_survives_rendering_without_reclassifying_it():
     assert trimmed['isArchived'] and not trimmed['isSent']
     assert prior['body'] in rendered and prior['id'] in rendered
     assert 'Cc: other@example.com' in rendered and 'archive status is not completion' in rendered
-    assert prior['body'] not in _format_emails([_trim_email(prior)])
+    plain = _format_emails([_trim_email(prior)])  # archived, unanswered: body kept, not loop evidence
+    assert prior['body'] in plain and 'reply status unknown' in plain and 'LOOP_EVIDENCE' not in plain
 
 
 def test_archived_evidence_does_not_expand_existing_long_body_or_attachments():
@@ -426,3 +443,83 @@ def test_supplemental_body_reaches_writer_and_respects_revocation(monkeypatch, s
     assert source_context.email_evidence_text(merged[0]) == 'Hello Dana.'
     rendered = render_local._format_emails([render_local._trim_email(row) for row in merged])
     assert 'The deck is attached' not in rendered
+
+
+class Threads(Service):
+    """Each thread holds `size` distinct messages; an address search finds that address's own thread."""
+    def __init__(self, size=1):
+        super().__init__([])
+        self.size = size
+    def execute(self):
+        name, kwargs = self.calls[-1]
+        if name == 'list':
+            return {'messages': [{'id': 'hit', 'threadId': 'mail-' + kwargs['q'].split('"')[1]}]}
+        return {'messages': [dict(raw(f"{kwargs['id']}-{k}"), threadId=kwargs['id']) for k in range(self.size)]}
+
+
+def fetched(rows, briefs, *, hours=12, size=1):
+    """The threads actually fetched at each of `briefs` consecutive briefs `hours` apart."""
+    out = []
+    for k in range(briefs):
+        service = Threads(size)
+        lc.refresh(rows(k) if callable(rows) else rows, {}, service, gg.normalize_email, allowed=lambda _: True,
+                   now=NOW + dt.timedelta(hours=hours * k), aliases=lambda _: ())
+        out.append([kwargs['id'] for name, kwargs in service.calls if name == 'get'])
+    return out
+
+
+@pytest.mark.parametrize('hours, briefs', [(12, 2 * 20 // lc.MAX_TARGETS), (24, int(2.5 * 20 / lc.MAX_TARGETS))])
+def test_every_open_target_is_reread_within_a_bounded_number_of_briefs(hours, briefs):
+    rows = [loop(anchor_key=f'task-{i}', source_thread_id=f't{i}') for i in range(20)]
+    reads = fetched(rows, briefs, hours=hours)
+    assert all(len(r) <= lc.MAX_TARGETS for r in reads)
+    assert set().union(*reads) == {f't{i}' for i in range(20)}
+
+
+@pytest.mark.parametrize('kind', ['thread', 'email'])
+def test_overdue_work_cannot_starve_other_open_targets(kind):
+    def overdue(i):
+        if kind == 'thread':
+            return loop(anchor_key=f'late-{i}', source_thread_id=f'late{i}', deadline='2026-09-01')
+        return loop(anchor_key=f'late-{i}', channel='imessage', source_thread_id='',
+                    contact_identifier=f'late{i}@example.com', deadline='2026-09-01')
+    late = [overdue(i) for i in range(8)]
+    others = [loop(anchor_key=f'open-{i}', source_thread_id=f'open{i}') for i in range(5)]
+    for reads in fetched(late + others, 6, size=6):
+        assert len([t for t in reads if t.startswith('open')]) == lc.RESERVED_NOT_OVERDUE
+        assert reads[0].removeprefix('mail-').startswith('late')
+    assert set().union(*fetched(late + others, 6, size=6)) >= {f'open{i}' for i in range(5)}
+
+
+def test_unused_reserved_or_overdue_slots_go_to_the_other_pool():
+    late = [loop(anchor_key=f'late-{i}', source_thread_id=f'late{i}', deadline='2026-09-01') for i in range(8)]
+    others = [loop(anchor_key=f'open-{i}', source_thread_id=f'open{i}') for i in range(8)]
+    reads, = fetched(late + others[:1], 1)
+    assert sorted(t[:4] for t in reads) == ['late'] * 5 + ['open']
+    reads, = fetched(late[:1] + others, 1)
+    assert sorted(t[:4] for t in reads) == ['late'] + ['open'] * 5
+
+
+
+def test_one_new_task_a_day_does_not_reset_the_rotation():
+    steady = [loop(anchor_key=f'task-{i}', source_thread_id=f't{i}') for i in range(20)]
+    since = {row['source_thread_id']: 0 for row in steady}
+    longest = 0
+    for k, reads in enumerate(fetched(lambda k: steady + [
+            loop(anchor_key=f'new-{j}', source_thread_id=f'n{j}') for j in range(k // 2)], 40)):
+        since = {tid: 0 if tid in reads else gap + 1 for tid, gap in since.items()}
+        longest = max(longest, *since.values())
+    assert longest < 2 * 40 / lc.MAX_TARGETS
+
+
+def test_due_today_has_a_reserved_slot_among_past_due_tasks(monkeypatch):
+    monkeypatch.setenv('SOTTO_TIMEZONE', 'UTC')
+    task = loop(anchor_key='due-today', source_thread_id='due-today', deadline=NOW.date().isoformat())
+    late = [loop(anchor_key=f'overdue-{i}', source_thread_id=f'overdue-{i}', deadline='2026-09-30')
+            for i in range(30)]
+    options = dict(now=NOW, allowed=lambda _: True)
+    assert 'due-today' in fetched(late + [task], 1)[0]
+
+    text = dict(task, channel='imessage', source='imessage', contact_identifier='+15555550123')
+    ranked = lc._imessage_plan([text], aliases=lambda *_: (), **options)
+    assert ranked[0][0][0] == 1

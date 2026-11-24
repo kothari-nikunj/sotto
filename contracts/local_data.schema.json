@@ -56,6 +56,24 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "OPTIONAL / backward-compatible. Raw handle ids (phones/emails) of the group's members; [] (or absent) for a 1:1. When the group is unnamed, the consumer builds an iMessage-style participant label (e.g. \"Alice, Bob & 2 others\") from these by resolving each handle to a contact name."
+        },
+        "date_read": {
+          "type": "string",
+          "description": "OPTIONAL. Outbound 1:1 only: RFC3339 UTC time the recipient's read receipt stamped this row. Absent does NOT mean unread (receipts off, or not the last message of a run). Never set for groups."
+        },
+        "reactions": {
+          "type": "array",
+          "description": "OPTIONAL. 1:1 only: each side's current tapback on this message (a removal cancels it). Metadata, never message text.",
+          "items": {
+            "type": "object",
+            "required": ["kind", "is_from_me", "timestamp_utc"],
+            "properties": {
+              "kind": { "enum": ["love", "like", "dislike", "laugh", "emphasize", "question", "emoji", "sticker"] },
+              "emoji": { "type": "string" },
+              "is_from_me": { "type": "boolean" },
+              "timestamp_utc": { "type": "string" }
+            }
+          }
         }
       }
     },

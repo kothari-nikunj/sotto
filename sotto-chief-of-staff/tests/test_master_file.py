@@ -23,15 +23,15 @@ def _env(tmp_path):
 
 def test_set_get_sections_roundtrip(tmp_path):
     _env(tmp_path)
-    mf.set_section("About", "Nikunj is a partner at FPV Ventures.")
+    mf.set_section("About", "Casey is a partner at HBR Ventures.")
     mf.set_section("Procedures", "- Intros are always forwardable emails.")
     text = mf.read()
-    assert "## About" in text and "FPV Ventures" in text
+    assert "## About" in text and "HBR Ventures" in text
     assert "## Procedures" in text and "forwardable" in text
     # replace, not append
     mf.set_section("About", "Rewritten.")
     text = mf.read()
-    assert "Rewritten." in text and "FPV Ventures" not in text
+    assert "Rewritten." in text and "HBR Ventures" not in text
     assert text.count("## About") == 1
 
 
@@ -93,7 +93,7 @@ def test_cli_verbs_and_overcap_exit_code(tmp_path):
     assert r.returncode == 2 and "cap" in json.loads(r.stdout)["error"]
 
 
-def test_concurrent_cli_appends_do_not_tear(tmp_path):
+def test_concurrent_cli_appends_do_not_tear(tmp_path, monkeypatch):
     # Two processes append 10 rules each under the sidecar lock: all 20 land, no torn file.
     env = {**os.environ, "SOTTO_DATA": str(tmp_path)}
     script = ("import subprocess,sys\n"
@@ -103,7 +103,7 @@ def test_concurrent_cli_appends_do_not_tear(tmp_path):
     ps = [subprocess.Popen([sys.executable, "-c", script, tag], env=env) for tag in ("a", "b")]
     for p in ps:
         assert p.wait() == 0
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     text = mf.read()
     for tag in ("a", "b"):
         for i in range(10):
@@ -119,7 +119,7 @@ def test_brief_and_prep_prompts_carry_the_placeholder():
 
 def test_compose_brief_renders_master_into_the_field(tmp_path):
     _env(tmp_path)
-    mf.set_section("People", "Partners: Wesley Chan, Pegah Ebrahimi.")
+    mf.set_section("People", "Partners: Wesley Chan, Odile Marchettii.")
     spec2 = importlib.util.spec_from_file_location(
         "cb_master", os.path.join(ROOT, "_shared", "scripts", "compose_brief.py"))
     cb = importlib.util.module_from_spec(spec2)

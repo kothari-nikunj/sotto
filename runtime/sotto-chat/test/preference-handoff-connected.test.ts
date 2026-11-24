@@ -91,7 +91,7 @@ test('default bootstrap stops settled preference steps and sends canonical respo
    if(phase==='preview'){
     assert.ok(count<=2,'proposed receipt must prevent a third model contact');
     call=count===1?{name:'skill',args:{name:'sotto-feedback'}}:{name:'run_sotto_script',args:{id:'master-file',args:['append','--section','Procedures','--text',rule]}};
-    if(count===2)assert.ok(JSON.stringify(body.messages).includes('Adding to your standing file'));
+    if(count===2)assert.ok(JSON.stringify(body.messages).includes('with the exact line. Only a distinct later owner yes permits'));
    }else if(phase==='confirm'){
     assert.equal(count,1,'committed receipt must prevent another model contact');assert.ok(JSON.stringify(body.messages).includes('Accepted standing-rule review for this owner confirmation'));
     call={name:'run_sotto_script',args:{id:'master-file',args:['confirm-procedure']}};

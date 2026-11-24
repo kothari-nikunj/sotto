@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import {clearRoutineYes} from './owner-routine-tool-contract.js';
 import { z } from 'zod';
 import {stableActionIdentity} from './action-gate.js';
 export const ownerCalendarKind = 'owner_calendar_tool';
@@ -85,7 +86,7 @@ export const calendarPreviewSchema = z.object({ version: z.literal(1), status: z
 export type CalendarPreview = z.infer<typeof calendarPreviewSchema>;
 export const calendarReceiptSchema = z.object({ version: z.literal(1), status: z.literal('committed'), action_id: hex, event_id: hex, payload_hash: hex, args_hash: hex, outcome: z.union([z.object({operation:z.literal('move_update'),calendar_id:calendarIdSchema,event_id:id,start:time,end:time,review_hash:hex,status:z.literal('updated')}).strict(),z.object({ operation: z.literal('move'), calendar_id: calendarIdSchema, event_id: id, start: time, end: time, review_hash: hex, status: z.literal('moved') }).strict(),z.object({operation:z.literal('rsvp'),calendar_id:calendarIdSchema,event_id:id,response,review_hash:hex,status:z.literal('rsvped')}).strict(),z.object({operation:z.literal('create'),calendar_id:z.literal('primary'),event_id:hex,summary:createScalar(1024).min(1),start:time,end:time,html_link:scalar(2048).min(1).refine(v=>/^https:\/\/(?:calendar\.google\.com|www\.google\.com)\//.test(v)),review_hash:hex,status:z.literal('created'),organizer_listed:z.boolean().nullable(),location_attached:z.boolean().nullable(),description_attached:z.boolean().nullable()}).strict(),z.object({operation:z.literal('update'),calendar_id:calendarIdSchema,event_id:id,review_hash:hex,status:z.literal('updated')}).strict()]) }).strict();
 export type CalendarReceipt = z.infer<typeof calendarReceiptSchema>;
-export const calendarRejectionSchema = z.enum(['authority_changed', 'calendar_permission_unavailable', 'invalid_target', 'unsupported_event', 'target_changed', 'review_unavailable', 'event_conflict']);
+export const calendarRejectionSchema = z.enum(['authority_changed', 'calendar_permission_unavailable', 'permission_unavailable', 'invalid_target', 'unsupported_event', 'target_changed', 'review_unavailable', 'event_conflict']);
 export type CalendarRejection = z.infer<typeof calendarRejectionSchema>;
 export function calendarReviewHash(review: z.infer<typeof calendarReviewSchema>): string {
     const { review_hash: _, ...fields } = review;
@@ -111,6 +112,19 @@ export function calendarWhenText(start: string, end: string, allDay = false): st
     if (first.date === last.date && first.offset === last.offset)
         return `${calendarDateText(first.date)}, ${first.clock} to ${last.clock} (${first.offset})`;
     return `${calendarDateText(first.date)}, ${first.clock} (${first.offset}) to ${calendarDateText(last.date)}, ${last.clock} (${last.offset})`;
+}
+/** Only a journaled Calendar action can deliver the create review or receipt. */
+export function guardUnrecordedCalendarReply(text: string, batched: boolean, ownerText: string): string {
+    const reply = text.trim();
+    if (/^I[’']ll add [^\n]+ to your main calendar\.\n/i.test(reply) &&
+        /\nCreate it(?: and invite these guests)?\?$/.test(reply)) {
+        return batched
+            ? 'I haven’t staged an invite with those changes. Say “review the corrected invite” and I’ll show you the details for approval.'
+            : 'I haven’t staged that invite. Ask me to review the invite so you can approve it.';
+    }
+    if (clearRoutineYes(ownerText) && /^Added [^\n]+ to your calendar\.\n/i.test(reply))
+        return 'I can’t verify that this invite was created. Check your calendar before asking me to create it again.';
+    return text;
 }
 function calendarLabel(id: string): string { return id === 'primary' ? 'main calendar' : id; }
 export function calendarReviewText(preview: CalendarPreview): string {

@@ -33,7 +33,7 @@ export function createOwnerGmailDraftClient(options: OwnerToolClientOptions) {
       admitted_at_ms: input.admittedAtMs, provider_thread_id: input.providerThreadId, args: input.args,
       ...(acceptedDelivery?{accepted_delivery:gmailAcceptedDeliverySchema.parse(acceptedDelivery)}:{})};
     if(input.args.operation==='propose_pair'&&Buffer.byteLength(JSON.stringify({...body,identity:transport.identity}))>65536)throw new Error('Gmail pair request exceeds capacity');
-    const response = await transport.request(body, signal, {responseLimit: operation === 'preview'||operation==='record_offer'||operation==='inspect'&&['propose_typed','propose_send_typed','propose_pair'].includes(input.args.operation) ? 128 * 1024 : 8192});
+    const response = await transport.request(body, signal, {responseLimit: operation === 'preview'||operation==='record_offer'||operation==='inspect'&&['propose_typed','propose_send_typed','propose_pair'].includes(input.args.operation) ? 128 * 1024 : 8192, deadlineMs: operation === 'apply' ? 15_000 : undefined});
     const result = schema.parse(response.value);
     if ((response.status === 409) !== (result.status === 'rejected') ||
       (operation === 'preview' ? !['preview', 'rejected', 'no_match', 'offers'].includes(result.status) : result.status === 'preview' && !['propose_typed','propose_send_typed','propose_pair'].includes(input.args.operation)) ||

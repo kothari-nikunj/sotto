@@ -1,10 +1,11 @@
 /** Framework-neutral admitted task execution; transport and journal own effects. */
+import {deliveredTaskDispatch} from '../background-context.js';
 import type { OperationalJournal, ExplicitOwnerLoopAuthority } from '../journal/index.js';
 import { readAuthority, SourceAuthorityChanged, type SourceAuthorityReader } from '../agent/source-authority.js';
 import {stableActionIdentity} from './action-gate.js';
 import {ownerTaskToolKind,taskReviewText,SIMILAR_FACT_TEXT,resolveManyOwnerTextMatches,ownerTaskTitleMatches,namedLoopSelection,namedLoopDescriptionMatches,loopContactName,explicitLoopThreadSelection,type TaskPreview,OwnerTaskListUnavailable,OWNER_TASK_SELECTION_CLARIFICATION} from './owner-task-tool-contract.js';
 import {CleanupDiagnosticError} from './cleanup-diagnostic.js';
-import { ActionHeldError } from './action-gate.js';
+import { ActionHeldError, OneMessageRequiredError } from './action-gate.js';
 import { ownerTaskToolArgsSchema, type OwnerTaskToolArgs } from './owner-task-tool-contract.js';
 import type { OwnerTaskToolClient } from './owner-task-tool-client.js';
 
@@ -41,12 +42,17 @@ export function createOwnerTaskExecution(options: {
   const proposed=(preview:TaskPreview)=>preview.review.operation==='cleanup_list'?{status:'proposed' as const,review_text:taskReviewText(preview.review),needs_owner_selection:true as const,instruction:'Finish this turn normally with an assistant response containing review_text exactly, without more tools. Nothing has changed. Wait for a later owner message with explicit numbered done, dismiss, snooze or keep choices; a yes is not a selection.'}:({status:'proposed' as const,review_text:taskReviewText(preview.review),needs_owner_confirmation:true as const,instruction:'The runtime will deliver this exact review. Finish this turn normally with an assistant response containing review_text exactly, without more tools, then wait for a distinct later owner yes. This is a proposal, not permission to apply the change.'});
   const execute = async (input: OwnerTaskToolArgs, context: OwnerTaskExecutionContext) => {
     const {journal, authority, eventId} = trusted(context);
-    if (context.allowOwnerTask !== true) throw new Error('Owner task requires one owner message');
+    if (context.allowOwnerTask !== true) throw new OneMessageRequiredError();
     const args = ownerTaskToolArgsSchema.parse(input);
     if(args.operation==='add_identifier')throw new Error('Identifier teaching requires an accepted review and separate yes');
     if(args.operation==='cleanup'&&context.sourceRevision!==args.list.source_revision)throw new SourceAuthorityChanged();
     if(args.operation==='resolve_many'&&context.sourceRevision!==args.source_revision)throw new SourceAuthorityChanged();
     if((args.operation==='relation'||args.operation==='identifier'||args.operation==='fact_add')&&context.sourceRevision!==args.review.source_revision)throw new SourceAuthorityChanged();
+    if(args.operation==='resolve_many'&&args.selection_mode==='delivered'){
+      const delivery=deliveredTaskDispatch(journal,eventId);
+      if(!delivery||!resolveManyOwnerTextMatches(args.items,journal.ownerReminderToolAdmission(authority,eventId,true).text,'delivered')||args.items.some(item=>item.anchor_key!==undefined))throw new ResolveManyClarification();
+      args.delivery=delivery;
+    }
     if((args.operation==='snooze'||args.operation==='keep')){
       journal.ownerReminderToolAdmission(authority,eventId,true);
       const previous=journal.getAction(stableActionIdentity(eventId,ownerTaskToolKind,args).actionId);
@@ -103,7 +109,7 @@ export function createOwnerTaskExecution(options: {
       }
     }
     if(args.operation==='cleanup'){const binding=stableActionIdentity(eventId,ownerTaskToolKind,args);options.client.preflight({...admission,args,actionId:binding.actionId});}
-    if(args.operation==='resolve_many'){
+    if(args.operation==='resolve_many'&&args.selection_mode!=='delivered'){
       if(!resolveManyOwnerTextMatches(args.items,admission.text,args.selection_mode))throw new ResolveManyClarification();
       // Validate each selection against the read projection; the receiver repeats this against raw peers.
       const rows=await options.client.readLoops(args.source_revision,context.signal);

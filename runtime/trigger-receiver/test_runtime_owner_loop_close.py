@@ -36,6 +36,11 @@ EVENT = 'a' * 64
 
 
 @pytest.fixture
+def meeting_clock(monkeypatch):
+    monkeypatch.setattr('time.time', WHEN.timestamp)
+
+
+@pytest.fixture
 def context(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     policy = {'SOTTO_DEPLOYMENT_MODE': 'managed',

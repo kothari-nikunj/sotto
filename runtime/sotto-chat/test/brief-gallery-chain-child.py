@@ -65,7 +65,7 @@ BRIEF = '''Good morning — Monday, September 14
 Needs Attention Now
 Alex — Complete the preschool waiver by tomorrow; the form is still outstanding.
 Should Handle Today
-Jordan — Reply to the lunch invitation for Thursday.
+Jordan — Reply to the lunch invitation for Thursday. I can draft a reply.
 Coming Up
 10:00 AM — Team meeting
 12:00 PM — Lunch with Alex
@@ -111,7 +111,7 @@ image_hashes = [hashlib.sha256((folder / f'{i:02d}.png').read_bytes()).hexdigest
 server = ThreadingHTTPServer(('127.0.0.1', 0), rec.Handler)
 print(json.dumps({'ready': True, 'url': f'http://127.0.0.1:{server.server_port}/mcp',
                   'bearer': rec.MCP_TOKEN, 'artifact': artifact, 'route_digest': route,
-                  'payload_hash': receipt['payload_hash'], 'image_hashes': image_hashes,
+                  'payload_hash': receipt['payload_hash'], 'dispatch_id': rows[0]['id'], 'image_hashes': image_hashes,
                   'revision': 'a' * 64}), flush=True)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 try:

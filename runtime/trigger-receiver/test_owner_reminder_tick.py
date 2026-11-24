@@ -69,6 +69,24 @@ def test_invalid_proof_is_neither_sent_nor_returned_to_proactive(timer, change, 
     assert scanner._intention_candidates(datetime.now(timezone.utc), continuity=[]) == []
 
 
+@pytest.mark.parametrize('minutes_ago', [1, 16])
+def test_source_change_before_timer_delivery_does_not_authorize_reminder_as_chat_context(timer, monkeypatch, minutes_ago):
+    rec, _, create, sent, _ = timer
+    authority = {'complete': True, 'revision': 'a' * 64, 'bridge_sources': ['imessage']}
+    monkeypatch.setattr(rec, '_runtime_source_authority', lambda: authority)
+    monkeypatch.setattr(rec, '_candidate_retained_route_digest', lambda: 'c' * 64)
+    create(minutes_ago=minutes_ago)
+    authority.update(revision='b' * 64, bridge_sources=[])
+    def send(body, target, key, attempt, **context):
+        sent.append((body, context))
+        return True, '', {'acceptance': 'accepted', 'message_id': 'accepted'}
+    rec.OUTBOX.HOOKS['send'] = send
+    rec._owner_reminder_tick()
+    rec._owner_reminder_tick()
+    assert len(sent) == 1 and 'Check test results' in sent[0][0]
+    assert 'source_revision' not in sent[0][1]
+
+
 def test_cancel_or_changed_route_before_outbox_contact_withholds(timer):
     rec, store, create, sent, identity = timer
     row = create()
@@ -500,3 +518,13 @@ def test_old_unreserved_notice_expires_without_owner_route(timer, monkeypatch):
     rec._owner_reminder_tick()
     assert store.current()[0]['delivery_notice_outcome'] == 'expired'
     assert not sent
+
+
+def test_batched_timer_notice_keeps_its_closing_line_a_paragraph(timer):
+    rec = timer[0]
+    rows = [{'action': 'Call Sam', 'due': '2026-11-16T17:00:00Z'}, {'action': 'Pay rent', 'due': '2026-11-16T18:00:00Z'}]
+    body = rec._owner_timer_notice_body(rows, timezone.utc)
+    head, entries, closing = body.split('\n\n')
+    assert head == "I couldn't deliver these reminders on time:"
+    assert entries.count('\n') == 1 and entries.startswith('• Call Sam')
+    assert closing == "They have been canceled; I won't send them late."

@@ -8,6 +8,7 @@ import {z} from 'zod';
 import { generateText, tool, stepCountIs } from 'ai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import {gmailNewSendProposalSchema, gmailDraftReviewHash, gmailDraftPreviewMatches, gmailDraftReceiptMatches, gmailDraftReviewText} from '../src/tools/owner-gmail-draft-contract.js';
 import { createOwnerGmailDraftTools } from '../src/tools/owner-gmail-draft-tool.js';
 import { createOwnerGmailDraftClient } from '../src/tools/owner-gmail-draft-client.js';
 
@@ -91,4 +92,15 @@ test('real managed SDK initial and tool continuation bodies remain eligible for 
     server.closeAllConnections();
     await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
   }
+});
+
+test('fresh email closed inputs, exact full review and returned thread receipt preserve old send isolation',()=>{
+ const args={operation:'propose_new_send' as const,to:'alice@example.com',subject:'',body:'Hello Alice.'};
+ for(const to of ['Alice <alice@example.com>','a@example.com;b@example.com','a@example.com\u0085'])assert.equal(gmailNewSendProposalSchema.safeParse({...args,to}).success,false);
+ assert.equal(gmailNewSendProposalSchema.safeParse({...args,thread_id:'invented'}).success,false);
+ const review={kind:'new_send' as const,to:args.to,subject:args.subject,body:'Hello Alice.',sender_email:'owner@example.test',source_revision:'d'.repeat(64),review_hash:''};review.review_hash=gmailDraftReviewHash(review);
+ const preview={version:1 as const,status:'preview' as const,event_id:'d'.repeat(64),payload_hash:'d'.repeat(64),review};assert.ok(gmailDraftPreviewMatches(preview,args));assert.equal(gmailDraftPreviewMatches(preview,{...args,to:'other@example.com'}),false);assert.match(gmailDraftReviewText(preview),/From: owner@example.test/);
+ const send={operation:'send' as const,review,proposal:{event_id:'d'.repeat(64),action_id:'d'.repeat(64),args_hash:'d'.repeat(64),accepted_dispatch_id:'review',source_revision:'d'.repeat(64)}};
+ const receipt={version:1 as const,status:'committed' as const,action_id:'d'.repeat(64),event_id:'d'.repeat(64),payload_hash:'d'.repeat(64),args_hash:'d'.repeat(64),outcome:{operation:'send' as const,message_id:'sent',thread_id:'returned-existing-thread',review_hash:review.review_hash,status:'sent' as const}};
+ assert.ok(gmailDraftReceiptMatches(receipt,send));assert.equal(gmailDraftReceiptMatches({...receipt,outcome:{...receipt.outcome,review_hash:'b'.repeat(64)}},send),false);
 });

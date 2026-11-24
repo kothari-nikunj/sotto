@@ -1,6 +1,7 @@
 """The public-repo guards, enforced at TEST time — a guard that only fires during ship.sh
 lands in the OWNER's terminal mid-release (it has, twice). Same regexes as
 tools/prepare-public-repo.sh; distributable paths only."""
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -96,15 +97,15 @@ def test_the_corpus_guard_is_not_vacuous():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_a_corpus_in_the_working_tree_never_reaches_the_distribution():
+def test_a_corpus_in_the_working_tree_never_reaches_the_distribution(scratch):
     """The real generator, run against a source tree that HAS a corpus: the corpus must be gone and
     the CORPUS GUARD must say so. This is the exact situation on the owner's machine."""
-    seeded = _seed_corpus(ROOT)
+    pack = str(scratch / "sotto-chief-of-staff")
+    seeded = _seed_corpus(pack)
     target = tempfile.mkdtemp(prefix="sotto-dist-")
     os.rmdir(target)                                    # the generator refuses a non-empty target
     try:
-        proc = subprocess.run(["bash", GENERATOR, target, "kothari-nikunj/sotto"],
-                              capture_output=True, text=True)
+        proc = _run_generator(target, scratch)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "CORPUS GUARD: PASS" in proc.stdout
         leaked = subprocess.run(["find", target] + CORPUS_FIND + ["-print"],
@@ -117,8 +118,7 @@ def test_a_corpus_in_the_working_tree_never_reaches_the_distribution():
     finally:
         shutil.rmtree(seeded, ignore_errors=True)
         shutil.rmtree(target, ignore_errors=True)
-        if os.path.exists(os.path.join(ROOT, "evals", "corpus-v1.map.json")):
-            os.remove(os.path.join(ROOT, "evals", "corpus-v1.map.json"))
+        os.remove(os.path.join(pack, "evals", "corpus-v1.map.json"))
 
 
 def test_corpus_paths_are_gitignored():
@@ -135,29 +135,60 @@ def test_corpus_paths_are_gitignored():
 # vendor-prefixed key shape, and ship.sh's untracked check could not see it either — `git status
 # --porcelain` never lists ignored files.
 
-def _run_generator(target):
-    return subprocess.run(["bash", GENERATOR, target, "kothari-nikunj/sotto"],
-                          capture_output=True, text=True)
+def _run_generator(target, source=AGENT_ROOT):
+    return subprocess.run(["bash", os.path.join(source, "tools", "prepare-public-repo.sh"), target,
+                           "kothari-nikunj/sotto"], capture_output=True, text=True)
 
 
-def test_a_gitignored_env_file_in_a_shipped_dir_fails_the_publish():
-    planted = os.path.join(AGENT_ROOT, "adapters", "sotto", ".env")
-    assert not os.path.exists(planted), "a real .env is in the way — remove it first"
+def _source_with_check_wrapper(tmp_path):
+    source = tmp_path / "sotto-agent"
+    shutil.copytree(AGENT_ROOT, source, symlinks=True, ignore=shutil.ignore_patterns(
+        "node_modules", "dist", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "target"))
+    (tmp_path / "bin").mkdir()
+    shutil.copy2(Path(AGENT_ROOT).parent / "bin/check", tmp_path / "bin/check")
+    return source
+
+
+@pytest.fixture(scope="module")
+def scratch(tmp_path_factory):
+    """A git checkout that is a COPY of this working tree, with the monorepo's own ignore rules.
+    Every test that plants a file plants it here and runs this copy's generator, so the live
+    checkout is never written: two runs cannot collide and a killed run leaves no stray behind."""
+    repo = tmp_path_factory.mktemp("publish-guards")
+    source = _source_with_check_wrapper(repo)
+    shutil.copy2(Path(AGENT_ROOT).parent / ".gitignore", repo / ".gitignore")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    return source
+
+
+@contextlib.contextmanager
+def _planted(scratch, rel, body):
+    """`body` at `rel` inside the scratch copy, and an absent publish target, for one test."""
+    path = scratch / rel
+    assert not path.exists(), f"{path} is in the way"
+    made = next(p for p in [*reversed(path.parents), path] if not p.exists())
     target = tempfile.mkdtemp(prefix="sotto-dist-")
     os.rmdir(target)                                    # the generator refuses a non-empty target
     try:
-        with open(planted, "w", encoding="utf-8") as f:
-            f.write("BRIDGE" + "_TOKEN=" + "z" * 48 + "\n")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        yield path, target
+    finally:
+        if made.is_dir():
+            shutil.rmtree(made)
+        else:
+            made.unlink(missing_ok=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+
+def test_a_gitignored_env_file_in_a_shipped_dir_fails_the_publish(scratch):
+    with _planted(scratch, "adapters/sotto/.env", "BRIDGE" + "_TOKEN=" + "z" * 48 + "\n") as (planted, target):
         # It IS gitignored in the source (that is exactly why nothing else caught it)…
-        assert subprocess.run(["git", "check-ignore", "-q", planted], cwd=AGENT_ROOT).returncode == 0
-        proc = _run_generator(target)
+        assert subprocess.run(["git", "check-ignore", "-q", planted], cwd=scratch).returncode == 0
+        proc = _run_generator(target, scratch)
         assert proc.returncode != 0, "a gitignored .env published:\n" + proc.stdout
         assert "IGNORED GUARD: FAIL" in proc.stdout
-        assert "adapters/sotto/.env" in proc.stdout
-    finally:
-        if os.path.exists(planted):
-            os.remove(planted)
-        shutil.rmtree(target, ignore_errors=True)
+        assert "gitignored in the source: adapters/sotto/.env" in proc.stdout
 
 
 def test_the_template_env_file_still_ships():
@@ -173,25 +204,16 @@ def test_the_template_env_file_still_ships():
         shutil.rmtree(target, ignore_errors=True)
 
 
-def test_the_secrets_guard_catches_an_opaque_token_assignment():
+def test_the_secrets_guard_catches_an_opaque_token_assignment(scratch):
     """The vendor prefixes recognize a key by its brand. The keys Sotto documents now
     — EXA_API_KEY, PARALLEL_API_KEY, BRIDGE_TOKEN, SOTTO_TRIGGER_TOKEN, SOTTO_SETUP_CODE — are
     opaque strings, so the shape that catches them is the ASSIGNMENT. Planted as a NON-ignored file
     so this exercises the SECRETS guard rather than the IGNORED one."""
-    planted = os.path.join(AGENT_ROOT, "adapters", "sotto", "scratch-notes.md")
-    assert not os.path.exists(planted)
-    target = tempfile.mkdtemp(prefix="sotto-dist-")
-    os.rmdir(target)
-    try:
-        with open(planted, "w", encoding="utf-8") as f:
-            f.write("EXA" + "_API_KEY=" + "a1b2c3d4e5f6a7b8c9d0" + "\n")
-        proc = _run_generator(target)
+    body = "EXA" + "_API_KEY=" + "a1b2c3d4e5f6a7b8c9d0" + "\n"
+    with _planted(scratch, "adapters/sotto/scratch-notes.md", body) as (_planted_file, target):
+        proc = _run_generator(target, scratch)
         assert proc.returncode != 0, "an opaque key assignment published:\n" + proc.stdout
         assert "SECRETS GUARD: FAIL" in proc.stdout
-    finally:
-        if os.path.exists(planted):
-            os.remove(planted)
-        shutil.rmtree(target, ignore_errors=True)
 
 
 # ── SECRETS GUARD, the vendor prefixes ────────────────────────────────────────────────────────────
@@ -200,55 +222,44 @@ def test_the_secrets_guard_catches_an_opaque_token_assignment():
 # below is assembled from string parts for the same reason the module-level pattern is — this file
 # ships, and the guard greps the whole shipped tree including its own tests.
 
-def _publish_with_planted_note(body: str, suffix: str = ".md"):
+@pytest.fixture
+def publish_with_planted_note(scratch):
     """Run the real generator with `body` sitting in a shipped (non-ignored) file, so what is being
     exercised is the SECRETS guard and not the IGNORED one. Returns the completed process."""
-    # A unique name per call: the fixture must sit in a shipped, NON-ignored directory, and a fixed
-    # one would collide with the older opaque-assignment test (and with a second checkout running the
-    # suite at the same time).
-    fd, planted = tempfile.mkstemp(prefix="scratch-fixture-", suffix=suffix,
-                                   dir=os.path.join(AGENT_ROOT, "adapters", "sotto"))
-    os.close(fd)
-    target = tempfile.mkdtemp(prefix="sotto-dist-")
-    os.rmdir(target)                                    # the generator refuses a non-empty target
-    try:
-        with open(planted, "w", encoding="utf-8") as f:
-            f.write(body + "\n")
-        return _run_generator(target)
-    finally:
-        if os.path.exists(planted):
-            os.remove(planted)
-        shutil.rmtree(target, ignore_errors=True)
+    def publish(body: str, suffix: str = ".md"):
+        with _planted(scratch, "adapters/sotto/scratch-fixture" + suffix, body + "\n") as (_file, target):
+            return _run_generator(target, scratch)
+    return publish
 
 
 @pytest.mark.parametrize("prefix", ["gh" + "p_", "gh" + "o_", "gh" + "u_", "gh" + "s_", "gh" + "r_"])
-def test_the_secrets_guard_catches_every_github_token_prefix(prefix):
+def test_the_secrets_guard_catches_every_github_token_prefix(prefix, publish_with_planted_note):
     """`ghp_` was never the whole family. An OAuth, user-to-server, server-to-server or refresh
     token leaks exactly as much, and the guard knew none of them."""
-    proc = _publish_with_planted_note(prefix + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")
+    proc = publish_with_planted_note(prefix + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")
     assert proc.returncode != 0, "a GitHub token published:\n" + proc.stdout
     assert "SECRETS GUARD: FAIL" in proc.stdout
 
 
-def test_the_secrets_guard_catches_a_fine_grained_github_token():
+def test_the_secrets_guard_catches_a_fine_grained_github_token(publish_with_planted_note):
     """The kind GitHub hands out by default now — and the kind the publish lane's own PAT is."""
-    proc = _publish_with_planted_note(
+    proc = publish_with_planted_note(
         "git" + "hub_pat_" + "11ABCDEFG0aBcDeFgHiJkL" + "_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0U1v2W3x4Y5z6A7b8C9")
     assert proc.returncode != 0, "a fine-grained GitHub token published:\n" + proc.stdout
     assert "SECRETS GUARD: FAIL" in proc.stdout
 
 
 @pytest.mark.parametrize("prefix", ["xo" + "xb-", "xo" + "xa-", "xo" + "xp-", "xo" + "xr-", "xo" + "xs-"])
-def test_the_secrets_guard_catches_a_slack_token(prefix):
+def test_the_secrets_guard_catches_a_slack_token(prefix, publish_with_planted_note):
     """Sotto has no Slack integration, which is exactly why a Slack token here would be someone's
     own workspace credential pasted into a note — the accident this guard exists for."""
-    proc = _publish_with_planted_note(prefix + "2109876543-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx")
+    proc = publish_with_planted_note(prefix + "2109876543-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx")
     assert proc.returncode != 0, "a Slack token published:\n" + proc.stdout
     assert "SECRETS GUARD: FAIL" in proc.stdout
 
 
-def test_the_secrets_guard_catches_an_aws_access_key_id():
-    proc = _publish_with_planted_note("AK" + "IA" + "IOSFODNN7EXAMPLE" + " (an access key id)")
+def test_the_secrets_guard_catches_an_aws_access_key_id(publish_with_planted_note):
+    proc = publish_with_planted_note("AK" + "IA" + "IOSFODNN7EXAMPLE" + " (an access key id)")
     assert proc.returncode != 0, "an AWS access key id published:\n" + proc.stdout
     assert "SECRETS GUARD: FAIL" in proc.stdout
 
@@ -260,10 +271,10 @@ def test_the_secrets_guard_catches_an_aws_access_key_id():
     "AK" + "IA is the prefix every AWS access key id starts with",   # prose, not a key
     "GITHUB" + "_TOKEN=${" + "GITHUB_TOKEN}",    # a variable reference, not a value
 ])
-def test_the_new_prefixes_stay_quiet_on_placeholders(placeholder):
+def test_the_new_prefixes_stay_quiet_on_placeholders(placeholder, publish_with_planted_note):
     """The tightening must not cost the placeholder-friendly design: a guard that fires on the
     documentation it ships is a guard someone deletes."""
-    proc = _publish_with_planted_note(placeholder)
+    proc = publish_with_planted_note(placeholder)
     assert proc.returncode == 0, "a placeholder tripped the guard:\n" + proc.stdout
     assert "SECRETS GUARD: PASS" in proc.stdout
 
@@ -327,9 +338,12 @@ def test_the_shipped_ci_workflow_names_no_credential():
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         from pathlib import Path
-        commands = [argv[1:] for _cwd, argv in module.commands(Path(target))]
-        for suite in ("tests", "runtime/trigger-receiver", "adapters/sotto", "cloud/model-proxy"):
+        commands = [argv[1:] for steps in module.lanes(Path(target)).values()
+                    for _cwd, argvs in steps for argv in argvs]
+        for suite in ("runtime/trigger-receiver", "adapters/sotto", "cloud/model-proxy"):
             assert ["-m", "pytest", suite, "-q"] in commands
+        # The pack suite (`pytest tests`) runs sharded by file.
+        assert any(argv[:2] == ["-m", "pytest"] and "tests/test_verify_gate.py" in argv for argv in commands)
         # The hosted account broker never ships, and the shipped gate does not name a suite it lacks.
         assert ["-m", "pytest", "cloud/accounts", "-q"] not in commands
         assert not os.path.isdir(os.path.join(target, "cloud", "accounts"))
@@ -349,24 +363,16 @@ def test_the_shipped_ci_workflow_names_no_credential():
         shutil.rmtree(target, ignore_errors=True)
 
 
-def test_a_second_workflow_anywhere_in_the_tree_fails_the_publish():
+def test_a_second_workflow_anywhere_in_the_tree_fails_the_publish(scratch):
     """The guard is no longer 'no .github', so prove the narrower rule still bites: a workflow that
     rides along inside a shipped directory must stop the publish."""
-    planted_dir = os.path.join(AGENT_ROOT, "adapters", "sotto", ".github", "workflows")
-    assert not os.path.exists(os.path.join(AGENT_ROOT, "adapters", "sotto", ".github"))
-    target = tempfile.mkdtemp(prefix="sotto-dist-")
-    os.rmdir(target)
-    try:
-        os.makedirs(planted_dir)
-        with open(os.path.join(planted_dir, "rides-along.yml"), "w", encoding="utf-8") as f:
-            f.write("name: rides along\non: push\n")
-        proc = _run_generator(target)
+    rel = "adapters/sotto/.github/workflows/rides-along.yml"
+    with _planted(scratch, rel, "name: rides along\non: push\n") as (_file, target):
+        proc = _run_generator(target, scratch)
         assert proc.returncode != 0, "a second workflow published:\n" + proc.stdout
         assert "WORKFLOW GUARD: FAIL" in proc.stdout
         assert "rides-along.yml" in proc.stdout
-    finally:
-        shutil.rmtree(os.path.join(AGENT_ROOT, "adapters", "sotto", ".github"), ignore_errors=True)
-        shutil.rmtree(target, ignore_errors=True)
+    assert not (scratch / "adapters/sotto/.github").exists()
 
 
 def test_the_shipped_gitignore_ignores_a_deployers_env_file():
@@ -396,10 +402,10 @@ def test_the_shipped_gitignore_ignores_a_deployers_env_file():
 # not have. The guard now applies its broker half to every shipped `*.sh`; Bridge paths stay
 # .md-only, because the adapters' installers legitimately describe the monorepo-only build.
 
-def test_a_broker_mention_in_a_shipped_shell_script_fails_the_publish():
+def test_a_broker_mention_in_a_shipped_shell_script_fails_the_publish(publish_with_planted_note):
     """The half of the fix that catches the NEXT one: a shipped script naming the broker is a leak,
     exactly as a shipped doc is."""
-    proc = _publish_with_planted_note(
+    proc = publish_with_planted_note(
         "# regenerate the broker locks\nuv pip compile cloud/accounts/requirements.in\n",
         suffix=".sh")
     assert proc.returncode != 0, "a shipped script named the broker:\n" + proc.stdout
@@ -472,15 +478,6 @@ def test_every_doc_the_readme_links_actually_ships():
 
 
 
-def _source_with_check_wrapper(tmp_path):
-    source = tmp_path / "source"
-    shutil.copytree(AGENT_ROOT, source, symlinks=True, ignore=shutil.ignore_patterns(
-        "node_modules", "dist", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "target"))
-    (tmp_path / "bin").mkdir()
-    shutil.copy2(Path(AGENT_ROOT).parent / "bin/check", tmp_path / "bin/check")
-    return source
-
-
 def test_the_build_guard_covers_every_dockerfile_the_public_ci_builds(tmp_path):
     """The generated ci.yml builds runtime/sotto-chat/Dockerfile.runtime and the fixed-cross overlay
     besides the root Dockerfile; a COPY source or context filter missing for any of them must stop
@@ -510,23 +507,17 @@ def test_local_speech_venv_is_never_copied_into_the_public_tree(tmp_path):
     assert not (tmp_path / "out/runtime/local-speech/.venv").exists()
 
 
-def test_hosted_only_doc_passages_are_stripped_and_a_surviving_broker_mention_fails_the_publish():
+def test_hosted_only_doc_passages_are_stripped_and_a_surviving_broker_mention_fails_the_publish(scratch):
     """The monorepo docs describe the account broker because the monorepo has it; the shipped docs
     must not, because the shipped tree does not. Marked passages vanish (markers included), a
     marked table row vanishes without breaking the table, and an UNMARKED mention is a moat leak."""
-    fd, planted = tempfile.mkstemp(prefix="scratch-fixture-", suffix=".md",
-                                   dir=os.path.join(AGENT_ROOT, "adapters", "sotto"))
-    os.close(fd)
-    rel = os.path.relpath(planted, AGENT_ROOT)
-    target = tempfile.mkdtemp(prefix="sotto-dist-")
-    os.rmdir(target)
-    try:
-        with open(planted, "w", encoding="utf-8") as f:
-            f.write("Self-host paragraph stays.\n\n<!-- hosted-only -->\n## Broker\n\n"
-                    "The account broker in `cloud/accounts/` adopts tenants.\n<!-- /hosted-only -->\n\n"
-                    "| Service | Role |\n|---|---|\n| receiver | ships |\n"
-                    "| sotto-accounts | hosted <!-- hosted-only-row -->\n| model-proxy | ships |\n")
-        proc = _run_generator(target)
+    rel = "adapters/sotto/scratch-fixture.md"
+    body = ("Self-host paragraph stays.\n\n<!-- hosted-only -->\n## Broker\n\n"
+            "The account broker in `cloud/accounts/` adopts tenants.\n<!-- /hosted-only -->\n\n"
+            "| Service | Role |\n|---|---|\n| receiver | ships |\n"
+            "| sotto-accounts | hosted <!-- hosted-only-row -->\n| model-proxy | ships |\n")
+    with _planted(scratch, rel, body) as (planted, target):
+        proc = _run_generator(target, scratch)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "MOAT GUARD: PASS" in proc.stdout
         with open(os.path.join(target, rel), encoding="utf-8") as f:
@@ -542,12 +533,7 @@ def test_hosted_only_doc_passages_are_stripped_and_a_surviving_broker_mention_fa
                           "Browser setup and sender proof", "account service", "account broker"):
                 assert trace not in playground, (name, trace)
         shutil.rmtree(target, ignore_errors=True)
-        with open(planted, "w", encoding="utf-8") as f:
-            f.write("See `cloud/accounts/README.md` for the sign-in contract.\n")
-        proc = _run_generator(target)
+        planted.write_text("See `cloud/accounts/README.md` for the sign-in contract.\n", encoding="utf-8")
+        proc = _run_generator(target, scratch)
         assert proc.returncode != 0
         assert "MOAT GUARD: FAIL" in proc.stdout and rel in proc.stdout
-    finally:
-        if os.path.exists(planted):
-            os.remove(planted)
-        shutil.rmtree(target, ignore_errors=True)

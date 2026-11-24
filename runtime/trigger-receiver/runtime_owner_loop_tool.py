@@ -54,6 +54,14 @@ _WITHHELD_REVERSAL = re.compile(r"\b(?:not|never|neither|don't|don’t|do not|ac
 
 
 def resolve_many_names_match(text, items, mode, *, exact_clause=False):
+    if mode == 'delivered':
+        if re.fullmatch(r'done[.!]?', text.strip(), re.I):
+            return len(items) == 1 and items[0]['name'] == items[0]['correction'] == text.strip().rstrip('.!')
+        from delivered_tasks import sent_selection
+        if len(items) == 1 and items[0]['name'] == items[0]['correction'] and sent_selection(text, items[0]['name']):
+            return bool(re.fullmatch(r'[\w-]+', items[0]['name']))
+        if any(re.search(r'\b(?:not|never|all|both|everything|done|close|leave|maybe|except|instead|still|open|if)\b', item['name'], re.I) for item in items):
+            return False
     claim=text.strip() if exact_clause else re.sub(r'(?:[.!]\s*|\s+[—–-]\s*)(?:what(?:(?:\'s|’s| is)? left|(?:\'s|’s)?(?: else| still)?(?: is)? open| remains)|any(?: [A-Za-z0-9_-]+){0,6} tasks? left|anything else open|what else)\?$', '', text.strip(), flags=re.I).strip()
     claim=claim if exact_clause else re.sub(r'[.!]\s*(?:you can|please) close (?:them|those|these)[.!]?$', '',claim,flags=re.I).strip()
     restatement=None if exact_clause else re.search(r'[.!]\s*(?:please\s+)?(?:close|resolve|mark)\s+(?:those|these|the)\s+(two|three|[2-9]|1[0-9]|20)(?:\s+(?:done|closed))?[.!]?$',claim,re.I)
@@ -97,7 +105,7 @@ def resolve_many_names_match(text, items, mode, *, exact_clause=False):
     connector=r'(?:\s|,|&|\band\b)*'
     return (re.fullmatch(r'(?:I|we|I\'ve|we\'ve|I have|we have)?\s*(?:finished|completed|closed|resolved|sorted)(?:\s+with)?\s*'+connector,remainder.strip(),re.I) is not None
         or re.fullmatch(connector+r'(?:loops?\s+)?(?:(?:are|were|is|have been)\s+)?(?:both\s+)?(?:closed|done|handled|finished|complete|completed|resolved|sorted)(?:\s+(?:too|now))?',remainder.strip(),re.I) is not None
-        or re.fullmatch(r'(?:please\s+)?(?:close|resolve|complete)\s*'+connector,remainder.strip(),re.I) is not None
+        or re.fullmatch(r'(?:please\s+)?(?:close|resolve|complete)\s*'+connector+r'(?:as well|too)?',remainder.strip(),re.I) is not None
         or re.fullmatch(r'(?:please\s+)?mark\s+'+connector+r'(?:as\s+)?(?:done|complete|completed|closed|resolved)',remainder.strip(),re.I) is not None)
 
 
@@ -171,7 +179,7 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
                       whitespace=name=='correction')
                 if len(args[name])>bound or args[name].strip()!=args[name]:
                     raise ValueError('owner source correction span invalid')
-        if ((args['operation']=='correct' and args['to'] not in ('resolved','dismissed'))
+        if ((args['operation']=='correct' and args['to'] not in ('resolved','dismissed','open'))
                 or (args['operation']=='retarget' and args['direction'] not in ('you','them'))):
             raise ValueError('owner source correction transition invalid')
         if args['operation']=='snooze' and (type(args['days']) is not int or not 1 <= args['days'] <= 3652058):
@@ -240,7 +248,16 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
                 expected_action,expected_hash=_identity(proposal['event_id'],original)
                 if proposal['action_id']!=expected_action or proposal['args_hash']!=expected_hash:
                     raise ValueError('cleanup proposal invalid')
-            receipt=writer.op_admitted_loop_cleanup(args,proof,now=when,inspect=body['operation']=='inspect',authority=policy['_source_authority'])
+            binder = None
+            if args.get('selection_mode') == 'delivered':
+                from runtime_read_admission import DELIVERED_THREADED_WINDOW_MS, DELIVERED_UNTHREADED_WINDOW_MS
+                from delivered_tasks import select
+                quoted = isinstance(args.get('delivery'), dict) and args['delivery'].get('quoted') is True
+                window = DELIVERED_THREADED_WINDOW_MS if quoted else DELIVERED_UNTHREADED_WINDOW_MS
+                def binder():
+                    return select(data_root, body, window, policy['_retained_route_digest']())
+            receipt=writer.op_admitted_loop_cleanup(args,proof,now=when,inspect=body['operation']=='inspect',
+                authority=policy['_source_authority'], **({'delivered_select': binder} if binder else {}))
             if body['operation']=='apply' and args['operation']=='cleanup' and type(receipt) is dict and receipt.get('status')=='unknown':
                 return {**receipt,'cleanup_stage':'writer','cleanup_category':'unavailable'}
             return receipt if receipt is not None else {'version':1,'status':'not_found'}

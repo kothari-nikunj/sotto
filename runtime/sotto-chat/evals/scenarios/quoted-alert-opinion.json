@@ -1,0 +1,35 @@
+{
+  "name": "fresh-accepted-alert-exact-quote",
+  "world": {},
+  "turns": [
+    {
+      "text": "We were looking at the Copper Finch patio design. It has two planter options. Please summarize the tradeoff between tall steel planters and short cedar planters in one sentence.",
+      "containsAny": [
+        [
+          "planter",
+          "steel",
+          "cedar"
+        ]
+      ],
+      "canonicalUnchanged": true
+    },
+    {
+      "text": "Wdyt?",
+      "quoteBackgroundFromTurn": 1,
+      "containsAny": [
+        [
+          "audio interface",
+          "interface",
+          "demo laptop"
+        ]
+      ],
+      "excludes": [
+        "planter",
+        "Copper Finch"
+      ],
+      "publicReads": 0,
+      "canonicalUnchanged": true,
+      "backgroundBefore": "New alert: The Juniper Relay rehearsal moved to Studio 8, but the new room's only working audio interface is incompatible with the demo laptop. The rehearsal starts in 25 minutes. A tested interface is still available in the original room."
+    }
+  ]
+}

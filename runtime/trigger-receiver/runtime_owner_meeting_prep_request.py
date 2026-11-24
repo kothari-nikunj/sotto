@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+import time
 
 from owner_tool_admission import validate_tool_admission, _text, UnavailableError
 from installed_writers import preferences_for
@@ -11,6 +12,82 @@ _preferences = preferences_for(__file__)
 YES = re.compile(r'^(yes|yes please|yes, please|yes pls|yep|yup|sure|do it|full prep please|full prep pls)[.!]?$', re.I)
 NAMED_PREP = re.compile(r'^(?:please\s+)?(?:(?:give|send|pull|get)(?:\s+me)?\s+)?(?:the\s+)?(?:full\s+|meeting\s+)?prep\s+(?:on|for)\s+([^\W\d_][^\d_]*?)[.!?]?$', re.I)
 OFFER_ID = re.compile(r'[a-f0-9]{32}(?:[a-f0-9]{32})?')
+
+
+PREP_WINDOW_SECONDS = 10 * 60
+NOTICE_LEAD_SECONDS = 60
+
+
+def meeting_start(prompt, effects=()):
+    """Return the timed occurrence selected at admission or resolved by focused prep."""
+    from datetime import datetime
+    try:
+        procedure = json.loads(prompt)
+    except (TypeError, ValueError):
+        return None  # Legacy text-only jobs carry no occurrence metadata.
+    if not isinstance(procedure, dict):
+        return None
+    selection = procedure.get('offer') or procedure.get('selection') or {}
+    start = (selection.get('meeting') or {}).get('start')
+    if not start and selection.get('mode') == 'focus':
+        starts = {row.get('calendar_start') for row in effects
+                  if row.get('kind') == 'meeting_prep_delivered' and row.get('mode') == 'full'}
+        if len(starts) == 1:
+            start = starts.pop()
+    if start:
+        when = datetime.fromisoformat(start.replace('Z', '+00:00'))
+        # All-day calendar events have a date but no instant to count back from.
+        if when.tzinfo is not None:
+            return when.timestamp()
+    return None
+
+
+def terminal_feedback(feedback, payload, result):
+    """Recover a legacy prep occurrence before queue cleanup discards its evidence."""
+    if not feedback:
+        return feedback
+    try:
+        meta = json.loads(feedback)
+        label = meta.get('label', '')
+        if 'prep_meeting_start' in meta or not (label.startswith('meeting-prep:') or label.endswith(':meeting-prep')):
+            return feedback
+        start = meeting_start(json.loads(payload).get('prompt'), json.loads(result or '{}').get('effects') or ())
+    except (AttributeError, TypeError, ValueError, OverflowError, RecursionError):
+        return feedback  # Unusable legacy metadata must never hold another job's claim.
+    return feedback if start is None else json.dumps({**meta, 'prep_meeting_start': start})
+
+
+def prep_window(prompt, created, effects=()):
+    start = meeting_start(prompt, effects)
+    until = created + PREP_WINDOW_SECONDS
+    return (min(until, start - NOTICE_LEAD_SECONDS) if start is not None else until), start
+
+
+def admission_window(prompt, created, feedback):
+    until, start = prep_window(prompt, created)
+    if feedback and start is not None:
+        feedback = {**feedback, 'prep_meeting_start': start}
+    return until, feedback
+
+
+class PrepDeadlineError(RuntimeError):
+    pass
+
+
+def check_work_deadline(job, result, owner, queue, root):
+    until, start = prep_window(job['payload']['prompt'], job['created'], (result or {}).get('effects') or [])
+    limits = [value for value in (job.get('valid_until'), (result or {}).get('valid_until'), until) if value is not None]
+    until = min(limits)
+    feedback = json.loads(job.get('feedback') or '{}')
+    previous = feedback.get('prep_meeting_start')
+    discovered = start if feedback and start is not None and (previous is None or start < previous) else None
+    if job.get('valid_until') != until or discovered is not None:
+        if not queue.tighten_deadline(root, job['id'], owner, until, meeting_start=discovered):
+            raise RuntimeError('meeting prep deadline lease lost')
+        job['valid_until'] = until
+    if time.time() >= until:
+        raise PrepDeadlineError('meeting prep deadline reached')
+    return until
 
 
 class _InvalidPrepTargetError(ValueError):
@@ -346,6 +423,8 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation, qu
     try:
         code, result = admit(offer, admission=metadata, feedback_identity=body['identity'],
                              feedback_thread_id=body['provider_thread_id'])
+    except queue.AdmissionWindowClosedError:
+        return {'version': 1, 'status': 'rejected', 'code': 'prep_window_closed'}
     except ValueError as error:
         if str(error) == 'work admission conflict':
             return {'version': 1, 'status': 'rejected', 'code': 'event_conflict'}

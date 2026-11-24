@@ -11,7 +11,9 @@ import { activationStateSchema, type ActivationState } from './activation-state.
 import { ManagedProxyAdmissionBusy, ManagedProxyRequestTooLarge } from './agent/models.js';
 
 const identifier = z.string().regex(/^[A-Za-z0-9._:-]{1,160}$/);
+const deliveryDeadline = z.number().int().positive().optional();
 const sendSchema = z.object({
+  valid_until_ms: deliveryDeadline,
   dispatch_id: identifier,
   target: z.string().min(1).max(512),
   text: z.string().min(1).max(32_000),
@@ -26,6 +28,7 @@ const gallerySchema = z.object({
   summary: z.string().min(1).max(1000),
 }).strict();
 const galleryBytesSchema = z.object({
+  valid_until_ms: deliveryDeadline,
   dispatch_id: identifier,
   target: z.string().min(1).max(512),
   summary: z.string().min(1).max(1000),
@@ -45,7 +48,7 @@ const runSchema = z.object({
 }).strict();
 const sessionsSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('list') }).strict(),
-  z.object({ action: z.literal('rotate') }).strict(),
+  z.object({ action: z.literal('rotate'), before: z.iso.datetime().optional() }).strict(),
   z.object({ action: z.literal('purge_before'), before: z.iso.datetime() }).strict(),
 ]);
 const retentionSchema = z.object({
@@ -150,7 +153,7 @@ function decodeGalleryBytes(input: z.infer<typeof galleryBytesSchema>): GalleryB
     }
     return { name: image.name, bytes };
   });
-  return { dispatch_id: input.dispatch_id, target: input.target, summary: input.summary, images };
+  return { ...input, images };
 }
 
 /** No network listeners or SDK connections are created until listenLoopback is called. */

@@ -21,19 +21,19 @@ def resolve_request(context, names=('Person 1', 'Person 2', 'Person 3')):
 def test_unique_first_names_bind_full_current_contact_names(context):
     prepare_cleanup(context)
     cr=ke._load_continuity()
-    names=['Tina Jiang','Shimolee Kothari','Hari Raghavan']
+    names=['Wren Halvorsen','Ines Varga','Theo Lindqvist']
     selected=[]
     for index,name in enumerate(names,1):
         row=next(r for r in rows() if r['anchor_key']==f'cleanup-{index}')
         row['contact_name']=name
         cr._persist(row)
         current=next(r for r in rows() if r['anchor_key']==row['anchor_key'])
-        word=name.split()[0] if index!=2 else 'shimolee'
+        word=name.split()[0] if index!=2 else 'ines'
         selected.append({'name':word,'anchor_key':current['anchor_key'],
             'loop_version':loop_version(current),'loop_identity':loop_identity(current),
             'correction':word})
     body=request({'operation':'resolve_many','source_revision':'a'*64,'selection_mode':'named_people','items':selected},event='e'*64,
-        text='Tina shimolee Hari loops are closed. What else is open?')
+        text='Wren ines Theo loops are closed. What else is open?')
     assert call(body,context)['outcome']=='complete'
     assert all(row['status']=='resolved' for row in rows() if row['contact_name'] in names)
 
@@ -145,15 +145,15 @@ def test_ambiguous_first_name_preflight_changes_none(context):
     body=resolve_request(context)
     cr=ke._load_continuity()
     first=next(row for row in rows() if row['anchor_key']=='cleanup-1')
-    first['contact_name']='Tina Jiang'
+    first['contact_name']='Wren Halvorsen'
     cr._persist(first)
     other=next(row for row in rows() if row['anchor_key']=='cleanup-4')
-    other['contact_name']='Tina Lee'
+    other['contact_name']='Wren Lee'
     cr._persist(other)
     current=next(row for row in rows() if row['anchor_key']=='cleanup-1')
-    body['args']['items'][0].update(name='Tina',correction='Tina',
+    body['args']['items'][0].update(name='Wren',correction='Wren',
         loop_version=loop_version(current),loop_identity=loop_identity(current))
-    body=request(body['args'],event=body['event_id'],text='Tina, Person 2, Person 3 loops are closed. What else is open?')
+    body=request(body['args'],event=body['event_id'],text='Wren, Person 2, Person 3 loops are closed. What else is open?')
     assert call(body,context)['code']=='target_unavailable'
     assert all(row['status']=='open' for row in rows())
 
@@ -262,23 +262,23 @@ def test_remaining_task_question_preserves_exact_completion_clause(suffix):
 def test_possessive_descriptions_close_only_unique_current_tasks(context,variant):
     prepare_cleanup(context)
     cr=ke._load_continuity()
-    fixtures=[('Tina Jiang','Discuss her product lead offer','Message Tina about the offer check-in'),
-              ('Shimolee Kothari','Choose dates and locations for family photos','Pick a date and location')]
+    fixtures=[('Wren Halvorsen','Discuss her product lead offer','Message Wren about the offer check-in'),
+              ('Ines Varga','Choose dates and locations for family photos','Pick a date and location')]
     selected=[]
     for index,(name,summary,ask) in enumerate(fixtures,1):
         row=next(r for r in rows() if r['anchor_key']==f'cleanup-{index}')
         row.update(contact_name=name,summary=summary,ask=ask);cr._persist(row)
         current=next(r for r in rows() if r['anchor_key']==row['anchor_key'])
-        phrase=["Tina’s offer check-in","Shimolee’s family photo plans"][index-1]
+        phrase=["Wren’s offer check-in","Ines’s family photo plans"][index-1]
         if variant=='ascii':
             phrase=phrase.replace('’',"'")
         if variant=='wrong-description' and index==1:
-            phrase='Tina’s school application'
+            phrase='Wren’s school application'
         selected.append(dict(name=phrase,correction=phrase,anchor_key=current['anchor_key'],loop_version=loop_version(current),loop_identity=loop_identity(current)))
     if variant in ('ambiguous-person','two-tasks'):
         row=next(r for r in rows() if r['anchor_key']=='cleanup-3')
-        row.update(contact_name='Tina Smith' if variant=='ambiguous-person' else 'Tina Jiang',
-                   summary='Message Tina about the offer check-in' if variant=='ambiguous-person' else 'Different task');cr._persist(row)
+        row.update(contact_name='Wren Smith' if variant=='ambiguous-person' else 'Wren Halvorsen',
+                   summary='Message Wren about the offer check-in' if variant=='ambiguous-person' else 'Different task');cr._persist(row)
     if variant=='changed':
         row=next(r for r in rows() if r['anchor_key']=='cleanup-1');row['ask']='New changed ask';cr._persist(row)
     if variant=='revoked':

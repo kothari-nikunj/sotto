@@ -28,7 +28,7 @@ def _loop(tmp_path, key="k", **fields):
     directory.mkdir(parents=True, exist_ok=True)
     row = {"anchor_key": key, "status": "open", "action_type": "reply",
            "channel": "imessage", "contact_name": "Dana",
-           "contact_identifier": "+14155552222", "created_at": "2026-06-23 08:00:00",
+           "contact_identifier": "+14155550109", "created_at": "2026-06-23 08:00:00",
            "summary": "Send Dana the pricing document", **fields}
     (directory / (cr._safe(key) + ".md")).write_text(
         "---\n" + yaml.safe_dump(row, sort_keys=False) + "---\n")
@@ -65,9 +65,9 @@ def _resolve(local, update=None):
 
 def test_generic_reply_link_call_and_calendar_do_not_close_a_task(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch); _loop(tmp_path)
-    local = {"imessage": [{"rowid": 1, "is_from_me": True, "handle": "4155552222",
+    local = {"imessage": [{"rowid": 1, "is_from_me": True, "handle": "4155550109",
         "timestamp": "2026-06-23 20:00:00", "text": "done https://x.test/doc"}],
-        "calls": [{"is_outgoing": True, "phone": "4155552222"}],
+        "calls": [{"is_outgoing": True, "phone": "4155550109"}],
         "calendar_events": [{"id": "m1", "attendees": [{"email": "dana@example.com"}]}]}
     out = _resolve(local)
     assert out["resolved"] == [] and [r["anchor_key"] for r in out["active"]] == ["k"]
@@ -89,8 +89,8 @@ def test_age_deadline_and_unreachable_never_auto_expire(tmp_path, monkeypatch, f
 
 def test_named_version_and_real_message_resolve_across_phone_format(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
-    row = _loop(tmp_path, contact_identifier="+1 (415) 555-2222")
-    msg = {"rowid": 17, "is_from_me": True, "handle": "4155552222",
+    row = _loop(tmp_path, contact_identifier="+1 (415) 555-0109")
+    msg = {"rowid": 17, "is_from_me": True, "handle": "4155550109",
            "timestamp": "2026-06-23 20:00:00", "text": "The pricing document is sent."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
                      "pricing document is sent")
@@ -100,20 +100,20 @@ def test_named_version_and_real_message_resolve_across_phone_format(tmp_path, mo
 
 
 def test_evidence_identity_requires_matching_identifier_types():
-    assert cr._handle_matches("+1 (415) 555-2222", "415-555-2222")
+    assert cr._handle_matches("+1 (415) 555-0109", "415-555-0109")
     assert cr._handle_matches("Dana@Example.com", "dana@example.com")
-    assert cr._jid_matches_phone("14155552222@s.whatsapp.net", "+1 (415) 555-2222")
-    assert cr._jid_matches_phone("14155552222@c.us", "+14155552222")
-    assert not cr._handle_matches("alex4155552222@example.com", "+14155552222")
-    assert not cr._jid_matches_phone("14155552222@lid", "+14155552222")
-    assert not cr._jid_matches_phone("alex4155552222@example.com", "+14155552222")
+    assert cr._jid_matches_phone("14155550109@s.whatsapp.net", "+1 (415) 555-0109")
+    assert cr._jid_matches_phone("14155550109@c.us", "+14155550109")
+    assert not cr._handle_matches("alex4155550109@example.com", "+14155550109")
+    assert not cr._jid_matches_phone("14155550109@lid", "+14155550109")
+    assert not cr._jid_matches_phone("alex4155550109@example.com", "+14155550109")
 
 
 def test_numeric_email_username_cannot_resolve_phone_counterpart(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path)
     msg = {"id": "mail-numeric", "isSent": True, "from": "me@example.com",
-           "to": "Alex <alex4155552222@example.com>", "date": "2026-06-23T22:00:00Z",
+           "to": "Alex <alex4155550109@example.com>", "date": "2026-06-23T22:00:00Z",
            "body": "Attached is the final pricing document."}
     update = _update(row, "resolved", "email", "mail-numeric", "final pricing document")
     assert _resolve({"emails": [msg]}, update)["resolved"] == []
@@ -122,8 +122,8 @@ def test_numeric_email_username_cannot_resolve_phone_counterpart(tmp_path, monke
 def test_direct_imessage_chat_guid_is_not_misread_as_a_group(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path)
-    msg = {"rowid": 117, "chat_guid": "iMessage;-;+14155552222", "is_group_chat": False,
-           "is_from_me": True, "handle": "+14155552222",
+    msg = {"rowid": 117, "chat_guid": "iMessage;-;+14155550109", "is_group_chat": False,
+           "is_from_me": True, "handle": "+14155550109",
            "timestamp": "2026-06-23 20:00:00", "text": "The pricing document is sent."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
                      "pricing document is sent")
@@ -133,7 +133,7 @@ def test_direct_imessage_chat_guid_is_not_misread_as_a_group(tmp_path, monkeypat
 def test_disabled_source_cannot_resolve_from_leftover_snapshot_rows(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path)
-    msg = {"rowid": 118, "is_from_me": True, "handle": "+14155552222",
+    msg = {"rowid": 118, "is_from_me": True, "handle": "+14155550109",
            "timestamp": "2026-06-23 20:00:00", "text": "The pricing document is sent."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
                      "pricing document is sent")
@@ -153,7 +153,7 @@ def test_disabled_source_cannot_resolve_from_leftover_snapshot_rows(tmp_path, mo
 def test_completion_diagnostics_keep_evidence_guards(tmp_path, monkeypatch, change, reason):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path)
-    msg = {"rowid": 117, "is_from_me": True, "handle": "+14155552222",
+    msg = {"rowid": 117, "is_from_me": True, "handle": "+14155550109",
            "timestamp": "2026-06-23 20:00:00", "text": "The pricing document is sent."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
                      "pricing document is sent")
@@ -193,12 +193,12 @@ def test_malformed_top_level_update_is_counted_as_rejected(tmp_path, monkeypatch
 def test_cross_channel_completion_uses_snapshot_contact_identity(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, channel="email", contact_identifier="dana@example.com")
-    msg = {"rowid": 18, "is_from_me": True, "contact_jid": "14155552222@s.whatsapp.net",
+    msg = {"rowid": 18, "is_from_me": True, "contact_jid": "14155550109@s.whatsapp.net",
            "timestamp": "2026-06-23 21:00:00", "text": "The pricing document is sent."}
     update = _update(row, "resolved", "whatsapp", message_evidence_id(msg, "whatsapp"),
                      "pricing document is sent")
     local = {"contacts": [{"name": "Dana", "emails": ["dana@example.com"],
-              "phones": ["+1 415 555 2222"]}], "whatsapp": [msg]}
+              "phones": ["+1 415 555 0109"]}], "whatsapp": [msg]}
     assert len(_resolve(local, update)["resolved"]) == 1
 
 
@@ -206,12 +206,12 @@ def test_cross_channel_completion_uses_only_verified_graph_aliases(tmp_path, mon
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, channel="email", contact_identifier="dana@example.com",
                 canonical_id="person-dana")
-    msg = {"rowid": 118, "is_from_me": True, "handle": "+14155552222",
+    msg = {"rowid": 118, "is_from_me": True, "handle": "+14155550109",
            "timestamp": "2026-06-23 21:00:00", "text": "The pricing document is sent."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
                      "pricing document is sent")
     index = {"index": {"by_identifier": {"dana@example.com": "/people/dana.md",
-                                          "4155552222": "/people/dana.md"},
+                                          "4155550109": "/people/dana.md"},
                        "by_cid": {"person-dana": "/people/dana.md"}}}
     monkeypatch.setattr(cr, "person_identity", lambda: _unique_index(index))
     _loop(tmp_path, key="separate-memo", channel="email",
@@ -226,16 +226,16 @@ def test_shared_name_or_unverified_graph_alias_cannot_bind_completion(tmp_path, 
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, channel="email", contact_identifier="dana@example.com",
                 canonical_id="person-dana")
-    msg = {"rowid": 119, "is_from_me": True, "handle": "+14155552222",
+    msg = {"rowid": 119, "is_from_me": True, "handle": "+14155550109",
            "timestamp": "2026-06-23 21:00:00", "text": "The pricing document is sent."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
                      "pricing document is sent")
     index = {"index": {"by_identifier": {"dana@example.com": "/people/dana.md",
-                                          "4155552222": "/people/other-dana.md"},
+                                          "4155550109": "/people/other-dana.md"},
                        "by_cid": {"person-dana": "/people/dana.md"}}}
     monkeypatch.setattr(cr, "person_identity", lambda: _unique_index(index))
     local = {"imessage": [msg], "contacts": [{"name": "Dana", "emails": ["other@example.com"],
-                                              "phones": ["+14155552222"]}]}
+                                              "phones": ["+14155550109"]}]}
     assert _resolve(local, update)["resolved"] == []
 
 
@@ -307,7 +307,7 @@ def test_rendered_sent_email_id_survives_normalization_and_resolves_matching_loo
 
 def test_inbound_message_cannot_resolve_what_user_owes(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch); row = _loop(tmp_path)
-    msg = {"rowid": 19, "is_from_me": False, "handle": "+14155552222",
+    msg = {"rowid": 19, "is_from_me": False, "handle": "+14155550109",
            "timestamp": "2026-06-23 22:00:00", "text": "I sent the pricing document."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
                      "sent the pricing document")
@@ -318,7 +318,7 @@ def test_waiting_update_uses_inbound_promise_and_promised_date(tmp_path, monkeyp
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, action_type="waiting_on", summary="Dana owes the signed waiver",
                 chase_after="2026-06-24")
-    msg = {"rowid": 20, "is_from_me": False, "handle": "+14155552222",
+    msg = {"rowid": 20, "is_from_me": False, "handle": "+14155550109",
            "timestamp": "2026-06-24 08:00:00", "text": "Legal will send it on Friday."}
     update = _update(row, "waiting", "imessage", message_evidence_id(msg, "imessage"),
                      "will send it on Friday")
@@ -330,7 +330,7 @@ def test_waiting_update_uses_inbound_promise_and_promised_date(tmp_path, monkeyp
 def test_waiting_on_resolves_as_delivered_only_with_inbound_proof(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, action_type="waiting_on", summary="Dana owes the signed waiver")
-    msg = {"rowid": 21, "is_from_me": False, "handle": "+14155552222",
+    msg = {"rowid": 21, "is_from_me": False, "handle": "+14155550109",
            "timestamp": "2026-06-24 08:00:00", "text": "Here is the signed waiver."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"), "signed waiver")
     assert [r["resolution"] for r in _resolve({"imessage": [msg]}, update)["resolved"]] == ["delivered"]
@@ -338,7 +338,7 @@ def test_waiting_on_resolves_as_delivered_only_with_inbound_proof(tmp_path, monk
 
 def test_explicit_manual_commitment_ignores_model_update(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch); row = _loop(tmp_path, resolution_mode="explicit")
-    msg = {"rowid": 22, "is_from_me": True, "handle": "+14155552222",
+    msg = {"rowid": 22, "is_from_me": True, "handle": "+14155550109",
            "timestamp": "2026-06-24 08:00:00", "text": "The pricing document is sent."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
                      "pricing document is sent")
@@ -348,7 +348,7 @@ def test_explicit_manual_commitment_ignores_model_update(tmp_path, monkeypatch):
 def test_callback_activity_requires_explicit_completion(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch); _loop(tmp_path, action_type="call_back", channel="phone")
     out = _resolve({"whatsapp_calls": [{"is_outgoing": True,
-        "jid": "14155552222@s.whatsapp.net", "timestamp": "2026-06-24 08:00:00"}]})
+        "jid": "14155550109@s.whatsapp.net", "timestamp": "2026-06-24 08:00:00"}]})
     assert out["resolved"] == []
 
 
@@ -357,15 +357,15 @@ def test_reviewed_specific_text_answer_closes_callback_across_channels(tmp_path,
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, action_type='call_back', channel='phone', summary='Respond after Dana called')
     text = 'Saw your missed call; Thursday at two works for me.'
-    msg = {'rowid': 42, 'is_from_me': True, 'handle': '+14155552222',
-           'contact_jid': '14155552222@s.whatsapp.net', 'timestamp': '2026-06-24 08:00:00', 'text': text}
+    msg = {'rowid': 42, 'is_from_me': True, 'handle': '+14155550109',
+           'contact_jid': '14155550109@s.whatsapp.net', 'timestamp': '2026-06-24 08:00:00', 'text': text}
     source_id, field = message_evidence_id(msg, channel), channel
     local = {}
     if channel == 'email':
         msg = {'id': 'mail-callback', 'isSent': True, 'to': 'dana@example.com',
                'date': msg['timestamp'], 'body': text}
         source_id, field = msg['id'], 'emails'
-        local['contacts'] = [{'name': 'Dana', 'phones': ['+14155552222'], 'emails': ['dana@example.com']}]
+        local['contacts'] = [{'name': 'Dana', 'phones': ['+14155550109'], 'emails': ['dana@example.com']}]
     local[field] = [msg]
     assert not _resolve(local)['resolved']
     assert len(_resolve(local, _update(row, 'resolved', channel, source_id, text))['resolved']) == 1
@@ -376,11 +376,11 @@ def test_ambiguous_contact_cards_never_expand_completion_aliases(tmp_path, monke
     _env(tmp_path, monkeypatch)
     primary = 'shared@example.com' if shared == 'primary' else 'dana-a@example.com'
     row = _loop(tmp_path, channel='email', contact_identifier=primary, contact_name='Dana A')
-    contacts = [{'name': 'Dana A', 'emails': [primary], 'phones': ['+14155551111']},
-                {'name': 'Dana B', 'emails': ['shared@example.com'], 'phones': ['+14155552222']}]
+    contacts = [{'name': 'Dana A', 'emails': [primary], 'phones': ['+14155550106']},
+                {'name': 'Dana B', 'emails': ['shared@example.com'], 'phones': ['+14155550109']}]
     if shared == 'secondary':
-        contacts[0]['phones'] = ['+14155552222']
-    msg = {'rowid': 43, 'is_from_me': True, 'handle': '+14155552222',
+        contacts[0]['phones'] = ['+14155550109']
+    msg = {'rowid': 43, 'is_from_me': True, 'handle': '+14155550109',
            'timestamp': '2026-06-24 08:00:00', 'text': 'The pricing document is sent.'}
     update = _update(row, 'resolved', 'imessage', message_evidence_id(msg, 'imessage'), msg['text'])
     assert not _resolve({'contacts': contacts, 'imessage': [msg]}, update)['resolved']
@@ -393,9 +393,9 @@ def test_real_graph_collision_cannot_lend_shared_phone_to_other_person(tmp_path,
     folder = Path(kg.people_dir()); folder.mkdir(parents=True)
     for cid, email in [('c_aaaaaa1', 'dana-a@example.com'), ('c_bbbbbb2', 'dana-b@example.com')]:
         (folder / (cid + '.md')).write_text(kg.serialize_person_file(kg.PersonFile(
-            name='Dana', canonical_id=cid, identifiers=[email, '+14155552222'])))
+            name='Dana', canonical_id=cid, identifiers=[email, '+14155550109'])))
     row = _loop(tmp_path, channel='email', canonical_id='c_aaaaaa1', contact_identifier='dana-a@example.com')
-    msg = {'rowid': 44, 'is_from_me': True, 'handle': '+14155552222',
+    msg = {'rowid': 44, 'is_from_me': True, 'handle': '+14155550109',
            'timestamp': '2026-06-24 08:00:00', 'text': 'The pricing document is sent.'}
     update = _update(row, 'resolved', 'imessage', message_evidence_id(msg, 'imessage'), msg['text'])
     assert not _resolve({'imessage': [msg]}, update)['resolved']
@@ -409,48 +409,47 @@ def test_graph_phone_and_whatsapp_jid_share_alias_keys_without_lending_shared_id
     folder = Path(kg.people_dir()); folder.mkdir(parents=True)
     kg.write_person_file(str(folder / 'c_aaaaaa1.md'), kg.PersonFile(
         name='Dana', canonical_id='c_aaaaaa1',
-        identifiers=['dana@example.com', '14155552222@s.whatsapp.net']), NOW)
+        identifiers=['dana@example.com', '14155550109@s.whatsapp.net']), NOW)
     if collision:
         kg.write_person_file(str(folder / 'c_bbbbbb2.md'), kg.PersonFile(
             name='Dana', canonical_id='c_bbbbbb2',
-            identifiers=['other@example.com', '+1 (415) 555-2222']), NOW)
+            identifiers=['other@example.com', '+1 (415) 555-0109']), NOW)
     index = cr.person_identity()
-    key = cr.alias_identifier('+14155552222')
-    assert key == cr.alias_identifier('14155552222@s.whatsapp.net')
+    key = cr.alias_identifier('+14155550109')
+    assert key == cr.alias_identifier('14155550109@s.whatsapp.net')
     assert (key in index['ambiguous_identifiers']) is collision
     assert (index['unique_identifiers'].get(key) == 'c_aaaaaa1') is (not collision)
     row = _loop(tmp_path, channel='email', canonical_id='c_aaaaaa1', contact_identifier='dana@example.com')
-    msg = {'rowid': 45, 'is_from_me': True, 'contact_jid': '14155552222@s.whatsapp.net',
+    msg = {'rowid': 45, 'is_from_me': True, 'contact_jid': '14155550109@s.whatsapp.net',
            'timestamp': '2026-06-24 08:00:00', 'text': 'The pricing document is sent.'}
     update = _update(row, 'resolved', 'whatsapp', message_evidence_id(msg, 'whatsapp'), msg['text'])
     assert bool(_resolve({'whatsapp': [msg]}, update)['resolved']) is (not collision)
 
 
 def _connected_call(source):
-    return ({'phone': '+14155552222', 'timestamp': '2026-06-24 08:00:00',
-             'is_outgoing': True, 'is_answered': True, 'call_type': 'phone', 'duration_seconds': 125}
+    return ({'phone': '+14155550109', 'timestamp': '2026-06-24 08:00:00',
+             'is_outgoing': True, 'is_answered': False, 'call_type': 'phone', 'duration_seconds': 125}
             if source == 'calls' else
-            {'jid': '14155552222@s.whatsapp.net', 'timestamp': '2026-06-24 08:00:00',
+            {'jid': '14155550109@s.whatsapp.net', 'timestamp': '2026-06-24 08:00:00',
              'is_outgoing': True, 'is_missed': False})
 
 
-@pytest.mark.parametrize('source', ['calls'])
-def test_rendered_connected_call_review_closes_only_named_callback(tmp_path, monkeypatch, source):
+def test_native_call_closes_only_reviewed_callback(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, action_type='call_back', channel='phone', summary='Return Dana call')
-    _loop(tmp_path, key='separate-document', summary='Send the pricing document')
-    call = _connected_call(source)
-    source_id, quote = call_evidence(call, source)
-    local = {source: [call], 'contacts': [{'name': 'Dana', 'phones': ['+14155552222']}]}
+    _loop(tmp_path, key='other', summary='Send the pricing document')
+    call = _connected_call('calls')
+    source_id, quote = call_evidence(call, 'calls')
+    local = {'calls': [call], 'contacts': [{'name': 'Dana', 'phones': ['+14155550109']}]}
     rendered = _format_recent_calls(resolve_contact_names(local)['recent_calls'])
-    assert source_id in rendered and quote in rendered
+    assert source_id and 'Outgoing connected phone call' in quote and quote in rendered
     assert not _resolve(local)['resolved']
-    update = _update(row, 'resolved', source, source_id, quote)
+    update = _update(row, 'resolved', 'calls', source_id, quote)
     assert compose_brief._project_loop_updates({'loop_updates': [update]},
         {'local': local, 'google': {}}, [row]) == []
     result = _resolve(local, update)
     assert [item['anchor_key'] for item in result['resolved']] == ['k']
-    assert [item['anchor_key'] for item in result['active']] == ['separate-document']
+    assert [item['anchor_key'] for item in result['active']] == ['other']
 
 
 @pytest.mark.parametrize('instant,closes', [('2026-06-24T07:00:00Z', False), ('2026-06-24T08:30:00Z', True)])
@@ -473,7 +472,7 @@ def test_call_evidence_preserves_repeated_hour_offset_when_captured(tmp_path, mo
             'timestamp': '2024-11-03 01:30:00', 'timestamp_utc': '2024-11-03T06:30:00Z', 'record_id': '42'}
     source_id, quote = call_evidence(call, 'calls')
     action = {'type': 'call_back', 'channel': 'phone', 'contactName': 'Dana',
-              'contactIdentifier': '+14155552222', 'contextSummary': 'Respond to missed call',
+              'contactIdentifier': '+14155550109', 'contextSummary': 'Respond to missed call',
               'evidence': [{'sourceType': 'calls', 'sourceId': source_id, 'snippet': quote}]}
     result = cr.resolve({'today': '2024-11-03', 'local': {'calls': [call]}, 'new_actions': [action]},
                         datetime(2024, 11, 3, 3), resolve_existing=False)
@@ -490,7 +489,7 @@ def test_native_whatsapp_not_missed_attempt_cannot_prove_connected_or_hide_misse
     missed = {**attempted, 'is_outgoing': False, 'is_missed': True,
               'timestamp': '2026-06-24 07:00:00'}
     local = {'whatsapp_calls': [missed, attempted],
-             'contacts': [{'name': 'Dana', 'phones': ['+14155552222']}]}
+             'contacts': [{'name': 'Dana', 'phones': ['+14155550109']}]}
     assert call_evidence(attempted, 'whatsapp_calls') == ('', '')
     resolved = resolve_contact_names(local)
     assert len(resolved['missed_calls']) == 1 and resolved['recent_calls'] == []
@@ -509,9 +508,9 @@ def test_callback_call_evidence_holds_on_missing_or_changed_proof(tmp_path, monk
     monkeypatch.setenv('SOTTO_SKILL_COMPOSITION_PROOF', json.dumps({'source_revision': 'a' * 64}))
     row = _loop(tmp_path, action_type='call_back', channel='phone')
     call = _connected_call(source)
-    key = 'is_answered' if source == 'calls' else 'is_missed'
+    key = 'duration_seconds' if source == 'calls' else 'is_missed'
     if change == 'unanswered':
-        call[key] = source != 'calls'
+        call[key] = 0 if source == 'calls' else True
     if change == 'unknown_connection':
         call.pop(key)
     if change == 'unknown_direction':
@@ -519,7 +518,7 @@ def test_callback_call_evidence_holds_on_missing_or_changed_proof(tmp_path, monk
     if change == 'earlier':
         call['timestamp'] = '2026-06-23 07:00:00'
     if change == 'wrong_person':
-        call['phone' if source == 'calls' else 'jid'] = '+14155559999'
+        call['phone' if source == 'calls' else 'jid'] = '+14155550116'
     source_id, quote = call_evidence(call, source)
     update = _update(row, 'resolved', source, source_id or 'unproved', quote or 'Unproved call')
     if change == 'stale_version':
@@ -553,7 +552,7 @@ def test_connected_call_cannot_pay_other_obligations(tmp_path, monkeypatch, fiel
 def test_short_entire_answer_requires_real_message_and_review(tmp_path, monkeypatch, text):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, summary='Confirm the time or delivery with Dana')
-    msg = {'rowid': 45, 'is_from_me': True, 'handle': '+14155552222',
+    msg = {'rowid': 45, 'is_from_me': True, 'handle': '+14155550109',
            'timestamp': '2026-06-24 08:00:00', 'text': text}
     source_id = message_evidence_id(msg, 'imessage')
     assert not _resolve({'imessage': [msg]}, _update(row, 'resolved', 'imessage', source_id, text, reviewed=False))['resolved']
@@ -562,7 +561,7 @@ def test_short_entire_answer_requires_real_message_and_review(tmp_path, monkeypa
 
 def test_short_fragment_cannot_cherry_pick_incomplete_response(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch); row = _loop(tmp_path)
-    msg = {'rowid': 46, 'is_from_me': True, 'handle': '+14155552222',
+    msg = {'rowid': 46, 'is_from_me': True, 'handle': '+14155550109',
            'timestamp': '2026-06-24 08:00:00', 'text': 'I have not sent the pricing document yet.'}
     update = _update(row, 'resolved', 'imessage', message_evidence_id(msg, 'imessage'), 'sent')
     assert not _resolve({'imessage': [msg]}, update)['resolved']
@@ -572,7 +571,7 @@ def test_short_fragment_cannot_cherry_pick_incomplete_response(tmp_path, monkeyp
 def test_optional_birthday_closure_requires_actual_greeting(tmp_path, monkeypatch, text, closes):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, resolution_mode='birthday_greeting', summary='Optional birthday greeting')
-    msg = {'rowid': 47, 'is_from_me': True, 'handle': '+14155552222',
+    msg = {'rowid': 47, 'is_from_me': True, 'handle': '+14155550109',
            'timestamp': '2026-06-24 08:00:00', 'text': text}
     update = _update(row, 'resolved', 'imessage', message_evidence_id(msg, 'imessage'), text)
     assert bool(_resolve({'imessage': [msg]}, update)['resolved']) is closes
@@ -586,16 +585,16 @@ def test_callback_capture_uses_missed_call_time_before_brief_and_later_answer(tm
     call['is_outgoing'] = False
     call['is_answered' if source == 'calls' else 'is_missed'] = source != 'calls'
     source_id, quote = call_evidence(call, source)
-    local = {source: [call], 'contacts': [{'name': 'Dana', 'phones': ['+14155552222']}]}
+    local = {source: [call], 'contacts': [{'name': 'Dana', 'phones': ['+14155550109']}]}
     assert source_id in _format_missed_calls(resolve_contact_names(local)['missed_calls'])
     action = {'type': 'call_back', 'channel': 'phone', 'contactName': 'Dana',
-              'contactIdentifier': '+14155552222', 'contextSummary': 'Respond to missed call',
+              'contactIdentifier': '+14155550109', 'contextSummary': 'Respond to missed call',
               'evidence': [{'sourceType': source, 'sourceId': source_id, 'snippet': quote}]}
     captured = cr.resolve({'today': '2026-06-24', 'local': local, 'new_actions': [action]},
                           NOW, resolve_existing=False)['active']
     assert len(captured) == 1 and captured[0]['created_at'] == '2026-06-24 08:00:00'
     row = captured[0]
-    msg = {'rowid': 48, 'is_from_me': True, 'handle': '+14155552222',
+    msg = {'rowid': 48, 'is_from_me': True, 'handle': '+14155550109',
            'timestamp': '2026-06-24 08:30:00', 'text': 'Saw your call; Thursday at two works for me.'}
     local['imessage'] = [msg]
     update = _update(row, 'resolved', 'imessage', message_evidence_id(msg, 'imessage'), msg['text'])
@@ -619,7 +618,7 @@ def test_callback_capture_refuses_unobserved_or_wrong_missed_call(tmp_path, monk
     if change == 'revoked':
         local['source_status'] = {'calls': 'disabled'}
     action = {'type': 'call_back', 'channel': 'phone', 'contactName': 'Dana',
-              'contactIdentifier': '+14155559999' if change == 'wrong_person' else '+14155552222',
+              'contactIdentifier': '+14155550116' if change == 'wrong_person' else '+14155550109',
               'contextSummary': 'Respond to missed call',
               'evidence': [{'sourceType': 'calls', 'sourceId': source_id, 'snippet': quote}]}
     assert cr.resolve({'today': '2026-06-24', 'local': local, 'new_actions': [action]},
@@ -629,14 +628,14 @@ def test_callback_capture_refuses_unobserved_or_wrong_missed_call(tmp_path, monk
 def test_same_person_prose_folds_unless_second_obligation_is_source_bound(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     base = {"action_type": "reply", "channel": "imessage", "contactName": "Dana",
-            "contactIdentifier": "+14155552222", "contextSummary": "Send the pricing document"}
+            "contactIdentifier": "+14155550109", "contextSummary": "Send the pricing document"}
     first = cr.resolve({"today": "2026-06-24", "new_actions": [base, dict(base)]}, NOW,
                        resolve_existing=False)
     assert len(first["active"]) == 1
     second = cr.resolve({"today": "2026-06-24", "new_actions": [
         {**base, "contextSummary": "Confirm the lunch address"}]}, NOW, resolve_existing=False)
     assert len(second["active"]) == 1
-    msg = {"rowid": 91, "is_from_me": False, "handle": "+14155552222",
+    msg = {"rowid": 91, "is_from_me": False, "handle": "+14155550109",
            "timestamp": "2026-06-24 08:00:00", "text": "Send it and confirm lunch."}
     distinct = {**base, "contextSummary": "Confirm the lunch address", "newObligation": True,
                 "evidence": [{"sourceType": "imessage", "sourceId": "91",
@@ -649,7 +648,7 @@ def test_same_person_prose_folds_unless_second_obligation_is_source_bound(tmp_pa
 def test_paraphrase_recaptures_stable_base_without_redefining_the_task(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     base = {"action_type": "reply", "channel": "imessage", "contactName": "Dana",
-            "contactIdentifier": "+14155552222", "contextSummary": "Send the pricing document"}
+            "contactIdentifier": "+14155550109", "contextSummary": "Send the pricing document"}
     original, = cr.resolve({"today": "2026-06-24", "new_actions": [base]}, NOW,
                            resolve_existing=False)["active"]
     paraphrase = {**base, "contextSummary": "Get Dana the price sheet"}
@@ -666,7 +665,7 @@ def test_group_evidence_must_bind_tracked_group(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     group = "iMessage;+;group-one"
     row = _loop(tmp_path, group_id=group, contact_identifier="", contact_name="Dinner group")
-    msg = {"rowid": 23, "is_from_me": True, "handle": "+14155552222",
+    msg = {"rowid": 23, "is_from_me": True, "handle": "+14155550109",
            "chat_guid": "iMessage;+;group-two", "is_group_chat": True,
            "timestamp": "2026-06-24 08:00:00", "text": "The dinner address is confirmed."}
     update = _update(row, "resolved", "imessage", message_evidence_id(msg, "imessage"),
@@ -684,14 +683,14 @@ def test_group_task_accepts_email_to_verified_participant_alias(tmp_path, monkey
     row = _loop(tmp_path, group_id=group, contact_identifier="",
                 contact_name="Introduction group", summary="Introduce Alex to ExampleCo")
     group_message = {"rowid": 30, "is_from_me": False, "is_group_chat": True,
-                     "chat_guid": group, "handle": "+14155552222",
-                     "group_participants": ["+14155552222"],
+                     "chat_guid": group, "handle": "+14155550109",
+                     "group_participants": ["+14155550109"],
                      "timestamp": "2026-06-23 09:00:00", "text": "Please introduce us."}
     email = {"id": "mail-intro", "isSent": True, "from": "me@example.com",
              "to": "Alex <alex@example.com>", "date": "2026-06-23T22:00:00Z",
              "body": "Introducing Alex to ExampleCo."}
     update = _update(row, "resolved", "email", "mail-intro", "Introducing Alex to ExampleCo")
-    index = {"index": {"by_identifier": {"4155552222": "/people/alex.md",
+    index = {"index": {"by_identifier": {"4155550109": "/people/alex.md",
                                           "alex@example.com": "/people/alex.md"},
                        "by_cid": {"person-alex": "/people/alex.md"}}}
     monkeypatch.setattr(cr, "person_identity", lambda: _unique_index(index))
@@ -712,14 +711,14 @@ def test_group_task_closes_by_email_only_when_addressed_to_whole_roster(
     row = _loop(tmp_path, group_id=group, contact_identifier="", contact_name="Family",
                 summary="Send the family the dinner address")
     group_message = {"rowid": 31, "is_from_me": False, "is_group_chat": True,
-                     "chat_guid": group, "handle": "+14155552222",
-                     "group_participants": ["+14155552222", "+14155553333"],
+                     "chat_guid": group, "handle": "+14155550109",
+                     "group_participants": ["+14155550109", "+14155550110"],
                      "timestamp": "2026-06-23 07:00:00", "text": "What's the dinner address?"}
     email = {"id": "mail-family", "isSent": True, "from": "me@example.com", "to": recipients,
              "date": "2026-06-23T22:00:00Z", "body": "Happy birthday Mom! Dinner is at 12 Elm St."}
-    index = {"index": {"by_identifier": {"4155552222": "/people/mom.md",
+    index = {"index": {"by_identifier": {"4155550109": "/people/mom.md",
                                           "mom@example.com": "/people/mom.md",
-                                          "4155553333": "/people/dad.md",
+                                          "4155550110": "/people/dad.md",
                                           "dad@example.com": "/people/dad.md"},
                        "by_cid": {}}}
     monkeypatch.setattr(cr, "person_identity", lambda: _unique_index(index))
@@ -734,12 +733,12 @@ def test_group_roster_is_the_sources_participant_list_not_senders_seen(tmp_path,
     row = _loop(tmp_path, group_id=group, contact_identifier="", contact_name="Family",
                 summary="Send the family the dinner address")
     sender_only = {"rowid": 32, "is_from_me": False, "is_group_chat": True, "chat_guid": group,
-                   "handle": "+14155552222", "timestamp": "2026-06-23 07:00:00",
+                   "handle": "+14155550109", "timestamp": "2026-06-23 07:00:00",
                    "text": "What's the dinner address?"}
     email = {"id": "mail-mom", "isSent": True, "from": "me@example.com",
              "to": "Mom <mom@example.com>", "date": "2026-06-23T22:00:00Z",
              "body": "Dinner is at 12 Elm St."}
-    index = {"index": {"by_identifier": {"4155552222": "/people/mom.md",
+    index = {"index": {"by_identifier": {"4155550109": "/people/mom.md",
                                           "mom@example.com": "/people/mom.md"}, "by_cid": {}}}
     monkeypatch.setattr(cr, "person_identity", lambda: _unique_index(index))
     update = _update(row, "resolved", "email", "mail-mom", "Dinner is at 12 Elm St.")
@@ -754,13 +753,13 @@ def test_group_email_needs_observed_roster_and_verified_recipient(tmp_path, monk
     row = _loop(tmp_path, group_id=group, contact_identifier="",
                 contact_name="Introduction group", summary="Introduce Alex to ExampleCo")
     group_message = {"rowid": 30, "is_from_me": False, "is_group_chat": True,
-                     "chat_guid": group, "handle": "+14155552222",
-                     "group_participants": ["+14155552222"],
+                     "chat_guid": group, "handle": "+14155550109",
+                     "group_participants": ["+14155550109"],
                      "timestamp": "2026-06-23 09:00:00", "text": "Please introduce us."}
     email = {"id": "mail-intro", "isSent": True, "from": "me@example.com",
              "to": "Alex <alex@example.com>", "date": "2026-06-23T22:00:00Z",
              "body": "Introducing Alex to ExampleCo."}
-    index = {"index": {"by_identifier": {"4155552222": "/people/alex.md",
+    index = {"index": {"by_identifier": {"4155550109": "/people/alex.md",
                                           "alex@example.com": "/people/alex.md"},
                        "by_cid": {"person-alex": "/people/alex.md"}}}
     if change == "wrong_recipient":
@@ -768,7 +767,7 @@ def test_group_email_needs_observed_roster_and_verified_recipient(tmp_path, monk
     elif change == "missing_roster":
         group_message["chat_guid"] = "iMessage;+;another-group"
     elif change == "email_with_phone_digits":
-        email["to"] = "Stranger <x4155552222@example.com>"
+        email["to"] = "Stranger <x4155550109@example.com>"
     else:
         index["index"]["by_identifier"]["alex@example.com"] = "/people/other.md"
     monkeypatch.setattr(cr, "person_identity", lambda: _unique_index(index))
@@ -833,7 +832,7 @@ def test_assistant_source_cannot_mint_debt_but_original_human_email_can(tmp_path
 def test_public_proposal_hash_cannot_claim_a_review(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path)
-    msg = {'rowid': 90, 'is_from_me': True, 'handle': '+14155552222',
+    msg = {'rowid': 90, 'is_from_me': True, 'handle': '+14155550109',
            'timestamp': '2026-06-23 20:00:00', 'text': 'Here is the pricing document you asked for.'}
     update = _update(row, 'resolved', 'imessage', message_evidence_id(msg, 'imessage'),
                      msg['text'], reviewed=False)
@@ -878,7 +877,7 @@ def test_ordinary_capture_uses_request_time_so_later_answer_before_capture_can_c
                  'date': '2026-06-24 08:30:00', 'body': answer}
         field = 'emails'
     else:
-        ident = '+14155552222'
+        ident = '+14155550109'
         request = {'id': 'request-1', 'handle': ident, 'timestamp': '2026-06-24 08:00:00',
                    'is_from_me': False, 'text': ask}
         reply = {'id': 'reply-2', 'handle': ident, 'timestamp': '2026-06-24 08:30:00',
@@ -900,30 +899,30 @@ def test_ordinary_capture_uses_request_time_so_later_answer_before_capture_can_c
 
 
 @pytest.mark.parametrize('change', ['wrong_id', 'wrong_person', 'future', 'wrong_quote'])
-def test_ordinary_capture_never_backdates_from_unproved_source(tmp_path, monkeypatch, change):
+def test_unproved_capture_is_withheld(tmp_path, monkeypatch, change):
     _env(tmp_path, monkeypatch)
-    request = {'id': 'request-1', 'handle': '+14155552222', 'timestamp': '2026-06-24 08:00:00',
+    request = {'id': 'request-1', 'handle': '+14155550109', 'timestamp': '2026-06-24 08:00:00',
                'is_from_me': False, 'text': 'Please send the pricing document.'}
     if change == 'wrong_person':
-        request['handle'] = '+14155559999'
+        request['handle'] = '+14155550116'
     if change == 'future':
         request['timestamp'] = '2026-06-24 10:00:00'
     action = {'type': 'reply', 'channel': 'imessage', 'contactName': 'Dana',
-              'contactIdentifier': '+14155552222', 'contextSummary': 'Send the pricing document',
+              'contactIdentifier': '+14155550109', 'contextSummary': 'Send the pricing document',
               'evidence': [{'sourceType': 'imessage', 'sourceId': 'wrong' if change == 'wrong_id' else 'request-1',
                            'snippet': 'Unobserved words' if change == 'wrong_quote' else request['text']}]}
-    row = cr.resolve({'today': '2026-06-24', 'local': {'imessage': [request]}, 'new_actions': [action]},
-                     NOW, resolve_existing=False)['active'][0]
-    assert row['created_at'] == '2026-06-24 09:00:00'
+    result = cr.resolve({'today': '2026-06-24', 'local': {'imessage': [request]}, 'new_actions': [action]},
+                        NOW, resolve_existing=False)
+    assert result['active'] == [] and result['capture_outcomes']['source_rejected'] == 1
 
 
 def test_recapture_does_not_rebase_an_existing_task_cutoff(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, created_at='2026-06-24 08:45:00')
-    request = {'id': 'request-1', 'handle': '+14155552222', 'timestamp': '2026-06-24 08:00:00',
+    request = {'id': 'request-1', 'handle': '+14155550109', 'timestamp': '2026-06-24 08:00:00',
                'is_from_me': False, 'text': 'Please send the pricing document.'}
     action = {'loopId': row['anchor_key'], 'type': 'reply', 'channel': 'imessage',
-              'contactName': 'Dana', 'contactIdentifier': '+14155552222',
+              'contactName': 'Dana', 'contactIdentifier': '+14155550109',
               'contextSummary': row['summary'],
               'evidence': [{'sourceType': 'imessage', 'sourceId': 'request-1', 'snippet': request['text']}]}
     rows = cr.resolve({'today': '2026-06-24', 'local': {'imessage': [request]}, 'new_actions': [action]},
@@ -935,15 +934,15 @@ def test_recapture_does_not_rebase_an_existing_task_cutoff(tmp_path, monkeypatch
 def test_new_same_day_commitment_survives_automatic_closure(tmp_path, monkeypatch, outgoing):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path)
-    delivered = {'rowid': 801, 'handle': '+14155552222', 'is_from_me': True,
+    delivered = {'rowid': 801, 'handle': '+14155550109', 'is_from_me': True,
                  'timestamp': '2026-06-24 08:30:00', 'text': 'The pricing document is attached.'}
     update = _update(row, 'resolved', 'imessage', '801', delivered['text'])
     _resolve({'imessage': [delivered]}, update)
     closed = cr._load_items()['k']
     assert closed['closed_at'].startswith('2026-06-24T08:30:00')
-    fresh = {'rowid': 802, 'handle': '+14155552222', 'is_from_me': outgoing,
+    fresh = {'rowid': 802, 'handle': '+14155550109', 'is_from_me': outgoing,
              'timestamp': '2026-06-24 09:30:00', 'text': 'I will send the revised contract today.'}
-    action = {'type': 'reply', 'channel': 'imessage', 'contactIdentifier': '+14155552222',
+    action = {'type': 'reply', 'channel': 'imessage', 'contactIdentifier': '+14155550109',
               'contactName': 'Dana', 'contextSummary': 'Send the revised contract',
               'loopId': 'k', 'newObligation': outgoing,
               'evidence': [{'sourceType': 'imessage', 'sourceId': '802', 'snippet': fresh['text']}]}
@@ -957,19 +956,19 @@ def test_country_codes_and_numeric_email_do_not_share_person_keys(tmp_path, monk
     from textutil import _normalize_identifier
     _env(tmp_path, monkeypatch)
     for normalize in (knowledge.normalize_identifier, _normalize_identifier):
-        assert normalize('4155552222@example.com') != normalize('+14155552222')
-        assert normalize('+44 4155552222') != normalize('+91 4155552222')
-        assert normalize('14155552222@s.whatsapp.net') == normalize('+1 (415) 555-2222')
-    assert not cr._handle_matches('+44 4155552222', '+91 4155552222')
-    ids = cr._collect_all_identifiers('14155552222@s.whatsapp.net', '', {
-        'contacts': [{'phones': ['+1 (415) 555-2222'], 'emails': ['dana@example.com']}]})
+        assert normalize('4155550109@example.com') != normalize('+14155550109')
+        assert normalize('+44 4155550109') != normalize('+91 4155550109')
+        assert normalize('14155550109@s.whatsapp.net') == normalize('+1 (415) 555-0109')
+    assert not cr._handle_matches('+44 4155550109', '+91 4155550109')
+    ids = cr._collect_all_identifiers('14155550109@s.whatsapp.net', '', {
+        'contacts': [{'phones': ['+1 (415) 555-0109'], 'emails': ['dana@example.com']}]})
     assert 'dana@example.com' in ids
 
 
 def test_waiting_date_comes_from_the_cited_promise_not_other_message_dates(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, action_type='waiting_on')
-    msg = {'rowid': 803, 'handle': '+14155552222', 'is_from_me': False,
+    msg = {'rowid': 803, 'handle': '+14155550109', 'is_from_me': False,
            'timestamp': '2026-06-24 08:00:00',
            'text': 'I am away tomorrow. I will send the pricing document by Friday.'}
     update = _update(row, 'waiting', 'imessage', '803', 'I will send the pricing document by Friday.')
@@ -1024,7 +1023,7 @@ def test_reply_all_from_group_member_needs_complete_roster(tmp_path, monkeypatch
 def test_future_completion_evidence_cannot_close_a_task(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path)
-    msg = {'rowid': 804, 'handle': '+14155552222', 'is_from_me': True,
+    msg = {'rowid': 804, 'handle': '+14155550109', 'is_from_me': True,
            'timestamp': '2026-06-25 08:00:00', 'text': 'The pricing document is attached.'}
     update = _update(row, 'resolved', 'imessage', '804', msg['text'])
     assert not _resolve({'imessage': [msg]}, update)['resolved']
@@ -1066,15 +1065,15 @@ def test_naive_source_keeps_wall_clock_order_after_timezone_setting_correction(
                             'snippet': 'Please send the previous document.'}])
     ask = 'Please send the pricing document.'
     answer = 'Here is the pricing document you asked for.'
-    request = {'id': 'new-request', 'handle': '+14155552222',
+    request = {'id': 'new-request', 'handle': '+14155550109',
                'timestamp': '2026-06-24 08:00:00.500000',
                'is_from_me': False, 'text': ask}
-    reply = {'id': 'answer', 'handle': '+14155552222',
+    reply = {'id': 'answer', 'handle': '+14155550109',
              'timestamp': '2026-06-24 08:30:00.500000' if after_request else
                           '2026-06-24 07:30:00.500000',
              'is_from_me': True, 'text': answer}
     action = {'type': 'reply', 'channel': 'imessage', 'contactName': 'Dana',
-              'contactIdentifier': '+14155552222', 'contextSummary': 'Send the pricing document',
+              'contactIdentifier': '+14155550109', 'contextSummary': 'Send the pricing document',
               'evidence': [{'sourceType': 'imessage', 'sourceId': 'new-request', 'snippet': ask}]}
     if not reopen:
         action['newObligation'] = True
@@ -1122,7 +1121,7 @@ def test_reviewed_answered_call_in_either_direction_fulfills_only_callback(tmp_p
     _env(tmp_path, monkeypatch)
     row = _loop(tmp_path, action_type='call_back', summary='Reconnect with Dana by phone')
     _loop(tmp_path, key='separate-ask', summary='Send the proposal')
-    call = {**_connected_call('calls'), 'is_outgoing': outgoing}
+    call = {**_connected_call('calls'), 'is_outgoing': outgoing, 'is_answered': not outgoing}
     source_id, quote = call_evidence(call, 'calls')
     update = _update(row, 'resolved', 'calls', source_id, quote)
     result = _resolve({'calls': [call]}, update)

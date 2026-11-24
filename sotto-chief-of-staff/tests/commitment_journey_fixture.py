@@ -222,7 +222,7 @@ def run_chronological_stage(data_root, stage, scenario='email-to-text', *, actua
             message['text'] = 'I have not sent the pricing document yet.'
         elif scenario == 'ambiguous-group':
             message.update(is_group_chat=True, chat_guid='iMessage;+;unrelated-group',
-                           group_participants=[PHONE, '+14155550999'])
+                           group_participants=[PHONE, '+14155550105'])
         gather_receipt = None
         if stage in ('fulfillment', 'resolve'):
             class NoMail:

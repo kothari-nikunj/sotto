@@ -29,7 +29,7 @@ def call(body, context):
 
 def args():
     return {'operation':'add_identifier','canonical_id':'c_a1b2c3',
-        'identifier':'+1 (310) 924-5269','source_revision':REVISION}
+        'identifier':'+1 (310) 555-0144','source_revision':REVISION}
 
 
 def test_original_writer_resolver_and_historical_receipt(context,person,monkeypatch):
@@ -40,7 +40,7 @@ def test_original_writer_resolver_and_historical_receipt(context,person,monkeypa
     import render_local
     resolver=render_local.build_identity_resolver({'contacts':[], 'contact_index':[
         {'name':actual.name,'canonical_id':actual.canonical_id,'identifiers':actual.identifiers}]})
-    assert resolver('+13109245269')['name']=='Dana'
+    assert resolver('+13105550144')['name']=='Dana'
     before={str(p):p.read_bytes() for p in Path(ke.kg.people_dir()).glob('*.md')}
     monkeypatch.setattr(ke,'op_add_identifier',lambda *a,**k:pytest.fail('repeated writer'))
     context[1]['_source_authority']=lambda:{'complete':False,'revision':None}

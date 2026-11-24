@@ -237,13 +237,8 @@ def _interactions_by_contact(local: dict, index=None) -> dict:
         add(c.get("name"), c.get("timestamp"), False, "calls", c.get("canonical_id"), engaged=False,
             context={"missed_call": True})
     for c in _arr(local, "recent_calls"):
-        # Processed calls carry direction, while duration proves the call connected.
-        try:
-            connected = bool(c.get("is_answered")) or float(c.get("duration_seconds") or 0) > 0
-        except (TypeError, ValueError):
-            connected = False
         add(c.get("name"), c.get("timestamp"), c.get("direction") == "outgoing",
-            "calls", c.get("canonical_id"), engaged=connected)
+            "calls", c.get("canonical_id"))
     # Email is a relationship channel. A mail you sent counts as a touch to each recipient; a mail
     # you received counts as a touch from its sender — for people you KNOW (contacts or graph),
     # which is the same known-contact gate the message lanes apply. Before this the pulse was
@@ -571,7 +566,7 @@ def with_commitments(result, loops, now=None):
     proven = {cid for group in groups for _, _, cid in group if cid}
     groups = [[(item, direction) for item, direction, _ in group] for group in groups[:MAX_QUEUE]]
     rows = [group[0] for group in groups]
-    lines = ['**Follow-ups**']
+    lines, closing = [], []
     help_name = ''
     for group in groups:
         row, direction = group[0]
@@ -582,6 +577,9 @@ def with_commitments(result, loops, now=None):
         # Relative wording stays quoted under its recording date: an ask re-captured later keeps
         # its original `created_at`, so it is never rewritten as a dated instruction.
         text = dated_request_text(_compact_text(_commitment_request(row)), same_ask, now)
+        # Stored asks are free text; only the case of a bare leading letter is safe to normalise.
+        if text[:1].islower():
+            text = text[:1].upper() + text[1:]
         if row.get('birthday_courtesy'):
             text = f"{text} (Optional, no urgency)"
         extra = len({(_request_key(item), _calendar_due(item.get('deadline')))
@@ -596,17 +594,18 @@ def with_commitments(result, loops, now=None):
             help_name = _excerpt(row['name'], 100)
         lines.append(f"- **{_excerpt(row['name'], 100)}** — {direction_text if not row.get('birthday_courtesy') else ''}{text}{due}{ending}")
     if hidden > 0:
-        lines.append(f"{hidden} other item{'s are' if hidden != 1 else ' is'} on your list.")
+        closing.append(f"{hidden} other item{'s are' if hidden != 1 else ' is'} on your list.")
     if help_name:
-        lines.append(f'I can draft a reply to {help_name}.')
+        closing.append(f'I can draft a reply to {help_name}.')
     # A suggestion is folded into a commitment only through a proven canonical identity, never a name.
     queue = [row for row in result.get('attention_queue', [])
              if _s(row.get('canonical_id')).strip().lower() not in proven][:MAX_QUEUE - len(rows)]
+    blocks = ['**Follow-ups**', '\n'.join(lines), '\n'.join(closing)]
     if queue:
-        lines.append(_render([row for row in queue if row['queue_type'] != 'lapsed'],
-                             [row for row in queue if row['queue_type'] == 'lapsed']))
+        blocks.append(_render([row for row in queue if row['queue_type'] != 'lapsed'],
+                              [row for row in queue if row['queue_type'] == 'lapsed']))
     # A held-back lapse keeps its one-line disclaimer when commitments lead the message.
-    markdown = to_chat('\n'.join(lines)) + ('\n' + LAPSE_DISCLAIMER if result.get('lapse_withheld') else '')
+    markdown = to_chat('\n\n'.join(block for block in blocks if block)) + ('\n\n' + LAPSE_DISCLAIMER if result.get('lapse_withheld') else '')
     return {**result, 'pulse_markdown': markdown, 'commitments': [row for row, _ in rows]}
 
 
@@ -643,8 +642,8 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
                              and meaningful_relationship(row.get('importance_evidence'))
                              for row in history.values()):
         return {"attention_queue": [], "relationship_insights": [], "lapsed": [],
-                "pulse_markdown": ("I could not identify any known-person interactions this window — "
-                                   "skipping the pulse rather than guessing."),
+                "pulse_markdown": ("I could not match recent messages to people you know, so I have "
+                                   "no relationship suggestions this time rather than guess."),
                 "degraded": True}
 
     profiles = []
@@ -814,7 +813,7 @@ def compute(local: dict, now: datetime | None = None, history: dict | None = Non
 
     return {"attention_queue": queue + lapsed, "relationship_insights": insights,
             "lapsed": lapsed, "history": merged,
-            "pulse_markdown": to_chat(_render(queue, lapsed)) + ("\n" + LAPSE_DISCLAIMER if withheld else ""),
+            "pulse_markdown": to_chat(_render(queue, lapsed)) + ("\n\n" + LAPSE_DISCLAIMER if withheld else ""),
             "lapse_withheld": withheld, **({} if fresh else {"degraded": True})}
 
 
@@ -853,18 +852,15 @@ def _render(queue: list, lapsed: list | None = None) -> str:
             return f"- **{who}** — {text}"
         return f"- **{who}** — {q['reason']}. Consider a check-in."
 
-    lines = []
+    blocks = []
     if waiting:
-        lines.append("**Worth a reply review**")
-        lines += [_line(q) for q in waiting]
-        lines.append("No later response found in the available history.")
+        blocks += ["**Worth a reply review**", "\n".join(_line(q) for q in waiting),
+                   "No later response found in the available history."]
     if losing:
-        lines.append("\n**Going quiet** (you used to talk more)")
-        lines += [_line(q) for q in losing]
+        blocks += ["**Going quiet** (you used to talk more)", "\n".join(_line(q) for q in losing)]
     if lapsed:
-        lines.append("\n**Fully lost touch** (you used to be in regular contact)")
-        lines += [_line(q) for q in lapsed]
-    return "\n".join(lines)
+        blocks += ["**Fully lost touch** (you used to be in regular contact)", "\n".join(_line(q) for q in lapsed)]
+    return "\n\n".join(blocks)
 
 
 def _persist_state(result: dict, history_only=False, now=None):

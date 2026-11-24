@@ -449,7 +449,7 @@ def test_machine_named_ledger_entries_never_drive_a_permanent_still_open_line():
     forever. A machine label is not evidence; a rare summary word is."""
     entries = [{"contact_name": "Board sync", "status": "open", "chased_count": 1,
                 "summary": "Priya owes the redlines"},
-               {"contact_name": "nikunj.k17", "status": "open", "chased_count": 1,
+               {"contact_name": "casey.k17", "status": "open", "chased_count": 1,
                 "summary": "the pricing model"},
                {"contact_name": "Board sync", "status": "open", "chased_count": 1, "summary": "ok"}]
     md = "Priya owes you the redlines, and the pricing model is still out."
@@ -462,12 +462,12 @@ def test_machine_named_ledger_entries_never_drive_a_permanent_still_open_line():
 
 
 def test_a_group_label_the_brief_printed_counts_as_naming_it():
-    """The FPV/Piston row that repeated verbatim under "Still open" after the narrative had already
+    """The HBR/Piston row that repeated verbatim under "Still open" after the narrative had already
     covered it: the label is not name-shaped, so only a summary word could match. When the brief
     prints the label itself, that IS the evidence — the ask is not told twice."""
-    entries = [{"contact_name": "FPV / Piston", "status": "open", "chased_count": 1,
+    entries = [{"contact_name": "HBR / Piston", "status": "open", "chased_count": 1,
                 "summary": "asked for an intro to Insight Partners"}]
-    md = "## Should Handle Today\n**FPV / Piston** wants the Insight intro."
+    md = "## Should Handle Today\n**HBR / Piston** wants the Insight intro."
     assert bv.missing_open_loops(md, entries, TODAY) == []
     assert bv.missing_open_loops("quiet day", entries, TODAY) == entries
 
@@ -506,7 +506,7 @@ def test_another_persons_line_never_silences_a_shared_first_name():
     """Two Sams. The brief's only line is about Sam Patel; the ledger row is the OTHER Sam's twice-
     chased wire details. It used to be treated as already told and vanish from BOTH the printed
     lines and the count — the one failure mode this contract can never have."""
-    entry = {"status": "open", "contact_name": "Sam", "contact_identifier": "+14155550001",
+    entry = {"status": "open", "contact_name": "Sam", "contact_identifier": "+14155550103",
              "chased_count": 2, "summary": "the wire details"}
     md = "## Needs Attention Now\n- **Sam Patel**<!--id:sam.patel@x.com|ch:email--> sent the deck.\n"
     assert bv.missing_open_loops(md, [entry], TODAY) == [entry]
@@ -517,20 +517,20 @@ def test_another_persons_line_never_silences_a_shared_first_name():
 
 
 def test_a_marker_matches_a_phone_however_it_is_formatted():
-    """Identity, not string equality: the ledger's "+1 (415) 555-0001" and the marker's
-    "4155550001" are the same person (textutil's one normalizer decides)."""
-    entry = {"status": "open", "contact_name": "Sam", "contact_identifier": "+1 (415) 555-0001",
+    """Identity, not string equality: the ledger's "+1 (415) 555-0103" and the marker's
+    "4155550103" are the same person (textutil's one normalizer decides)."""
+    entry = {"status": "open", "contact_name": "Sam", "contact_identifier": "+1 (415) 555-0103",
              "chased_count": 2, "summary": "the wire details"}
-    md = "## Needs Attention Now\n- **Sam**<!--id:4155550001|ch:imessage--> owes the wire details.\n"
+    md = "## Needs Attention Now\n- **Sam**<!--id:4155550103|ch:imessage--> owes the wire details.\n"
     assert bv.missing_open_loops(md, [entry], TODAY) == []
 
 
 def test_a_group_is_still_proven_by_its_label():
     """A group has no deep link by design, so the brief never renders a marker for it — its label is
     the only evidence there can be, and it stays evidence."""
-    entry = {"status": "open", "contact_name": "FPV / Piston", "group_id": "chat:99",
+    entry = {"status": "open", "contact_name": "HBR / Piston", "group_id": "chat:99",
              "contact_identifier": "chat:99", "chased_count": 1, "summary": "the term sheet redline"}
-    assert bv.missing_open_loops("**FPV / Piston** want the redline.", [entry], TODAY) == []
+    assert bv.missing_open_loops("**HBR / Piston** want the redline.", [entry], TODAY) == []
     assert bv.missing_open_loops("quiet day", [entry], TODAY) == [entry]
 
 
@@ -557,7 +557,7 @@ def test_an_urgent_loop_with_no_printable_token_is_counted_not_lost():
     """Chased twice, a machine label for a name, no distinctive summary word: urgent, so the old
     count line skipped it; no token, so the backstop skipped it too. It was shown nowhere and
     counted nowhere. Whatever makes a row unprintable, it falls into the count."""
-    nameless = {"status": "open", "contact_name": "nikunj.k17", "chased_count": 2,
+    nameless = {"status": "open", "contact_name": "casey.k17", "chased_count": 2,
                 "summary": "the ask"}
     assert bv.is_urgent(nameless, TODAY) and bv._ledger_token(nameless) == ""
     assert bv.missing_open_loops("quiet day", [nameless], TODAY) == []
@@ -571,7 +571,7 @@ def test_printed_counted_and_surfaced_partition_the_open_rows():
              "chased_count": 1, "summary": "the signed contract"},          # urgent, printable
             {"status": "open", "contact_name": "Ron Diaz", "contact_identifier": "ron@x.com",
              "summary": "his intro request"},                               # quiet
-            {"status": "open", "contact_name": "nikunj.k17", "chased_count": 2,
+            {"status": "open", "contact_name": "casey.k17", "chased_count": 2,
              "summary": "the ask"},                                         # urgent, unprintable
             {"status": "open", "contact_name": "Ana Ruiz", "contact_identifier": "ana@x.com",
              "summary": "the invoice"}]                                     # named by the brief
@@ -579,7 +579,7 @@ def test_printed_counted_and_surfaced_partition_the_open_rows():
     missed = bv.missing_open_loops(md, rows, TODAY)
     counted = bv.unsurfaced_open_loops(md, rows, TODAY)
     assert [e["contact_name"] for e in missed] == ["Maya Chen"]
-    assert [e["contact_name"] for e in counted] == ["Ron Diaz", "nikunj.k17"]
+    assert [e["contact_name"] for e in counted] == ["Ron Diaz", "casey.k17"]
     assert len(missed) + len(counted) + 1 == len(bv.open_entries(rows))     # +1 = Ana, surfaced
 
 

@@ -116,12 +116,12 @@ def configure(receiver):
         assert request['params'] == {'name': 'read_local', 'arguments': {'since_hours': 72}}
         with (DATA / 'triage-bridge.jsonl').open('a') as log:
             log.write(json.dumps(request) + '\n')
-        local = {'contacts': [{'name': 'Jake Rosen', 'phones': ['+12069994970']}, {'name': 'Mira', 'phones': ['+12065550000']}],
-            'imessage': [{'handle': '+12069994970', 'text': 'Can you intro me?', 'is_from_me': False, 'timestamp': '2026-10-04T10:00'},
-                         {'handle': '+18885551234', 'text': 'your code is 123', 'is_from_me': False, 'timestamp': '2026-10-04T09:00'},
-                         {'handle': '+12069994970', 'chat_guid': 'group-chat', 'group_name': 'Planning group', 'is_group_chat': True,
+        local = {'contacts': [{'name': 'Quinn Albrecht', 'phones': ['+12065550143']}, {'name': 'Mira', 'phones': ['+12065550100']}],
+            'imessage': [{'handle': '+12065550143', 'text': 'Can you intro me?', 'is_from_me': False, 'timestamp': '2026-10-04T10:00'},
+                         {'handle': '+18885550100', 'text': 'your code is 123', 'is_from_me': False, 'timestamp': '2026-10-04T09:00'},
+                         {'handle': '+12065550143', 'chat_guid': 'group-chat', 'group_name': 'Planning group', 'is_group_chat': True,
                           'text': 'Are you coming?', 'is_from_me': False, 'timestamp': '2026-10-04T11:00'}],
-            'whatsapp': [{'contact_jid': '12065550000@s.whatsapp.net', 'push_name': 'Mira', 'text': 'Tuesday still good?', 'is_from_me': False, 'timestamp': '2026-10-04T12:00'}],
+            'whatsapp': [{'contact_jid': '12065550100@s.whatsapp.net', 'push_name': 'Mira', 'text': 'Tuesday still good?', 'is_from_me': False, 'timestamp': '2026-10-04T12:00'}],
             'source_status': {name: 'ok' for name in ('imessage', 'whatsapp', 'contacts')}}
         return {'jsonrpc': '2.0', 'id': request.get('id'), 'result': {'content': [{'type': 'text', 'text': json.dumps(local)}]}}
     receiver.RELAY.mcp_call = bridge

@@ -1092,7 +1092,6 @@ if __name__ == "__main__":
 
 def admitted_usefulness(proof, feedback, select, guard, *, inspect=False):
     """Original outcomes writer once; a lost separate-file result stays unknown."""
-    import hashlib
     args = proof['args']
     retained = {key: value for key, value in proof.items() if key != 'args'}
     path = _path()
@@ -1106,14 +1105,8 @@ def admitted_usefulness(proof, feedback, select, guard, *, inspect=False):
             if type(saved) is not dict or saved.get('tag') != 'usefulness' or saved.get('proof') != retained:
                 raise OwnerPreferenceRefusalError('event_conflict')
             locator = saved.get('item_locator')
-            if args['excerpt']:
-                match = re.fullmatch(r'excerpt:(\d+):(\d+):([a-f0-9]{20})', str(locator))
-                valid = bool(match) and int(match[2]) == len(args['excerpt'].strip()) and match[3] == hashlib.sha256(args['excerpt'].strip().encode()).hexdigest()[:20]
-            else:
-                valid = locator == 'output'
-            outcome = {'operation': 'usefulness', 'reference': args['reference'], 'item_locator': locator,
-                       'rating': args['rating'], 'status': 'recorded'}
-            if (not valid or saved.get('status') not in ('contacting', 'committed')
+            outcome = feedback.outcome(args, locator)
+            if (not feedback.locator_matches(args, locator) or saved.get('status') not in ('contacting', 'committed')
                     or set(saved) != {'tag', 'proof', 'status', 'item_locator'} | ({'outcome'} if saved['status'] == 'committed' else set())
                     or saved['status'] == 'committed' and saved['outcome'] != outcome):
                 raise ValueError('usefulness receipt invalid')
@@ -1121,23 +1114,22 @@ def admitted_usefulness(proof, feedback, select, guard, *, inspect=False):
             return saved
         if inspect:
             return None
-        locator = select()
+        selection = select()
+        locator = 'output' if args['operation'] == 'notification-usefulness' else selection
         guard()
         saved = {'tag': 'usefulness', 'proof': retained, 'status': 'contacting', 'item_locator': locator}
         records[proof['event_id']] = saved
         _durable_preferences_replace(path, data)
         try:
             guard()
-            result = feedback.record(args['reference'], args['rating'], args['excerpt'],
-                                     permitted=guard.permitted, archive_version=args['archive_version'])
+            result = feedback.record_admitted(proof, selection, select, guard.permitted)
             if result != {'logged': True, 'outcome': args['rating']} or type(result.get('logged')) is not bool:
                 raise ValueError('usefulness recording unconfirmed')
             _sync_existing_preferences(feedback.log_outcome._path())
             guard()
         except Exception:
             return saved
-        outcome = {'operation': 'usefulness', 'reference': args['reference'], 'item_locator': locator,
-                   'rating': args['rating'], 'status': 'recorded'}
+        outcome = feedback.outcome(args, locator)
         records[proof['event_id']] = {**saved, 'status': 'committed', 'outcome': outcome}
         try:
             _durable_preferences_replace(path, data)

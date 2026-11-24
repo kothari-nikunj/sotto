@@ -77,10 +77,10 @@ def configure(receiver):
         with (DATA / 'pulse-bridge-calls.jsonl').open('a') as log:
             log.write(json.dumps(request) + '\n')
         stamp = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
-        local = {'contacts': [{'name': 'Dana', 'phones': ['+12065550001'], 'emails': ['dana@example.com']}],
-            'imessage': [{'handle': '+12065550001', 'text': 'Can you send the Cedar deck?', 'timestamp': stamp,
+        local = {'contacts': [{'name': 'Dana', 'phones': ['+12065550101'], 'emails': ['dana@example.com']}],
+            'imessage': [{'handle': '+12065550101', 'text': 'Can you send the Cedar deck?', 'timestamp': stamp,
                           'is_from_me': False, 'chat_guid': 'dana-thread'},
-                         {'handle': '+18885559999', 'text': 'Your code', 'timestamp': stamp, 'is_from_me': False}],
+                         {'handle': '+18885550101', 'text': 'Your code', 'timestamp': stamp, 'is_from_me': False}],
             'whatsapp': [], 'calls': [],
             'source_status': {'imessage': 'ok', 'contacts': 'ok', 'whatsapp': 'disabled', 'calls': 'disabled'}}
         return {'jsonrpc': '2.0', 'id': request.get('id'), 'result': {'content': [{'type': 'text', 'text': json.dumps(local)}]}}

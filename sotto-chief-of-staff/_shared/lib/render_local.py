@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from source_catalog import SOURCE_LABELS
 import os
 import re
@@ -22,9 +23,7 @@ from textutil import (  # noqa: E402
 )
 from timeutil import _parse_ts, _date_only, configured_tz, _resolve_tz, configured_user_email  # noqa: E402
 from calendar_context import blocks_time  # noqa: E402
-# The attachment lane's caps, from their owner. This module RE-APPLIES the per-attachment character
-# cap rather than trusting the gather to have done it: a row can also reach here from an MCP-host
-# gather or a replayed fixture, and the prompt budget is this side's responsibility.
+# The attachment lane's caps, from their owner; re-applied here (rows also come from other gathers).
 from attachments import (  # noqa: E402
     MAX_ATTACHMENTS_PER_EMAIL, MAX_ATTACHMENT_CHARS, TRUNCATION_MARKER,
 )
@@ -35,18 +34,25 @@ EMAIL_BODY_MAX = 30000
 LOOP_EVIDENCE_BODY_MAX = 2000  # an archived row shown only as loop evidence (its excerpt)
 
 
-def build_contact_lookup(contacts: list) -> dict:
+def _card_keys(contact: dict) -> set:
+    keys = {_normalize_identifier(_s(v)) for v in [*_arr(contact, 'phones'), *_arr(contact, 'emails')]}
+    return keys - {''}
+
+
+def unique_contact_aliases(contacts: list) -> dict:
     # A contact alias is usable only when one card owns its typed identity key.
     owners = {}
     for index, contact in enumerate(contacts):
         name = _s(contact.get('name'))
         if not name:
             continue
-        for value in [*_arr(contact, 'phones'), *_arr(contact, 'emails')]:
-            key = _normalize_identifier(_s(value))
-            if key:
-                owners.setdefault(key, {})[index] = name
-    return {key: next(iter(cards.values())) for key, cards in owners.items() if len(cards) == 1}
+        for key in _card_keys(contact):
+            owners.setdefault(key, {})[index] = name
+    return {key: next(iter(cards.items())) for key, cards in owners.items() if len(cards) == 1}
+
+
+def build_contact_lookup(contacts: list) -> dict:
+    return {key: name for key, (_, name) in unique_contact_aliases(contacts).items()}
 
 
 
@@ -130,7 +136,6 @@ def seed_contact_index_from_contacts(contacts: list) -> list:
 
 
 
-
 def _call_time(call):
     """Prefer the Mac's explicit instant; legacy wall times use the configured user zone."""
     explicit = call.get('timestamp_utc')
@@ -146,17 +151,29 @@ def _call_metadata(call):
     return {key: call[key] for key in ('record_id', 'service_provider', 'timestamp_utc') if key in call}
 
 
+def phone_call_connection(call: dict) -> bool | None:
+    """Interpret CallHistory's direction-specific connection evidence."""
+    outgoing = call.get('is_outgoing')
+    if outgoing is False:
+        answered = call.get('is_answered')
+        return answered if type(answered) is bool else None
+    duration = call.get('duration_seconds')
+    if (outgoing is not True or type(duration) not in (int, float) or duration < 0
+            or (type(duration) is float and not math.isfinite(duration))):
+        return None
+    return duration > 0
+
+
 def _build_connected_dict(phone_calls: list, wa_calls: list) -> dict:
     connected: dict[str, datetime] = {}
     for call in phone_calls:
-        if call.get("is_answered") is True:
+        if phone_call_connection(call) is True:
             p = normalize_phone_for_comparison(_s(call.get("phone")))
             t = _call_time(call)
             if t and (p not in connected or t > connected[p]):
                 connected[p] = t
     # WhatsApp's native missed flag does not attest that an outgoing attempt connected.
     return connected
-
 
 
 
@@ -182,7 +199,6 @@ def _process_missed_calls(calls, lookup, connected):
 
 
 
-
 def _process_wa_missed_calls(calls, lookup, connected):
     by_name = {}
     for call in calls:
@@ -205,11 +221,10 @@ def _process_wa_missed_calls(calls, lookup, connected):
 
 
 
-
 def _process_recent_calls(phone_calls, wa_calls, lookup):
     by_name = {}
     for call in phone_calls:
-        if call.get("is_answered") is not True:
+        if phone_call_connection(call) is not True:
             continue
         name = resolve_call_name(_s(call.get("phone")), lookup)
         if not name:
@@ -238,7 +253,7 @@ def build_identity_resolver(local: dict):
     It exists as a named function because it has TWO consumers and they must answer identically:
     `resolve_contact_names` names 1:1 threads with it, and `_group_messages_into_threads` names a
     GROUP's participants with it. When only the first had it, a group of people Sotto knew from
-    email but who were not in Apple Contacts rendered as “+1 (404) 247-4568 & +1 (408) 666-3190”
+    email but who were not in Apple Contacts rendered as “+1 (404) 555-0145 & +1 (408) 555-0146”
     while the same people were named correctly in their own 1:1 threads."""
     graph = _arr(local, "contact_index")
     seeded = rekey_seed_to_graph(seed_contact_index_from_contacts(_arr(local, "contacts")), graph)
@@ -248,12 +263,9 @@ def build_identity_resolver(local: dict):
 
 def rekey_seed_to_graph(seeded: list, graph: list, *, ambiguous_names: set | None = None) -> list:
     """Re-key unique Contacts links; optionally report names whose card aliases collide."""
-    # A Contacts card and a graph file for the same human must carry the SAME canonical_id. The
-    # seed formula only reproduces the file's id when name + first email agree byte-for-byte — a
-    # person first graphed from a phone (no email) minted a DIFFERENT id, the extraction copied
-    # that drifted id back verbatim, and the updater's "different id = different person" safeguard
-    # forked one human into two files. Shared aliases and conflicting graph owners cannot prove
-    # that link: keep those cards separate, including in the pulse's legacy-name safety check.
+    # A Contacts card and a graph file for the same human must carry the SAME canonical_id; the seed
+    # formula reproduces the file's id only when name + first email agree, and a drifted id forked
+    # one human into two files. Shared aliases and conflicting graph owners cannot prove the link.
     if seeded:
         by_ident = {}
         for g in graph:
@@ -269,9 +281,8 @@ def rekey_seed_to_graph(seeded: list, graph: list, *, ambiguous_names: set | Non
             aliases = {_normalize_identifier(_s(i)) for i in card.get("identifiers") or []}
             aliases.discard("")
             card_aliases.append(aliases)
-        # Collisions count distinct people, not cards. Copies of one card (iCloud and Google: same
-        # seeded id from name + first email) are one person when one copy already carries every
-        # alias of the others. Same-id cards that each add a different phone stay separate.
+        # Collisions count distinct people, not cards. Same-id copies of one card are one person when
+        # one copy carries every alias of the others; cards each adding a phone stay separate.
         groups, owner_of = {}, {}
         for number, card in enumerate(seeded):
             groups.setdefault(_s(card.get("canonical_id")) or ("card", number), []).append(number)
@@ -360,9 +371,7 @@ def resolve_contact_names(local: dict) -> dict:
 
 
 
-# ---------------------------------------------------------------------------
 # Source renderers (port of gemini-flex.ts formatSourceForLLM-style helpers)
-# ---------------------------------------------------------------------------
 
 def _norm_escalation_tone(s: str) -> str:
     # The backend strips alarm/escalation language; we pass through the text faithfully here.
@@ -391,9 +400,8 @@ def _action_age(created_at: str, now=None) -> str:
 
 
 
-# Port of thread-processing.ts: system/status-message patterns (low signal, stripped before the
-# LLM sees a thread) and the ask/commitment heuristic that keeps a thread "needs response" even
-# after a short user ack.
+# Port of thread-processing.ts: system/status-message patterns (stripped before the LLM sees a
+# thread) and the ask/commitment heuristic keeping a thread "needs response" after a short ack.
 _SYSTEM_MESSAGE_PATTERNS = [
     re.compile(r"^.{0,30} added .{0,50} to the group\.?$", re.I),
     re.compile(r"^.{0,30} removed .{0,50} from the group\.?$", re.I),
@@ -581,10 +589,8 @@ def _group_messages_into_threads(messages, channel, lookup=None, identity=None):
             if sender:
                 m = dict(m)
                 m["sender_name"] = sender
-        # A display name (even a resolved one) is not a conversation identity: two contacts may
-        # share it. Keep endpoints separate, including different endpoints of the same person,
-        # so a reply in one conversation cannot close an ask in another. Missing endpoints must
-        # never collapse into a shared "unknown" thread either.
+        # A display name is not a conversation identity. Keep endpoints separate so a reply in one
+        # conversation cannot close an ask in another; missing endpoints never share one thread.
         key = (("group", chat_guid) if chat_guid else
                ("direct", ident.casefold()) if ident else ("unidentified", index))
         t = threads.setdefault(key, {"name": name or ident, "identifier": ident,
@@ -802,12 +808,11 @@ def call_evidence(call: dict, source: str, *, permission_scope: str | None = Non
     """Bind a call observation's rendered proof to its full native row and current source authority."""
     if source not in ('calls', 'whatsapp_calls') or type(call.get('is_outgoing')) is not bool:
         return '', ''
-    flag = call.get('is_answered') if source == 'calls' else call.get('is_missed')
-    if type(flag) is not bool:
-        return '', ''
-    if source == 'whatsapp_calls' and (call['is_outgoing'] or flag is not True):
+    if source == 'whatsapp_calls' and (call['is_outgoing'] or call.get('is_missed') is not True):
         return '', ''  # admit missed-call capture only; not-missed does not prove connection
-    connected = flag if source == 'calls' else not flag
+    connected = phone_call_connection(call) if source == 'calls' else False
+    if connected is None:
+        return '', ''
     counterpart = _s(call.get('phone') if source == 'calls' else call.get('jid'))
     timestamp = _s(call.get('timestamp_utc') or call.get('timestamp'))
     if (not counterpart or not _call_time(call)
@@ -871,9 +876,8 @@ def _format_thread_as_text(thread, channel) -> str:
     if identifier:
         lines.append(f"identifier: {identifier} | channel: {channel}")
     elif thread.get("is_group_chat") and _s(thread.get("chat_guid")):
-        # A group still has no deep link (hence no `identifier:` and no tap marker), but it DOES
-        # have a stable id — and a loop's identity must not rest on whatever the model called the
-        # group that day. Shown under its own key so it can never be mistaken for a tap target.
+        # A group has no deep link (no `identifier:`, no tap marker) but DOES have a stable id for
+        # loop identity. Shown under its own key so it can never be mistaken for a tap target.
         lines.append(f"group_id: {_s(thread.get('chat_guid'))} | channel: {channel}")
     # Strip system/status noise ("X added Y to group", "Missed voice call") before the LLM.
     real = [m for m in (thread.get("messages") or []) if not _is_system_message(_s(m.get("text")))]
@@ -894,11 +898,10 @@ def _format_thread_as_text(thread, channel) -> str:
         if m.get("content_partial"):
             lines.append("  Context incomplete: attachment contents or message text were not read; do not infer them or treat this as proof an ask was answered.")
         lines.extend(_format_message_attachments(m))
-        for key, label in (("message_guid", "message GUID"), ("reply_to_guid", "reply to GUID"),
-                           ("thread_originator_guid", "thread root GUID")):
+        for key, label in (("message_guid", "message GUID"), ("thread_originator_guid", "inline reply to GUID")):
             if _s(m.get(key)):
                 lines.append(f"  {label}: {_s(m.get(key))}")
-        if m.get("reply_to_guid") or m.get("thread_originator_guid"):
+        if m.get("thread_originator_guid"):
             lines.append("  A reference alone does not establish the referenced message's contents; it may be outside this excerpt.")
         lines.append(f"  {direction} {_s(m.get('text'))}")
     return "\n".join(lines)
@@ -909,19 +912,20 @@ def _format_thread_as_text(thread, channel) -> str:
 def _format_loop_message_evidence(local) -> str:
     """Supplemental history stays visible as evidence, outside current reply/handled threads."""
     from source_context import project_local
-    rows = [row for row in _arr(project_local(local), 'imessage')
+    rows = [(channel, row) for channel in ('imessage', 'whatsapp') for row in _arr(project_local(local), channel)
             if isinstance(row, dict) and row.get('_loop_context') is True]
     if not rows:
         return ''
-    lines = ['## LOOP_EVIDENCE — supplemental historical iMessage context',
+    lines = ['## LOOP_EVIDENCE — supplemental historical iMessage and WhatsApp context',
              'For reviewing existing obligations only. These are not new daily messages or new asks. '
              'Do not extract new facts, profile/relationship/company updates or writing-style observations '
              'from this block. It does not establish a complete history search or completion without task-specific review.']
-    for row in rows:
+    for channel, row in rows:
         # This preserves the native ID (or content-derived ID), event time and verbatim text.
-        lines.append('source_id: ' + message_evidence_id(row, 'imessage') +
+        lines.append('source_id: ' + message_evidence_id(row, channel) +
                      ' | timestamp: ' + _s(row.get('timestamp')) +
-                     ' | handle: ' + _s(row.get('handle')) +
+                     (' | handle: ' + _s(row.get('handle')) if channel == 'imessage'
+                      else ' | whatsapp_jid: ' + _s(row.get('contact_jid'))) +
                      ' | sources: ' + ','.join(row.get('_loop_context_sources') or []))
         if row.get('content_partial'):
             lines.append('Context incomplete; do not infer unread contents or fulfillment.')
@@ -956,16 +960,14 @@ def _trim_email(e, lookup: dict | None = None) -> dict:
     subject = headers.get("subject") or e.get("subject") or ""
     labels = e.get("labelIds") or e.get("labels") or []
     parts = email_evidence_parts(e)
-    # An inbox or sent row the loop lane also fetched keeps its whole body: a new ask (or a
-    # completion line) late in the reply must still reach the writer and revise prompts. Only the
-    # excerpt shown for an archived loop row is bounded, and it is the loop lane's own read.
+    # An inbox or sent row the loop lane also fetched keeps its whole body (a late ask or completion
+    # line must reach the prompts). Only an archived loop row's excerpt is bounded.
     body = EVIDENCE_EXCERPT_LABEL.join(parts)[:EMAIL_BODY_MAX]
     loop_body = (parts[-1] if parts else '')[:LOOP_EVIDENCE_BODY_MAX]
     m = re.search(r"<([^>]+)>", from_)
     sender_email = m.group(1) if m else (from_.strip() if "@" in from_ else "")
-    # Reconcile the sender with Apple Contacts (the single biggest cross-channel identity gap):
-    # without this, the person the user knows as "Sarah Chen" on iMessage surfaces under whatever
-    # display name her mail client put in the From header, and the LLM sees two different people.
+    # Reconcile the sender with Apple Contacts (the biggest cross-channel identity gap): otherwise
+    # the From header's display name makes the LLM see two different people.
     resolved_name = (lookup or {}).get(sender_email.lower().strip()) or "" if sender_email else ""
     return {
         "messageId": next((e.get(key) for key in ("id", "messageId", "message_id", "source_id")
@@ -990,9 +992,11 @@ def _trim_email(e, lookup: dict | None = None) -> dict:
         "isPromotional": "CATEGORY_PROMOTIONS" in labels,
         "isUpdate": "CATEGORY_UPDATES" in labels,
         "isSocial": "CATEGORY_SOCIAL" in labels,
+        "isForum": "CATEGORY_FORUMS" in labels,
+        # The exact thread read's answer (gather_google): True/False, or None when no thread was read.
+        "ownerRepliedLater": e['owner_replied_later'] if isinstance(e.get('owner_replied_later'), bool) else None,
         # The attachment lane (gather_google.py, converted by _shared/lib/attachments.py). Rows are
-        # {filename, text} or {filename, unreadable}; absent for every email that had none, and for
-        # every host whose gather predates the lane.
+        # {filename, text} or {filename, unreadable}; absent when none or the gather predates it.
         "attachments": e.get("attachments") or [],
     }
 
@@ -1037,6 +1041,23 @@ def _format_attachments(attachments) -> str:
     return "\n".join(lines)
 
 
+def _owner_replied_later(e, sent) -> bool:
+    from email.utils import parsedate_to_datetime
+
+    def when(row):
+        try:
+            return parsedate_to_datetime(_s(row.get("date")))
+        except (TypeError, ValueError, IndexError):
+            return None
+    received = when(e)
+    for reply in sent:
+        replied = when(reply)
+        if (e.get("threadId") and reply.get("threadId") == e["threadId"] and received and replied
+                and replied.tzinfo and received.tzinfo and replied > received):
+            return True
+    return False
+
+
 def _format_emails(emails) -> str:
     if not emails:
         return "(no emails)"
@@ -1051,6 +1072,16 @@ def _format_emails(emails) -> str:
                 archived.append(e)
         else:
             active.append(e)
+    # Archive is inbox placement, not proof of handling: an archived human message with no later
+    # owner reply in its thread keeps its body (already capped at EMAIL_BODY_MAX) for extraction.
+    def bulk(e):
+        return (e["isPromotional"] or e["isUpdate"] or e["isSocial"] or e.get("isForum")
+                or _is_likely_automated(e["senderEmail"] or e["from"]))
+    human = [e for e in archived if not bulk(e) and e.get("ownerRepliedLater") is not True
+             and not _owner_replied_later(e, sent)]
+    unanswered = [e for e in human if e.get("ownerRepliedLater") is False]
+    unknown = [e for e in human if e.get("ownerRepliedLater") is not False]
+    archived = [e for e in archived if e not in human]
 
     def fmt(e):
         flags = []
@@ -1101,7 +1132,13 @@ def _format_emails(emails) -> str:
         lines = "\n".join(f"- {e['subject'] or '(no subject)'} "
                           f"(from: {(e.get('resolvedName') + ' <' + e['senderEmail'] + '>') if e.get('resolvedName') else e['from']})"
                           + (f" [threadId: {e['threadId']}]" if e["threadId"] else "") for e in archived)
-        sections.append(f"### Archived/Handled Emails ({len(archived)})\n{lines}")
+        sections.append(f"### Archived Emails ({len(archived)}) — answered later or bulk mail; subject only\n{lines}")
+    if unanswered:
+        sections.append(f"### Archived Emails With No Later Reply From You ({len(unanswered)}) — "
+                        "archive is not proof of handling\n" + "\n\n".join(fmt(e) for e in unanswered))
+    if unknown:
+        sections.append(f"### Archived Emails ({len(unknown)}), reply status unknown — no thread read showed "
+                        "whether you answered; archive is not proof of handling\n" + "\n\n".join(fmt(e) for e in unknown))
     if loop_evidence:
         sections.append("### Archived emails selected as loop evidence (archive status is not completion)\n"
                         + "\n\n".join(fmt(e) for e in loop_evidence))
@@ -1411,9 +1448,9 @@ def _format_reminders(reminders, status=None, now=None) -> str:
     Overdue and undated reminders reach this formatter now (they never used to), so each one is
     rendered relative to today instead of as a bare date the model has to do arithmetic on.
 
-    `now` is the SAME injected instant the rest of the prompt reasons about — compose_brief passes
-    `_brief_now(inputs)`, so a corpus replay of a day six weeks back measures "overdue" against that
-    day, not against the wall clock. There is no second clock here; never add one.
+    `now` is the brief's instant in the OWNER'S zone (compose_brief's `local_now`): "today" is
+    their local day, and a corpus replay measures "overdue" against its own day, not the wall clock.
+    There is no second clock here; never add one.
     """
     if not reminders:
         return ("(source unavailable on this device)" if status == "unavailable"
@@ -1514,6 +1551,23 @@ def _stale_local_note(local) -> str:
     local data is from an earlier capture so it frames it honestly ('your Mac was last seen …')."""
     since = _s((local or {}).get("_local_stale_since"))
     gone = _s((local or {}).get("_local_unavailable_since"))
+    failed = (local or {}).get("_source_failed")
+    failed_note = ""
+    if isinstance(failed, dict) and failed:
+        rows = []
+        for sid, f in failed.items():
+            f = f if isinstance(f, dict) else {}
+            kept = (f"showing rows from the last good read ({_s(f.get('last_good_at'))})" if f.get("carried")
+                    else "no earlier rows are recent enough to show")
+            rows.append(f"- {SOURCE_LABELS.get(sid, sid)}: the read failed at {_s(f.get('failed_at'))} "
+                        f"({_s(f.get('reason'))}); {kept}.")
+        failed_note = ("## Local Sources That Could Not Be Read This Run\n" + "\n".join(rows) + "\n"
+                       "Say in one line that these sources could not be read this run, mark anything "
+                       "from them as possibly stale, and never imply they were quiet.\n\n")
+    return failed_note + _offline_local_note(since, gone)
+
+
+def _offline_local_note(since: str, gone: str) -> str:
     if not since and gone:
         # The Bridge is gone AND its last capture is past the reuse window: there is no local
         # context at all, and the brief must say that rather than read as a quiet day on iMessage.
@@ -1545,7 +1599,7 @@ def _consent_receipt_note(local) -> str:
             "the local channels were quiet.\n\n")
 
 
-def _format_source_availability(avail, observations=None) -> str:
+def _format_source_availability(avail, observations=None, *, disclose_partial=True) -> str:
     if not avail:
         return ""
     unavailable, disabled, partial, rate_limited, partial_limited = [], [], [], [], []
@@ -1558,7 +1612,6 @@ def _format_source_availability(avail, observations=None) -> str:
         if quota and status == "unavailable":
             rate_limited.append(label)
         elif quota and status == "partial":
-            # Some rows were read before the quota hit: keep the partial-coverage instruction.
             partial.append(label)
             partial_limited.append(label)
         elif status == "disabled":
@@ -1581,7 +1634,8 @@ def _format_source_availability(avail, observations=None) -> str:
     if unavailable or disabled or rate_limited:
         lines.append("When a source cannot be read, do not create action items that depend on missing evidence.")
     if partial:
-        lines.append(f"Partial coverage: {', '.join(partial)}. Use the returned evidence, disclose the gap, "
+        disclosure = "disclose the gap, " if disclose_partial else ""
+        lines.append(f"Partial coverage: {', '.join(partial)}. Use the returned evidence, {disclosure}"
                      "and do not infer that missing results mean nothing happened.")
     if partial_limited:
         lines.append(f"Google's query quota was reached before {', '.join(partial_limited)} finished reading; "
@@ -1636,25 +1690,26 @@ def _format_deferred_unread(local) -> str:
 
 
 def _format_stale_threads(local) -> str:
-    stale = _arr(local, "stale_threads")
-    if not stale:
-        return ""
-    tracked = {(_s(a.get("source_thread_id")).strip()) for a in _arr(local, "action_ledger") if _s(a.get("source_thread_id")).strip()}
-    visible = [t for t in stale if _s(t.get("threadId")) not in tracked]
+    from stale_sent import untracked_threads
+    visible = untracked_threads(_arr(local, "stale_threads"), _arr(local, "action_ledger"))
     if not visible:
         return ""
-    body = "\n".join(
-        f"- **{t.get('to')}**: \"{t.get('subject')}\" — sent {t.get('daysSinceSent')} days ago ({_s(t.get('sentDate')).split('T')[0]})\n"
-        f"  Thread ID: {t.get('threadId')}\n  {t.get('snippet')}"
-        for t in visible)
+    lines = []
+    for row in visible:
+        message = row.get("sent_message")
+        if isinstance(message, dict):
+            recipient = ", ".join(filter(None, [message.get("to"), message.get("cc")]))
+            snippet = f"MessageId: {message.get('id')}\n  {message.get('snippet')}"
+        else:
+            recipient, snippet = row.get("to"), row.get("snippet")
+        lines.append(f"- **{recipient}**: \"{row.get('subject')}\" — sent {row.get('daysSinceSent')} days ago "
+                     f"({_s(row.get('sentDate')).split('T')[0]})\n  Thread ID: {row.get('threadId')}\n  {snippet}")
     return ("### Emails you sent that nobody answered (Gmail candidates)\n"
             "Silence alone does not establish a debt. Check the original request and subsequent\n"
             "thread context before proposing a waiting_on action; an introduction, FYI, thanks,\n"
             "or handoff may need no answer. If the available snippet cannot establish what was\n"
             "owed and by whom, leave the thread as context rather than opening a loop.\n\n"
-            f"{body}\n")
-
-
+            + "\n".join(lines) + "\n")
 
 
 def _format_past_commitments(local) -> str:
@@ -1709,7 +1764,10 @@ def _format_action_ledger(local, now=None) -> str:
     zone = _resolve_tz(configured_tz() or '+00:00') or timezone.utc
     clock = now or datetime.now(zone)
     today = (clock.astimezone(zone) if clock.tzinfo else clock).date().isoformat()
+    import loop_checks
+    checks = loop_checks.read()
     for a in active:
+        maybe = loop_checks.note_for(a, checks)
         age = _action_age(_s(a.get("created_at")), now)
         deadline = ledger_io.deadline_context(a, today)
         summary = _norm_escalation_tone(a.get("summary"))
@@ -1724,11 +1782,11 @@ def _format_action_ledger(local, now=None) -> str:
                      + (f" [recorded identifier: {_s(a.get('contact_identifier'))}]"
                         if _s(a.get('contact_identifier')).strip() else "")
                      + f": {summary}"
-                     + (f" — {ask}" if ask else ""))
+                     + (f" — {ask}" if ask else "")
+                     + (f" | {maybe} (check the source; not proof)" if maybe else ""))
     body = "\n".join(lines)
-    # The header states the SAME one-sentence contract the extraction prompt's TRUST BOUNDARIES do:
-    # recorded state can lag the supplied evidence. Reconcile before selecting visible priorities;
-    # a completed task needs an update even when its story does not earn a line.
+    # The header states the SAME contract as the extraction prompt's TRUST BOUNDARIES: recorded
+    # state can lag the evidence; a completed task needs an update even without a visible line.
     return ("## Open Commitments (ACTION LEDGER from previous briefs)\n"
             "These are recorded open items, not proof that the work is still outstanding.\n"
             "First compare EVERY entry with the supplied original messages. Return a loopUpdates proposal\n"
@@ -1852,11 +1910,33 @@ def _format_knowledge_section(local) -> str:
 
 
 
+_CONTACT_SYNC_TAG = re.compile(r"<sn>.*?</sn>", re.S)
+
+
+def _todays_identifiers(local) -> set:
+    values = []
+    for m in _arr(local, "imessage"):
+        values += [m.get("handle"), *_arr(m, "group_participants")]
+    for m in _arr(local, "whatsapp"):
+        values += [m.get("contact_jid"), m.get("sender_jid"), *_arr(m, "group_participants")]
+    values += [c.get("phone") for c in _arr(local, "calls")]
+    values += [c.get("jid") for c in _arr(local, "whatsapp_calls")]
+    return {key for key in (_normalize_identifier(_s(v)) for v in values) if key}
+
+
 def _format_contact_notes(local) -> str:
-    notes = [c for c in _arr(local, "contacts") if _s(c.get("notes")).strip()]
+    # The daily read includes every noted card; keep notes for people present today, matched by
+    # the same one-card-owns-the-key rule that resolves names.
+    contacts = _arr(local, "contacts")
+    today = _todays_identifiers(local) & set(build_contact_lookup(contacts))
+    notes = []
+    for c in contacts:
+        text = _CONTACT_SYNC_TAG.sub("", _s(c.get("notes"))).strip()
+        if text and _card_keys(c) & today:
+            notes.append((c.get("name"), text))
     if not notes:
         return ""
-    body = "\n".join(f"- **{c.get('name')}**: {_s(c.get('notes')).strip()}" for c in notes)
+    body = "\n".join(f"- **{name}**: {text}" for name, text in notes)
     return ("### Contact Notes (from Apple Contacts)\n"
             "Personal notes the user saved about contacts. Use to enrich context — roles, how they met, preferences.\n"
             f"{body}\n")
@@ -2065,10 +2145,10 @@ def _format_escalation_signals(signals) -> str:
     if not signals:
         return ""
     body = "\n".join(f"- {s.get('name')}: {s.get('narrative')} — {s.get('escalation_level')} channels" for s in signals)
-    return ("## Cross-Channel Escalation (PRE-COMPUTED — trust these signals)\n"
+    return ("## Cross-Channel Contact Activity\n"
             "These contacts contacted the user via multiple channels within 48 hours.\n"
-            "Use this as a priority signal.\n\n"
+            "Use as escalation only when the original messages establish the same open ask.\n\n"
             f"{body}\n\n"
             "Rules:\n"
-            "- Place escalating contacts in top priority\n"
+            "- Prioritize confirmed escalation\n"
             "- Reference the channel timeline naturally\n")

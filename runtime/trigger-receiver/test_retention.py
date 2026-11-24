@@ -51,6 +51,13 @@ def _line(days_ago: float, **extra) -> str:
     return json.dumps({"ts": ts, **extra}) + "\n"
 
 
+def test_assistant_access_log_ages_by_filename(_volume):
+    dates = [time.strftime('%Y-%m-%d', time.gmtime(NOW - age * DAY)) for age in (31, 3)]
+    old, new = [_write(_volume, f'logs/mcp-access-{day}.jsonl', 'content-free\n') for day in dates]
+    ret.sweep(now=NOW)
+    assert not os.path.exists(old) and os.path.exists(new)
+
+
 def test_fallback_atomic_write_closes_fd_and_removes_temp_when_fchmod_fails(
         _volume, monkeypatch):
     path = _volume / "events" / "delivery.jsonl"

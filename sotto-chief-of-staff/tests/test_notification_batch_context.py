@@ -255,7 +255,7 @@ def test_unrelated_retained_threads_are_filtered_before_name_resolution(inbox, m
     (root / 'preferences.json').write_text(json.dumps({'explicit': {'mute_people': ['Someone Else']}}))
     path = root / 'events/queue.jsonl'
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({'event': message(now, 2, 'OTHER_THREAD_CANARY', handle='+12025550999')}) + '\n')
+    path.write_text(json.dumps({'event': message(now, 2, 'OTHER_THREAD_CANARY', handle='+12025550100')}) + '\n')
     reads = []
     monkeypatch.setattr(triage, '_graph_display_name', lambda ident: reads.append(ident) or '')
     contexts = judge_from_evidence(monkeypatch)

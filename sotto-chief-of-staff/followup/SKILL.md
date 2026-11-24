@@ -28,9 +28,7 @@ decided and what the user committed to, and **draft** the follow-ups to send. Th
    The result is a queued acknowledgement; stop there. The receiver runs the original extraction
    over the meetings inside the selected window and writes every `commitments[]` item into the
    continuity ledger **before** it delivers `{followup_markdown, commitments[], drafts[], ledger[, open_loops]}`
-   as one message. `ledger` is the deterministic write receipt; backlog mode's `open_loops` is the
-   read-back after those writes. For the short lane, `followup_markdown` is delivered **verbatim** —
-   it is already chat-ready. For the backlog lane, the delivered answer to
+   in one worker-owned message. `ledger` is the write receipt and `open_loops` is the readback. The recent-meeting message starts with `followup_markdown` and adds the applicable draft text and next steps. For the backlog lane, the delivered answer to
    “what is open” comes from `open_loops`, not merely from extracted intent, and names anything in
    `ledger.skipped_terminal > 0` as already closed and not reopened. Do not compose a replacement or
    claim delivery; stopping this chat does not cancel the queued job.
@@ -38,15 +36,14 @@ decided and what the user committed to, and **draft** the follow-ups to send. Th
      is nothing to follow up: "I don't have transcripts for your recent meetings (connect Granola)" —
      don't invent follow-ups. Notes without transcripts still work (fewer, safer items).
 2. **Offer the drafts — email asks, every other channel is text to send yourself**
-   (`sotto-draft-reply` step 4 is the one rule; don't restate it differently here). Each delivered
-   draft ends with its own question. **Email** → the ask is *"want this in your Gmail drafts?"*; on
+   (`sotto-draft-reply` step 4 is the one rule; don't restate it differently here). Each delivered draft gives its own next step. **Email with a known address** → the worker asks *"Would you like to review this follow-up for Gmail drafts?"*; on
    the user's yes, call `gmail_draft_followup_list`, clarify when more than one offer fits, then
    `gmail_draft_followup_review` with that exact returned offer ID: it presents the full
    recipient/subject/body review, and only a distinct later yes permits `gmail_draft_save`. Confirm
    in one line. **iMessage/SMS/WhatsApp** →
    the user sends the body in the app themselves. A known local channel gets the draft text and
    an instruction to paste it into the existing conversation, without email subject/destination
-   placeholders or another channel/address question. Only an unknown channel needs clarification.
+   placeholders or another channel/address question. An unknown channel or a missing email destination needs clarification.
    **Ask before saving or sending — never auto-send** (`_shared/references/approval-tiers.md`).
    - **`to_email`/`channel` may be `null`** — the extraction prompt mandates null when the data has no
      address for that attendee. In that branch: ask the user which channel (and address) to send it
@@ -54,8 +51,7 @@ decided and what the user committed to, and **draft** the follow-ups to send. Th
      address the user supplies in the current message as the review's optional `to`.
 3. **Trust the receipt, not intent.** Recording a private open loop is reversible bookkeeping, not
    an outward action, so it does **not** require a confirmation turn. Confirmation still gates Gmail
-   drafts and every send in step 2. Never say commitments were captured unless the delivered result
-   carried a `ledger` receipt; an unavailable or rejected run means capture did not happen. Safe
+   drafts and every send in step 2. Claim only the changes the `ledger` receipt confirms. A source failure before capture means the notes could not be processed. If the worker cannot confirm the outcome, describe it as unconfirmed. Safe
    re-runs dedupe by `anchor_key`, and terminal items are never resurrected. When the user corrects
    the result ("that is done", "nothing for me to do", "James will get back to me"), route the
    explicit edits to `sotto-loops` §C and verify the resulting ledger before confirming them.

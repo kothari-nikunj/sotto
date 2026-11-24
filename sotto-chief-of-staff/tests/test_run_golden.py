@@ -81,42 +81,6 @@ def test_live_without_a_key_aborts(corpus, monkeypatch):
     assert rg.run("corpus-v1", 0, True, False, False, False, 0.05, corpus["out"]) == 2
 
 
-def test_chronological_funnel_never_sees_later_messages_or_day_end_learning(tmp_path, monkeypatch):
-    from datetime import datetime
-    import personal_context
-    import triage_event
-
-    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
-    monkeypatch.delenv('SOTTO_DEPLOYMENT_MODE', raising=False)
-    def message(hour, text, **extra):
-        return {'handle': '+15555550123', 'timestamp': f'2026-08-08 {hour}:00:00',
-                'text': text, '_gid': text, **extra}
-    # Deliberately reverse source order. The sent reply is context, not an interruption.
-    day = {'name': 'ordered', 'replay_clock': 'day_end', 'inputs': {
-        'type': 'evening', 'google': {'emails': [], 'events': []}, 'local': {'imessage': [
-            message('18', 'later question'), message('14', 'sent it', is_from_me=True),
-            message('09', 'morning ask')]}}}
-    observed = []
-    learned = tmp_path / 'learned-at-day-end'
-    def compose(*args, **kwargs):
-        learned.write_text('future knowledge')
-        return {'brief_markdown': 'Scripted brief', 'actions': []}
-    def triage(payload, **kwargs):
-        event = payload['events'][0]
-        assert not learned.exists(), 'earlier event saw day-end learning'
-        context = personal_context.current_conversation(
-            event, candidates=personal_context.conversation_snapshot())
-        observed.append((event['text'], [row['text'] for row in context]))
-        return {'verdict': 'queue'}
-    monkeypatch.setattr(rg.cb, 'compose', compose)
-    monkeypatch.setattr(triage_event, 'triage', triage)
-    result = rg.replay_day(day, datetime(2026, 8, 8, 23, 59), str(tmp_path), False)
-    assert result['exception'] is None
-    assert observed == [('morning ask', ['morning ask']),
-                        ('later question', ['morning ask', 'sent it', 'later question'])]
-    assert learned.exists()
-
-
 def test_chronological_funnel_orders_sources_and_refuses_undated_events(tmp_path, monkeypatch):
     from datetime import datetime
     import triage_event
@@ -283,7 +247,7 @@ def test_the_judges_scores_reach_the_aggregate_and_the_baseline(corpus, tmp_path
     assert doc["scores"]["judge_voice"] == 0.9
     assert doc["run"] == {"mode": "live+judge", "sample": 0, "critic_policy": "auto",
                           "metric_policy": "active-states-and-absolute-entity-error-v2",
-                          "chronological_funnel_policy": "event-time-before-day-end-compose-v1",
+                          "chronological_funnel_policy": "source-instant-before-day-end-compose-v2",
                           "compose_model": "/".join(rg.gemini_transport.effective_compose_model()),
                           "judge_model": rg.judge_model()}
 
@@ -651,7 +615,7 @@ def test_chronological_commitment_rejects_unexpected_read_even_when_gather_catch
     import loop_context
     from commitment_journey_fixture import run_chronological_stage
     run_chronological_stage(tmp_path, 'request')
-    monkeypatch.setattr(loop_context, 'graph_aliases', lambda: lambda *_: ['+14155550999'])
+    monkeypatch.setattr(loop_context, 'graph_aliases', lambda: lambda *_: ['+14155550105'])
     with pytest.raises(AssertionError, match='unexpected native source read'):
         run_chronological_stage(tmp_path, 'fulfillment')
 

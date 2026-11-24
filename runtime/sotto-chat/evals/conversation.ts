@@ -11,7 +11,7 @@ import {mkdir, readFile, writeFile, chmod, rm} from 'node:fs/promises';
 import {createInterface} from 'node:readline';
 import {resolve, dirname, join} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {acceptBackgroundFixture,conversationInbound} from './conversation-fixtures.js';
+import {acceptBackgroundFixture,acceptGalleryFixture,captureDeliveryMedia,conversationInbound} from './conversation-fixtures.js';
 import {z} from 'zod';
 import {DatabaseSync} from 'node:sqlite';
 import {startConfiguredRuntime} from '../src/bootstrap/main.js';
@@ -31,7 +31,7 @@ const turnSchema=z.object({text:z.string().min(1).max(16000),contains:z.array(z.
   taskRecords:z.array(z.object({title:z.string().min(1),status:z.enum(['open','resolved'])}).strict()).optional(),
   taskAddReceipts:z.array(z.string().min(1)).optional(),
   bridgeSends:z.number().int().nonnegative().optional(),
-  backgroundBefore:z.string().max(16000).optional(),
+  backgroundBefore:z.string().max(16000).optional(),backgroundGalleryBefore:z.string().min(1).max(16000).optional(),
   quoteBackgroundFromTurn:z.number().int().nonnegative().optional(),
   chatPrepOffer:z.object({eventId:z.string().min(1)}).strict().optional(),
   prepJobCount:z.number().int().nonnegative().optional(),
@@ -158,15 +158,16 @@ try {
     addReaction:async()=>{},removeReaction:async()=>{},startTyping:async()=>{},renderFormatted:(x:unknown)=>String(x),
     postMessage:async()=>{throw new Error('Use capture transport');},
   } as unknown as GatewayAdapter;
+  const galleryFixture=scenario.turns.some(turn=>turn.backgroundGalleryBefore);
   const config = {version:1,channel:'photon',deployment:'managed',tenantId:'eval-tenant',
     owner:{accountId:'eval-account',ownerId:'+15555550123'},lineKey:'eval-line',target:'photon',
     providerThreadId:thread,credentials:{mode:'cloud',photonProjectId:'eval-project',photonProjectSecret:'eval-secret'},
-    stateDirectory:join(output,'runtime'),mediaRoot:join(output,'media'),port:0,
+    stateDirectory:join(output,'runtime'),mediaRoot:galleryFixture?join(data,'cache/visual-briefs'):join(output,'media'),port:0,
     bearerToken:randomBytes(32).toString('hex'),instructions:model.instructions,modelProxy:model.modelProxy,
     skillPackRoot:join(root,'sotto-chief-of-staff'),allowedSkills:[],turnPresence:false,
     bridge:{url:`http://127.0.0.1:${peer.port}/mcp`,readBearer:peer.readBearer},
     ownerLoop:{mode:'explicit_command',identity:peer.identity,bearer:peer.bearer}};
-  await mkdir(config.mediaRoot,{mode:0o700});
+  if(!galleryFixture)await mkdir(config.mediaRoot,{mode:0o700});
   const configFile=join(output,'runtime.json');await writeFile(configFile,JSON.stringify(config),{mode:0o600});
   const guardedFetch: typeof fetch = async (input,init) => {
     const req=new Request(input,init),url=new URL(req.url);
@@ -211,17 +212,7 @@ try {
       if(input.threadId!==thread) throw new Error('Eval destination mismatch');
       const id=`eval-out-${sends.length+1}`;
       const text=input.verbatim?input.text??'':await options?.formatText?.(input.text??'')??input.text??'';
-      const captured: {mediaSha256s?:string[];mediaPaths?:string[]}={};
-      if(scenario.world.meetingPrep&&input.media?.length){
-        const folder=join(output,'delivered-media');await mkdir(folder,{recursive:true,mode:0o700});
-        captured.mediaSha256s=[];captured.mediaPaths=[];
-        for(const [index,media] of input.media.entries()){
-          if(!media.data||media.mimeType!=='image/png'||media.data.length>5_000_000)throw new Error('Unknown prep media contract');
-          const bytes=Buffer.from(media.data),path=join(folder,`${id}-${index+1}.png`);
-          await writeFile(path,bytes,{mode:0o600});captured.mediaPaths.push(path);
-          captured.mediaSha256s.push(createHash('sha256').update(bytes).digest('hex'));
-        }
-      }
+      const captured=await captureDeliveryMedia(output,id,input.media,Boolean(scenario.world.meetingPrep||galleryFixture));
       sends.push({id,text,media:input.media?.length??0,at:Date.now(),...captured});
       return {acceptance:'accepted',providerMessageIds:[id],providerSentAtMs:Date.now()};
     }})});
@@ -264,7 +255,9 @@ try {
       acceptedPrepOfferProof=proof;
       await writeFile(join(output,`prep-offer-${i}.json`),JSON.stringify({staged,accepted:accepted[0],proof},null,2),{mode:0o600});
     }
-    if(turn.backgroundBefore){
+    if(turn.backgroundGalleryBefore)backgroundReceipts.set(i,await acceptGalleryFixture({command,output,step:i,text:turn.backgroundGalleryBefore,sends,
+      initialize:()=>runtime!.gateway.chat.processMessage(adapter,thread,conversationInbound(i,thread,"/new",config.owner.ownerId,undefined,"eval-gallery-init"))}));
+    else if(turn.backgroundBefore){
       const accepted=await acceptBackgroundFixture({fetch:originalFetch,port:runtime.port,bearer:config.bearerToken,step:i,text:turn.backgroundBefore,sends});
       if(accepted)backgroundReceipts.set(i,accepted);
     }

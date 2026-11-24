@@ -68,3 +68,11 @@ test('person correction accepts only explicit scalar typed profile fields',()=>{
  for(const field of ['--title','--company'])for(const value of ['', ' padded ', 'bad\nvalue', 'bad\u0085value', 'bad\u2028value', 'x'.repeat(201)])assert.throws(()=>parseTaskCorrectionCommand([...argv,field,value],revision));
  assert.throws(()=>parseTaskCorrectionCommand(['--op','add','--slug','c_123abc','--text','A fact','--title','COO'],revision));
 });
+
+test('reopening a task Sotto closed on its own is a correction to open on the same row',()=>{
+ assert.equal((parseTaskCorrectionCommand(['--op','loop',...common,'--to','open'],revision) as {to?:string}).to,'open');
+ const args=ownerTaskToolArgsSchema.parse({operation:'correct',anchor:'source',loop_version:revision,loop_identity:revision,source_revision:revision,correction:'not booked',to:'open'});
+ const receipt={version:1 as const,status:'committed' as const,action_id:revision,event_id:revision,payload_hash:revision,args_hash:revision,operation:'correct' as const,anchor_key:'source',post_digest:revision,loop_status:'open' as const};
+ assert.equal(taskReceiptMatches(receipt,args),true);
+ assert.equal(taskReceiptMatches({...receipt,loop_status:'resolved'},args),false);
+});

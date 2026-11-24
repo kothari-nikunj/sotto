@@ -17,8 +17,13 @@ const processOwnership = new PollerOwnership();
 
 export type GatewayAdapter = Adapter & Partial<Pick<TelegramAdapter, "startPolling" | "stopPolling" | "isPolling">> &
   Partial<Pick<iMessageAdapter, "startGatewayListener" | "app" | "decodeThreadId" | "encodeThreadId">>;
+export interface GatewayEvent {
+  threadId: string;
+  sentAtMs?: number;
+  callbackAtMs?: number;
+}
 export interface GatewayApplication {
-  receive(inbound: Inbound, provider?: { threadId: string; sentAtMs?: number }): Promise<unknown>;
+  receive(inbound: Inbound, provider?: GatewayEvent): Promise<unknown>;
   close(options?: { retainOwnership?: boolean }): Promise<void>;
 }
 export interface OwnerGatewayManifest {
@@ -130,6 +135,7 @@ export async function startOwnerGateway(options: StartGatewayOptions) {
       concurrency: "concurrent",
       logger: 'silent',
     }, ({ adapter: sourceAdapter, threadId, message }) => {
+      const callbackAtMs = manifest.channel === "photon" ? Date.now() : undefined;
       receivedEvents++;
       // An edit reuses the original provider message ID with new text. Edits are not
       // re-processed: deny so the SDK acknowledges it instead of retrying a conflict forever.
@@ -137,7 +143,7 @@ export async function startOwnerGateway(options: StartGatewayOptions) {
       const inbound = normalizeOwnerMessage(manifest, sourceAdapter, threadId, message);
       if (!accepting || !inbound) return { admitted: false, reason: "not an owner direct message" };
       // receive() synchronously commits admission. Its turn continues independently of provider intake.
-      const work = options.application.receive(inbound, { threadId,
+      const work = options.application.receive(inbound, { threadId, callbackAtMs,
         sentAtMs: nativePhotonIngressTime(message, threadId) });
       handedOffEvents++;
       const observed = Promise.resolve(work).catch(() => undefined);

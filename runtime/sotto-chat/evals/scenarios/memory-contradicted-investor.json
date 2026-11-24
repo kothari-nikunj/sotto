@@ -1,0 +1,181 @@
+{
+  "name": "contradicted-investor-original-evidence-and-restart",
+  "world": {
+    "savedSourceGrants": [
+      "gmail"
+    ],
+    "knowledge": {
+      "person_updates": [
+        {
+          "person_name": "Mira Example",
+          "identifier": "mira@example.test",
+          "facts": [
+            {
+              "fact": "Mira is an investor in Cedar Labs.",
+              "source": "observed_message",
+              "confidence": 0.8,
+              "source_ref": "gmail:memory-investor-denial",
+              "evidence_refs": [
+                "gmail:memory-investor-denial"
+              ],
+              "observed_date": "2026-11-06"
+            },
+            {
+              "fact": "Mira builds accessibility testing tools.",
+              "source": "observed_message",
+              "confidence": 0.8,
+              "source_ref": "gmail:memory-builds",
+              "evidence_refs": [
+                "gmail:memory-builds"
+              ],
+              "observed_date": "2026-11-06"
+            }
+          ]
+        }
+      ]
+    },
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "gmailMessages": {
+      "memory-investor-denial": {
+        "id": "memory-investor-denial",
+        "threadId": "mira-Cedar-role",
+        "internalDate": "1793869200000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "I am not an investor in Cedar Labs. I only reviewed their accessibility demo.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Mira Example <mira@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "Cedar role"
+            },
+            {
+              "name": "Date",
+              "value": "Thu, 05 Nov 2026 09:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "SSBhbSBub3QgYW4gaW52ZXN0b3IgaW4gQ2VkYXIgTGFicy4gSSBvbmx5IHJldmlld2VkIHRoZWlyIGFjY2Vzc2liaWxpdHkgZGVtby4="
+          }
+        }
+      },
+      "memory-builds": {
+        "id": "memory-builds",
+        "threadId": "mira-accessibility-work",
+        "internalDate": "1793782800000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "I build accessibility testing tools.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Mira Example <mira@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "accessibility work"
+            },
+            {
+              "name": "Date",
+              "value": "Wed, 04 Nov 2026 09:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "SSBidWlsZCBhY2Nlc3NpYmlsaXR5IHRlc3RpbmcgdG9vbHMu"
+          }
+        }
+      }
+    }
+  },
+  "turns": [
+    {
+      "text": "What is saved about mira@example.test and Cedar Labs? Only report saved memory; no source checks or changes.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "contactReads": 0,
+      "bridgeSends": 0,
+      "latencyClass": "evidence",
+      "contains": [
+        "Cedar Labs",
+        "investor"
+      ],
+      "containsAny": [
+        [
+          "saved",
+          "on file",
+          "memory"
+        ]
+      ],
+      "googleReads": 0,
+      "returnedEvidenceContains": [
+        "gmail:memory-investor-denial",
+        "source_timestamp"
+      ]
+    },
+    {
+      "text": "Verify Mira's original emails: what does she build, and is she an investor in Cedar Labs? The saved claim may be wrong. Do not change anything.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "contactReads": 0,
+      "bridgeSends": 0,
+      "latencyClass": "evidence",
+      "contains": [
+        "accessibility",
+        "Cedar Labs"
+      ],
+      "containsAny": [
+        [
+          "not an investor",
+          "isn't an investor",
+          "isn’t an investor",
+          "not invested",
+          "not a Cedar Labs investor"
+        ]
+      ]
+    },
+    {
+      "text": "Check the original Cedar email again: what role did Mira actually describe, and did she invest? Do not change anything.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "contactReads": 0,
+      "bridgeSends": 0,
+      "latencyClass": "evidence",
+      "restartBefore": true,
+      "contains": [
+        "demo"
+      ],
+      "containsAny": [
+        [
+          "reviewed",
+          "reviewing"
+        ],
+        [
+          "not an investor",
+          "isn't an investor",
+          "isn’t an investor",
+          "did not invest",
+          "didn't invest"
+        ]
+      ]
+    }
+  ]
+}

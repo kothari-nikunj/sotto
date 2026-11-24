@@ -40,6 +40,15 @@ def test_routines_skill_exists_and_is_registered():
     assert "sotto-routines" in _skill_names()
 
 
+def test_schedule_skill_sets_one_on_one_title_and_optional_location_defaults():
+    with open(os.path.join(ROOT, "schedule", "SKILL.md"), encoding="utf-8") as f:
+        instructions = " ".join(f.read().split())
+    assert "explicit title first, then the owner’s saved naming preference" in instructions
+    assert "both first names are known, use `Owner / Guest`" in instructions
+    assert "If no venue was specified, leave the location empty" in instructions
+    assert "past events at that venue" in instructions
+
+
 def test_routines_skill_states_the_fence():
     """The three load-bearing promises of the personal-routines feature, in the skill the model
     actually reads: only `user-` names are created, only `user-` jobs are removed, and the cap —

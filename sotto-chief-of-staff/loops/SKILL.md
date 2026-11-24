@@ -39,7 +39,7 @@ gone stale**. Both are read-first. The runtime’s always-on task readback contr
    obligations and must not be presented or counted as open. If more than one parked item could
    match a request such as "keep Maya", show the matches and resolve the ambiguity before applying
    `keep` with that exact row's identity.
-2. **For named completions, use `owner_task_resolve_many`.** Include every requested completion.
+2. **For two or more named completions, use `owner_task_resolve_many`.** Include every requested completion. Section C covers single items.
    Copy exact current row proofs for unique matches. For a missing/ambiguous name, include its
    exact owner phrase as name/correction and omit all target proofs. Close clear independent
    selections and ask only about unresolved ones. “Handled” means completed, not dismissed.
@@ -70,8 +70,7 @@ when you can't tell which loop they mean, ask.
    Returns `stale_loops[]` (each with `anchor_key`, `name`, `what`, `direction`, `age_days`,
    `times_surfaced`, `overdue`, `deadline`, `chased_count`, `chased_out`, `suggestion`),
    `mute_suggestions[]`,
-   and `current` (timezone + the mutes and tone in effect). All empty → say so in one line ("Your
-   loops are clean — nothing stale to clear") and stop.
+   and `current` (timezone + the mutes and tone in effect). If no stale items are returned and the view was available, say "I found no stale tasks in the sources I can currently read."
    It shows currently permitted canonical loops and explicit settings; withheld or unknown sources
    are not covered.
    An empty result means no stale items in that view, not a complete all-source all-clear.
@@ -135,8 +134,7 @@ when you can't tell which loop they mean, ask.
    - **"Nudge them"** on a waiting loop is a *send* — hand off to `sotto-draft-reply`. This skill
      never sends.
    - **Brief timing** ("move my morning brief to 7am") → `sotto-setup` owns the system schedule.
-4. **Confirm in one line.** "Cleared 4 stale loops, snoozed 2 for a week, and I'll stop surfacing
-   Bob. Your list is lighter now."
+4. **Report what changed.** Name the selected tasks and their verified outcomes. Mention any refused, unconfirmed, or skipped items in the same reply.
 
 ## C · Applying explicit corrections
 

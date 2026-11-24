@@ -54,9 +54,13 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
         raise UnavailableError('offer reply route unavailable')
     offer = offers.get_offer(message_id=message_id, latest=False,
                              target='photon', chat_id=route['chat_id'])
+    if text == 'hide':
+        contextual = [item for item in offer.get('offers', [offer]) if item.get('action') == 'contextual_draft']
+        offer = contextual[0] if len(contextual) == 1 else {}
     code = ('ambiguous_offer' if offer.get('ambiguous') else 'no_matching_offer' if not offer
             else 'unsupported_offer' if (offer.get('kind') not in offers.LOOP_KINDS
-                and not (action == 'declined' and offer.get('kind') in ('meeting_prep', 'procedure', 'intention'))) else None)
+                and not (action == 'declined' and (offer.get('kind') in ('meeting_prep', 'procedure', 'intention')
+                         or text == 'hide' and offer.get('kind') == 'followup_draft'))) else None)
     if code:
         if preview:
             return {'version': 1, 'status': 'no_match'}

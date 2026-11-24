@@ -735,12 +735,11 @@ def _offer(selection, *, policy, data_root, activation, expected=None):
 
 def _reconcile_offer(saved):
     if saved.get('status') == 'committed' and saved.get('offer') is not None:
-        # The immutable provider receipt is primary. Cleanup can be retried by exact inspection.
+        # The provider receipt owns cleanup retries.
         try:
             _offers().clear_offer(expected=saved['offer'])
         except Exception:
             pass
-
 
 def _followup_detail(offer, policy, revision):
     raw = offer.get('detail')
@@ -758,8 +757,7 @@ def _followup_detail(offer, policy, revision):
             or len(set(detail['sources'])) != len(detail['sources']) or 'granola' not in detail['sources']):
         raise RefusalError('authority_changed')
     current = policy['_source_authority']()
-    allowed = set(current.get('bridge_sources', []) + current.get('google_sources', [])
-                  + current.get('connector_sources', []))
+    allowed = {source for key in ('bridge_sources', 'google_sources', 'connector_sources') for source in current.get(key, [])}
     if (current.get('complete') is not True or current.get('revision') != revision
             or not set(detail['sources']) <= allowed):
         raise RefusalError('authority_changed')
@@ -775,16 +773,16 @@ def _followup_detail(offer, policy, revision):
     _body(detail['body'])
     return detail
 
-
-def _followup_offers(*, policy, data_root, activation, revision, offer_id=None, expected=None):
+def _followup_offers(*, policy, data_root, activation, revision, offer_id=None, expected=None, message_id=""):
     route = activation.verified_current_photon_route(data_root, policy)
     if route is None:
         raise RefusalError('authority_changed')
-    found = _offers().get_offer(offer_id=offer_id or '', latest=False, target='photon', chat_id=route['chat_id'])
-    candidates = found.get('offers', []) if found.get('ambiguous') else [found] if found else []
+    found = _offers().get_offer(offer_id=offer_id or '', message_id=message_id, target='photon', chat_id=route['chat_id'])
+    from brief_followup_offer import ACTION, is_current
     matches = []
-    for offer in candidates:
-        if offer.get('kind') != 'followup_draft' or not _offers()._accepted_at(offer):
+    for offer in found.get('offers', []) if found.get('ambiguous') else [found]:
+        if (offer.get('kind') != 'followup_draft' or not _offers()._accepted_at(offer)
+                or message_id and offer.get('action') != ACTION):
             continue
         if type(offer.get('offer_id')) is not str or not OFFER_ID.fullmatch(offer['offer_id']):
             raise RefusalError('invalid_target')
@@ -792,19 +790,17 @@ def _followup_offers(*, policy, data_root, activation, revision, offer_id=None, 
             raise RefusalError('target_changed')
         try:
             detail = _followup_detail(offer, policy, revision)
-        except RefusalError:
+            if is_current(offer, check_sent=expected is None):
+                matches.append((offer, detail))
+        except (RefusalError, OSError, RuntimeError):
             if offer_id is not None:
                 raise
-            continue  # Withheld offers never contribute titles, recipients or counts.
-        matches.append((offer, detail))
     if offer_id is not None and len(matches) > 1:
         raise RefusalError('invalid_target')
     return matches
 
-
 def _owner_recipient(value, text=None):
     _recipient(value)
-    # Match one complete owner-supplied address, never a substring of another address.
     if text is not None:
         tokens = {token.strip('()[]{}\"').rstrip('.,!?') for token in re.findall(r'[^\s<>@,;]+@[^\s<>@,;]+', text)}
         if value not in tokens:
@@ -963,22 +959,19 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
                 raise ValueError('draft proposal invalid')
             if args.get('operation') in ('list_followup', 'propose_followup'):
                 listing = args['operation'] == 'list_followup'
-                if ((set(args) != {'operation'} if listing else
-                     set(args) not in ({'operation', 'offer_id'}, {'operation', 'offer_id', 'to'}))
-                        or body['identity']['channel'] != 'photon'
-                        or not listing and (type(args['offer_id']) is not str or not OFFER_ID.fullmatch(args['offer_id']))):
-                    raise ValueError('followup draft proposal invalid')
-                revision = _authority(policy, google)
+                _offers()  # initialize the shared helper paths
+                from brief_followup_offer import review_selection
+                message_id = review_selection(args, body, listing)
+                revision = _authority(policy, google, read_only=bool(message_id))
                 recipient = _owner_recipient(args['to'], body['text']) if 'to' in args else None
-                matches = _followup_offers(policy=policy, data_root=data_root, activation=activation,
-                    revision=revision, offer_id=None if listing else args['offer_id'])
-                _authority(policy, google, revision)
+                matches = _followup_offers(policy=policy, data_root=data_root, activation=activation, revision=revision,
+                    offer_id=None if listing else args['offer_id'], message_id=message_id)
+                _authority(policy, google, revision, read_only=bool(message_id))
                 if not matches:
                     return {'version': 1, 'status': 'no_match'}
                 if listing:
-                    summaries = [{'offer_id': offer['offer_id'], **{key: detail[key]
-                        for key in ('to_name', 'to_email', 'channel')}, 'subject': detail['subject'] or ''}
-                        for offer, detail in matches]
+                    summaries = [dict(offer_id=o['offer_id'], subject=d['subject'] or '',
+                        **{k: d[k] for k in ('to_name', 'to_email', 'channel')}) for o, d in matches]
                     if len(json.dumps(summaries, ensure_ascii=False).encode()) > 48 * 1024:
                         raise RefusalError('review_unavailable')
                     return {'version': 1, 'status': 'offers', 'offers': summaries}
@@ -1043,14 +1036,17 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
         origin = proposal.get('origin')
         followup = type(origin) is dict and origin.get('kind') == 'followup'
         if 'origin' in proposal:
-            if (type(origin) is not dict or (set(origin) not in ({'kind', 'offer_id'}, {'kind', 'offer_id', 'to'})
+            if (type(origin) is not dict or (set(origin) - {'kind', 'offer_id', 'to', 'message_id'}
                                            if followup else set(origin) != {'selection', 'offer_id'})
-                    or type(origin['offer_id']) is not str or not OFFER_ID.fullmatch(origin['offer_id'])):
+                    or type(origin.get('offer_id')) is not str or not OFFER_ID.fullmatch(origin['offer_id'])):
                 raise ValueError('draft offer origin invalid')
             if not followup:
                 selected_message_id(origin['selection'])
-            elif 'to' in origin:
-                _owner_recipient(origin['to'])
+            else:
+                if 'to' in origin:
+                    _owner_recipient(origin['to'])
+                if 'message_id' in origin:
+                    _header(origin['message_id'])
         if (review.get('kind') == 'new_email') != followup:
             raise ValueError('draft review origin invalid')
         writer, path = _preferences(), _path(data_root)
@@ -1089,7 +1085,7 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
                     or proposal['source_revision'] != review['source_revision']):
                 raise RefusalError('review_unavailable')
             original = ({'operation': 'propose_followup', 'offer_id': origin['offer_id'],
-                         **({'to': origin['to']} if 'to' in origin else {})} if followup else
+                         **{k: origin[k] for k in ('to', 'message_id') if k in origin}} if followup else
                         {'operation': 'propose_offer', 'selection': origin['selection']} if origin is not None
                         else {'operation': 'propose_new_send', 'to': review['to'], 'subject': review['subject'], 'body': review['body']} if new_send
                         else {'operation': 'propose_send' if sending else 'propose', 'message_id': review['message_id'], 'body': review['body']})
@@ -1110,7 +1106,7 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
         if followup:
             revision = _authority(policy, google, review['source_revision'])
             resolved = _followup_offers(policy=policy, data_root=data_root, activation=activation,
-                revision=revision, offer_id=origin['offer_id'])
+                revision=revision, offer_id=origin['offer_id'], message_id=origin.get('message_id', ''))
             if not resolved:
                 raise RefusalError('review_unavailable')
             offer, detail = resolved[0]
@@ -1136,12 +1132,12 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
             if current_review != review:
                 raise RefusalError('target_changed')
         _authority(policy, google, revision, sending=sending)
-        # Recheck the local fence and durably consume it before provider contact.
+        # Consume the rechecked local fence before contact.
         offers = _offers() if offer is not None else None
         with (writer.jsonstore.lock(offers._path()) if offers else nullcontext()):
             if offer is not None:
                 resolved = (_followup_offers(policy=policy, data_root=data_root, activation=activation,
-                    revision=revision, offer_id=origin['offer_id'], expected=offer) if followup else
+                    revision=revision, offer_id=origin['offer_id'], expected=offer, message_id=origin.get('message_id', '')) if followup else
                     _offer(origin['selection'], policy=policy, data_root=data_root, activation=activation, expected=offer))
                 if not resolved:
                     raise RefusalError('review_unavailable')
@@ -1167,30 +1163,28 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
                 writer._durable_preferences_replace(str(path), doc)
         def save_reviewed():
             try:
+                def before_contact(send=False):  # every guard here runs before Gmail is contacted
+                    try:
+                        _authority(policy, google, revision, sending=send)
+                    except RefusalError as error:
+                        raise _PrecontactRefusalError(error.code) from error
+                    except Exception as error:
+                        raise _PrecontactRefusalError('authority_changed') from error
                 if new_send:
                     def validate_profile(profile):
                         if type(profile) is not dict or profile.get('emailAddress') != review['sender_email']:
-                            raise RefusalError('target_changed')
-                    return google._gmail_reviewed_new_send(service, review, validate_profile,
-                        lambda: _authority(policy, google, revision, sending=True))
+                            raise _PrecontactRefusalError('target_changed')
+                    return google._gmail_reviewed_new_send(service, review, validate_profile, lambda: before_contact(True))
                 if sending:
                     def validate(message, profile):
                         current = _send_review(message, profile, review['message_id'], review['body'], revision)
                         if typed:
                             current = _typed_review(current, typed_saved['row'], review['draft_origin']['baseline_action_id'])
                         if current != review:
-                            raise RefusalError('target_changed')
-                    return google._gmail_reviewed_reply(service, review, validate,
-                        lambda: _authority(policy, google, revision, sending=True))
-                def before_create():
-                    try:
-                        _authority(policy, google, revision)
-                    except RefusalError as error:
-                        raise _PrecontactRefusalError(error.code) from error
-                    except Exception as error:
-                        raise _PrecontactRefusalError('authority_changed') from error
-                return (google._gmail_reviewed_new_draft(service, review, before_create) if followup else
-                        google._gmail_reviewed_draft(service, review, before_create))
+                            raise _PrecontactRefusalError('target_changed')
+                    return google._gmail_reviewed_reply(service, review, validate, lambda: before_contact(True))
+                return (google._gmail_reviewed_new_draft(service, review, before_contact) if followup else
+                        google._gmail_reviewed_draft(service, review, before_contact))
             except _PrecontactRefusalError as error:
                 return {'status': 'error', 'precontact_refusal': error.code}
             except Exception:  # noqa: BLE001 -- contact remains uncertain; audit only sanitized metadata

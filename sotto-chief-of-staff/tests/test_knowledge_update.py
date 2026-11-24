@@ -496,17 +496,17 @@ def test_correction_supersedes_at_high_overlap_never_bumps(tmp_path):
     # wrong fact, so the old code BUMPed it (+0.1 conf, decay reset, seen>1 immortality) and threw
     # the correction away. change_type="correction" must SUPERSEDE at ANY overlap ratio.
     ku.apply({"person_updates": [{
-        "person_name": "Peyton Lee", "identifier": "peyton@alive.inc",
+        "person_name": "Peyton Lee", "identifier": "peyton@alive.test",
         "facts": [{"fact": "Peyton is the founder of Alive Ventures",
                    "memory_type": "context", "confidence": 0.8}],
     }]}, NOW)
     ku.apply({"person_updates": [{
-        "person_name": "Peyton Lee", "identifier": "peyton@alive.inc",
+        "person_name": "Peyton Lee", "identifier": "peyton@alive.test",
         "facts": [{"fact": "Peyton is NOT the founder of Alive — she runs partnerships",
                    "memory_type": "context", "confidence": 0.9,
                    "change_type": "correction"}],
     }]}, NOW)
-    path = kg.find_person_file(name="Peyton Lee", identifier="peyton@alive.inc")
+    path = kg.find_person_file(name="Peyton Lee", identifier="peyton@alive.test")
     p = kg.parse_person_file(open(path).read())
     active = [m.text for _, m in kg.sorted_active_facts(p.facts)]
     assert any("runs partnerships" in t for t in active), "correction must become the active fact"
@@ -560,18 +560,18 @@ def _suggestions():
 
 def test_exact_identifier_collision_auto_merges_into_one_file(tmp_path):
     """Two files, one email — one human. Facts are unioned, nothing is dropped, one file remains."""
-    _write_person("c_aaaaaaaaaaaa", "Ben", ["+1 (415) 555-0000", "ben@northstar.io"],
+    _write_person("c_aaaaaaaaaaaa", "Ben", ["+1 (415) 555-0102", "ben@northstar.test"],
                   {"f_a": "Ben runs ops at Northstar"})
-    _write_person("c_bbbbbbbbbbbb", "Ben Butler", ["BEN@northstar.io"],
+    _write_person("c_bbbbbbbbbbbb", "Ben Butler", ["BEN@northstar.test"],
                   {"f_b": "Ben Butler is closing the Series A"})
     out = ku.apply({}, NOW)
     assert len(_people_files()) == 1
-    assert len(out["auto_merged"]) == 1 and out["auto_merged"][0]["identifier"] == "ben@northstar.io"
+    assert len(out["auto_merged"]) == 1 and out["auto_merged"][0]["identifier"] == "ben@northstar.test"
     path = os.path.join(kg.people_dir(), _people_files()[0])
     p = kg.parse_person_file(open(path, encoding="utf-8").read())
     texts = {f.text for f in p.facts.values()}
     assert texts == {"Ben runs ops at Northstar", "Ben Butler is closing the Series A"}
-    assert "ben@northstar.io" in [str(i).lower() for i in p.identifiers]
+    assert "ben@northstar.test" in [str(i).lower() for i in p.identifiers]
     assert any("415" in str(i) for i in p.identifiers)      # the phone survived the merge too
 
 
@@ -585,8 +585,8 @@ def test_phone_identifier_collision_normalizes_before_matching(tmp_path):
 
 def test_similar_names_are_suggested_never_merged(tmp_path):
     """Slug containment with non-conflicting identifiers: a suggestion, and BOTH files survive."""
-    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"], {"f_a": "Ben runs ops"})
-    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"],
+    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550102"], {"f_a": "Ben runs ops"})
+    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.test"],
                   {"f_b": "Ben Butler is closing the Series A", "f_c": "based in SF"})
     out = ku.apply({}, NOW)
     assert out["auto_merged"] == []
@@ -603,7 +603,7 @@ def test_two_john_smiths_with_distinct_identifiers_are_never_merged_or_suggested
     auto-merged (names never auto-merge at all) NOR suggested — a confirmed merge here would be the
     identity bug the canonical_id keying exists to prevent."""
     _write_person("c_111111111111", "John Smith", ["john@acme.com"], {"f_a": "John Smith at Acme"})
-    _write_person("c_222222222222", "John Smith", ["john@globex.com"], {"f_b": "John Smith at Globex"})
+    _write_person("c_222222222222", "John Smith", ["john@globex.test"], {"f_b": "John Smith at Globex"})
     out = ku.apply({}, NOW)
     assert out["auto_merged"] == []
     assert len(_people_files()) == 2
@@ -613,8 +613,8 @@ def test_two_john_smiths_with_distinct_identifiers_are_never_merged_or_suggested
 
 def test_suggestion_survives_reruns_and_is_capped(tmp_path):
     """first_seen is preserved across passes (the dashboard ages the card), and the list is capped."""
-    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"])
-    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
+    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550102"])
+    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.test"], {"f_b": "closing the A"})
     ku.apply({}, NOW)
     later = datetime(2026, 7, 1, 7, 0, 0)
     ku.apply({}, later)
@@ -626,8 +626,8 @@ def test_suggestion_survives_reruns_and_is_capped(tmp_path):
 def test_a_dismissed_pair_never_comes_back(tmp_path):
     """The suggestions are recomputed from the files on disk on every apply, so "these really are
     two people" has to be written down — as a tombstone the refresh obeys."""
-    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"])
-    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
+    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550102"])
+    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.test"], {"f_b": "closing the A"})
     ku.apply({}, NOW)
     assert len(_suggestions()) == 1
     ku.dismiss_merge_suggestion("c_eeeeeeeeeeee", "c_ffffffffffff", NOW)
@@ -641,8 +641,8 @@ def test_a_dismissed_pair_never_comes_back(tmp_path):
 def test_a_dismissal_matches_the_pair_in_either_order(tmp_path):
     """A merge pair names two people, not a direction — the tombstone is order-insensitive, and the
     suggester picks the direction itself (sparser file → richer one)."""
-    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550000"])
-    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
+    _write_person("c_eeeeeeeeeeee", "Ben", ["+14155550102"])
+    _write_person("c_ffffffffffff", "Ben Butler", ["ben@northstar.test"], {"f_b": "closing the A"})
     ku.dismiss_merge_suggestion("c_ffffffffffff", "c_eeeeeeeeeeee", NOW)   # reversed
     ku.apply({}, NOW)
     assert _suggestions() == []
@@ -663,8 +663,8 @@ def test_dismissals_are_capped_at_the_newest(tmp_path):
 def test_identifiers_conflict_only_within_a_kind(tmp_path):
     """A phone-only file and an email-only file do not contradict each other — that IS the dupe
     shape the audit found (the non-Contacts path). Two different emails DO contradict."""
-    phone_only = kg.PersonFile(name="Ben", identifiers=["+14155550000"])
-    email_only = kg.PersonFile(name="Ben Butler", identifiers=["ben@northstar.io"])
+    phone_only = kg.PersonFile(name="Ben", identifiers=["+14155550102"])
+    email_only = kg.PersonFile(name="Ben Butler", identifiers=["ben@northstar.test"])
     other_email = kg.PersonFile(name="Ben Butler", identifiers=["ben@other.com"])
     assert ku.identifiers_conflict(phone_only, email_only) is False
     assert ku.identifiers_conflict(email_only, other_email) is True
@@ -673,9 +673,9 @@ def test_identifiers_conflict_only_within_a_kind(tmp_path):
 
 def test_auto_merge_runs_before_the_updates_land(tmp_path):
     """The Learn step merges first, so the day's facts land in the SURVIVING file, not a third one."""
-    _write_person("c_aaaaaaaaaaaa", "Ben", ["ben@northstar.io"], {"f_a": "Ben runs ops"})
-    _write_person("c_bbbbbbbbbbbb", "Ben Butler", ["ben@northstar.io"], {"f_b": "closing the A"})
-    ku.apply({"person_updates": [{"person_name": "Ben Butler", "identifier": "ben@northstar.io",
+    _write_person("c_aaaaaaaaaaaa", "Ben", ["ben@northstar.test"], {"f_a": "Ben runs ops"})
+    _write_person("c_bbbbbbbbbbbb", "Ben Butler", ["ben@northstar.test"], {"f_b": "closing the A"})
+    ku.apply({"person_updates": [{"person_name": "Ben Butler", "identifier": "ben@northstar.test",
                                   "facts": [{"fact": "Ben Butler moved the board meeting to Friday",
                                              "memory_type": "context", "confidence": 0.9}]}]}, NOW)
     assert len(_people_files()) == 1
@@ -730,14 +730,14 @@ def test_company_domain_resolves_to_the_existing_file(tmp_path):
     os.makedirs(kg.companies_dir(), exist_ok=True)
     with open(os.path.join(kg.companies_dir(), "northstar.md"), "w", encoding="utf-8") as f:
         f.write("---\nschema: 1\nnormalized: northstar\naliases:\n- Northstar Labs\n"
-                "domain: northstar.io\nupdated_at: '2026-06-01T07:00:00Z'\n"
+                "domain: northstar.test\nupdated_at: '2026-06-01T07:00:00Z'\n"
                 "updated_by: brief_extraction\n---\n")
-    out = ku.apply({"company_updates": [{"company_name": "northstar.io",
+    out = ku.apply({"company_updates": [{"company_name": "northstar.test",
                                          "context_updates": ["shipped the SDK"]}]}, NOW)
     assert out["company_files"] == ["northstar.md"]
     content = open(os.path.join(kg.companies_dir(), "northstar.md"), encoding="utf-8").read()
     assert "shipped the SDK" in content
-    assert "domain: northstar.io" in content                # metadata still preserved
+    assert "domain: northstar.test" in content                # metadata still preserved
 
 
 def test_genuinely_new_company_still_gets_its_own_file(tmp_path):
@@ -1014,22 +1014,25 @@ def test_migration_repoints_edges_when_a_file_is_re_keyed(tmp_path):
 
 def test_extracted_fact_keeps_its_source_ref(tmp_path):
     """A fact you can't trace is a fact the user can't check — source_ref survives the write."""
-    ku.apply({"person_updates": [{"person_name": "Morgan Lee", "identifier": "morgan@northstar.io",
+    ku.apply({"person_updates": [{"person_name": "Morgan Lee", "identifier": "morgan@northstar.test",
               "facts": [{"fact": "Founder of Northstar Labs", "memory_type": "context",
                          "confidence": 0.9, "source_ref": "thr_5510cd"}]}]}, NOW)
-    p = kg.parse_person_file(open(kg.find_person_file(identifier="morgan@northstar.io")).read())
+    p = kg.parse_person_file(open(kg.find_person_file(identifier="morgan@northstar.test")).read())
     fact = next(f for _fid, f in kg.sorted_active_facts(p.facts))
     assert fact.source_ref == "thr_5510cd"
     assert fact.source == "brief_extraction"      # the label still tells you WHICH pipeline wrote it
 
 
-def test_company_domain_lands_once_and_never_overwrites(tmp_path):
-    ku.apply({"company_updates": [{"company_name": "Northstar Labs", "domain": "northstar.io"}]}, NOW)
+def test_company_domain_separates_namesakes_and_exact_read_wins(tmp_path):
+    ku.apply({"company_updates": [{"company_name": "Northstar Labs", "domain": "northstar.test"}]}, NOW)
     path = os.path.join(kg.companies_dir(), "northstar.md")
-    assert yaml.safe_load(open(path).read().split("---")[1])["domain"] == "northstar.io"
-    # A later, wrong domain never rewrites the one on file (and resolves INTO the same company).
-    ku.apply({"company_updates": [{"company_name": "Northstar Labs", "domain": "northstar.example"}]}, NOW)
-    assert yaml.safe_load(open(path).read().split("---")[1])["domain"] == "northstar.io"
+    assert yaml.safe_load(open(path).read().split("---")[1])["domain"] == "northstar.test"
+    original = open(path).read()
+    ku.apply({"company_updates": [{"company_name": "Northstar Labs", "domain": "northstar.example",
+                                  "about": "Builds observatory software."}]}, NOW)
+    assert open(path).read() == original
+    assert ku.company_knowledge("Northstar Labs", domain="northstar.example")["about"] == "Builds observatory software."
+    assert ku.company_knowledge("Northstar Labs", domain="northstar.test", unique=True)["about"] == ""
 
 
 def test_company_about_is_written_and_a_user_edit_is_never_overwritten(tmp_path):

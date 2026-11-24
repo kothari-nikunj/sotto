@@ -1,89 +1,35 @@
 #!/usr/bin/env python3
-"""
-outbox.py — the durable delivery outbox (ROADMAP § Reliability P0, item 2).
+"""outbox.py — the durable delivery outbox (ROADMAP § Reliability P0, item 2).
 
-**Nothing Sotto says is marked delivered until the channel says so; what fails waits its turn
-instead of dying.**
-
-THE BUG THIS EXISTS FOR. `receiver._deliver_text` already refuses to lie about a send — a failed
-send leaves a loud `failed` receipt instead of a green one (Aug 2026, the seam that fixed
-five nudge producers writing to a sink). But an honest receipt for a lost message is still a lost
-message: the words were composed, the interrupt budget was spent, the run cost real tokens, and a
-gateway that was down for ninety seconds threw all of it away. The Front Door plan puts a
-third-party iMessage relay (Photon) in the command path, where an outage is a *when*, not an *if* —
-so "the channel was down" must mean **queued and retried**, never **lost**.
-
-WHERE IT SITS. `receiver._deliver_text` is the ONE place Sotto's words leave this box: every lane
-(brief, event nudge, proactive, post-meeting tap, the release valve, the dashboard's run-now and
-the midday digest) reaches the channel through it, because every one of them is spawned by
-`_spawn_and_deliver` and delivered by that function. So the outbox wraps exactly that call:
-enqueue BEFORE the first send attempt, transition only on the channel's ack. One writer, one file.
-
-WHAT THE CHANNEL ACKNOWLEDGES. The runtime adapter requires a structured acceptance receipt for
-the outbox's stable dispatch identity. The outbox retains this acceptance receipt, then applies the
-delivery effects. Acceptance does not prove device arrival or reading;
-a spawned model run exiting zero says nothing about delivery. Failed effects retry five times
-without sending the message again, then quarantine: the acceptance receipt, the label, the run id
-and the reason stay on file, and the effects' per-source addressing leaves it exactly as it does on
-the applied path — a row that will never replay has no use for a handle or a thread id.
-
-WHERE THE CHANNEL-HEALTH GATE STAYS. `receiver._delivery_channel_ready` is a setup probe (has the
-owner linked this channel?), and it cannot tell a live channel from a dead one. It therefore stays exactly where it already earns its keep — UPSTREAM, before triage spends a nudge of
-the daily interrupt budget — and it is deliberately NOT repeated here. At this seam the real probe
-is the send itself, so the outbox never refuses to try. That also settles the budget question the
-obvious way: a nudge is never DECIDED while the channel is known down, so a queued-then-expired row
-never spent budget there is nothing to refund. What changed is the other half — once words exist,
-the budget is already spent and throwing them away is pure loss, so a channel that fails now means
-"queued and retried", never "dropped".
+The receiver hands each brief, digest or nudge to this outbox before its first send.
+Provider acceptance settles delivery. Post-delivery effects retry five times before
+quarantine. Only a handset receipt could establish arrival.
 
 THE ONE THING IT CANNOT PROMISE. A process can die between provider acceptance and recording the
-reply. The outbox holds ambiguous text and gallery outcomes for receipt reconciliation instead of
-automatically replaying them. An absent receipt cannot prove
-absence of provider contact; such a row remains pending for explicit reconciliation. Concurrent
-drains are serialized within the tenant runtime, and state transitions use `json_transaction`'s
-locked read-modify-write. This is not a universal exactly-once guarantee.
+reply. The outbox never replays an ambiguous send: it asks the chat runtime for the dispatch's
+receipt until the row's window ends plus UNCONFIRMED_GRACE_SECS, then closes it `failed` ("could not
+confirm delivery") and tells the owner once about a scheduled brief. Only a lookup that finds no
+dispatch NOT_FOUND_AFTER_SECS after contact proves the runtime never saw it (it journals every
+dispatch before provider contact and never re-sends a known id), so only that row is retried.
 
-THE DELIVER-ONCE GATE IS MACHINERY HERE, NOT A PROMPT (Aug 30, 2026). The evening brief went out
-twice — the cron lane claimed `briefs/<day>.evening.delivered` at 17:34 and delivered, and the
-wake-push lane's text still left through this outbox at 17:35, a full minute after that marker
-existed. The claim lived only in the brief SKILL.md's step 6 ("if it prints `already`, STOP"), and
-the run did not honour it. So every brief-kind row now proves OWNERSHIP of today's marker at this
-seam, right before `HOOKS["send"]`: no marker, this row atomically creates one carrying its own run
-id and sends; the marker already holds this row's run id (the run claimed, obediently), it sends;
-the marker holds anyone else's id, the row goes STATUS_SUPERSEDED — receipted, payload dropped,
-never retried, never sent. `HOOKS["brief_gate"]` is the receiver's, because the marker's path and
-which labels even have one are already its to own.
+Before sending a brief, the receiver's brief_gate verifies ownership of today's marker.
+Nudges expire at NUDGE_MAX_AGE_MIN. Briefs respect their explicit deadline and local day.
+Digests expire at the end of the local day.
 
-EXPIRY IS PER KIND, AND REUSES THE FRESHNESS DOCTRINE THE FUNNEL ALREADY HAS — nothing new is
-invented here:
-
-  * a **nudge** expires `NUDGE_MAX_AGE_MIN` after it was composed — the same 240 minutes the
-    release valve refuses to promote a held nudge past (`triage_event.VALVE_MAX_AGE_MIN`). A
-    "meeting in 10 minutes" ping that arrives an hour late is worse than silence, so it is
-    ledgered `expired` and never sent.
-  * a **brief** retries until its explicit deadline (scheduled daily briefs: due time plus four
-    hours), bounded by the end of its LOCAL day, and
-    then `failed` — visibly, because a day with no brief is something you must be told about.
-  * the **digest** retries until the end of its local day too, then `expired` — that day ends
-    before the next digest window opens at 12:30, and tomorrow's digest supersedes it.
-
-MAX_ATTEMPTS is the backstop underneath all three, not a fourth rule: at the capped backoff it is a
-full day of trying, longer than any kind's expiry, so in practice expiry is what ends a row and this
-only catches one whose clock stopped moving.
+MAX_ATTEMPTS is the backstop underneath all three: a full day at the capped backoff.
 
 WHAT IT KEEPS, AND FOR HOW LONG. Message text is removed when a row becomes terminal.
 Delivered rows retain provider receipts and replayable effects until those effects settle;
 invalidated rows retain only the replacement-enqueue intent until it succeeds. Closed rows are
 pruned after RETENTION_SECS, except unfinished effects and terminal rows whose `on_terminal` hook has
-not yet reconciled them (they carry `terminal_reconciled` and wait for the producer, one per item). The pre-delivery work queue separately
-retains composed results for its bounded recovery period.
+not yet reconciled them. The pre-delivery work queue retains composed results for bounded recovery.
 
-Loaded by receiver.py via importlib (the relay/connectors/dashboard/calcache pattern); the receiver
-wires HOOKS — late-bound lambdas over ITS globals — so this module never imports the receiver and
-stays import-safe on its own. Stdlib only.
+Loaded by receiver.py via importlib; the receiver wires HOOKS (late-bound lambdas over ITS globals),
+so this module never imports the receiver and stays import-safe on its own. Stdlib only.
 
 Named constants, not knobs (defaults matter — see CLAUDE.md): MAX_ATTEMPTS, MAX_EFFECT_ATTEMPTS, BACKOFF_BASE_SECS,
-BACKOFF_MAX_SECS, DRAIN_INTERVAL_SECS, NUDGE_MAX_AGE_MIN, RETENTION_SECS. The only env var is
+BACKOFF_MAX_SECS, DRAIN_INTERVAL_SECS, NUDGE_MAX_AGE_MIN, RETENTION_SECS, UNCONFIRMED_GRACE_SECS,
+NOT_FOUND_AFTER_SECS. The only env var is
 SOTTO_OUTBOX=0, which turns the retry heartbeat off (the enqueue/ack path stays, so nothing is ever
 sent unrecorded).
 """
@@ -97,15 +43,12 @@ import threading
 import time
 import fcntl
 import re
+from functools import lru_cache
 
-# The tree's ONE content-id scheme (sha256 of a line, 16 hex). keys.py is the byte-identical
-# vendored copy the receiver image carries; the outbox's idempotency key is that scheme applied to
-# a message, not a second hashing convention invented here.
+# The tree's ONE content-id scheme (keys.py); the idempotency key is that scheme applied to a message.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from keys import queue_key as _content_id  # noqa: E402
 from visual_delivery import delivery_detail, artifact_id  # noqa: E402
-
-# ── Wiring surface (receiver overrides these; the defaults keep the module import-safe) ──────────
 
 def _unwired(name):
     def _raise(*_a, **_k):
@@ -128,12 +71,11 @@ HOOKS = {
     "on_delivered": lambda payload: None,       # receiver: finalize the run's chase/handoff effects
     "on_not_a_brief": lambda payload: None,     # receiver: a brief-kind row with no composed brief
     "local_today": lambda: time.strftime("%Y-%m-%d"),   # ONE tz resolution per process
-    # (label, day, run_id) -> "send" | "superseded". THE deliver-once gate for the day's brief, asked
-    # once per attempt, right before the channel is. receiver._brief_delivery_gate: it owns the
-    # marker's path AND which labels have one (the pulse and the digest do not, and it answers
-    # "send" for them), because that path already has exactly one owner and it is not this module.
+    # (label, day, run_id) -> "send" | "superseded": THE deliver-once gate, asked right before the
+    # channel. receiver._brief_delivery_gate owns the marker's path and which labels have one.
     "brief_gate": _unwired("brief_gate"),
     "valid": lambda payload: True,
+    "refresh_brief_offer": lambda payload: payload,
     "delivery_ready": lambda payload: True,
     "on_invalid": lambda payload: None,
     "on_terminal": lambda row: True,  # persist producer outcome before receipt retention ends
@@ -143,29 +85,17 @@ HOOKS = {
     # Receiver-owned current source + channel observation. Failure affects only
     # future retained-text proof, never whether the original message is sent.
     "retained_proof_current": lambda proof: False,
+    "handoff_context": lambda label: None,  # receiver: current {source_revision, route_digest} or None
 }
 
 
-def _retained_candidate(payload):
-    presentation = payload.get('presentation') if isinstance(payload, dict) else None
-    text_artifact = payload.get('retained_text_artifact') if isinstance(payload, dict) else None
-    proof = (presentation.get('retained_text_proof') if isinstance(presentation, dict)
-             else text_artifact.get('retained_text_proof') if isinstance(text_artifact, dict) else None)
-    expected_versions = (1, 2) if isinstance(presentation, dict) else (3,)
-    if (not isinstance(proof, dict) or set(proof) != {
-            'version', 'source_revision', 'route_digest', 'content_sha256',
-            'gallery_payload_sha256', 'image_sha256s'}
-            or type(proof['version']) is not int or proof['version'] not in expected_versions
-            or any(not isinstance(proof[key], str) or re.fullmatch(r'[a-f0-9]{64}', proof[key]) is None
-                   for key in ('source_revision', 'route_digest', 'content_sha256',
-                               'gallery_payload_sha256'))
-            or not isinstance(proof['image_sha256s'], list)
-            or len(proof['image_sha256s']) != (0 if proof['version'] == 3 else 4)
-            or any(not isinstance(item, str) or re.fullmatch(r'[a-f0-9]{64}', item) is None
-                   for item in proof['image_sha256s'])):
-        return None
-    return proof
+@lru_cache(maxsize=1)
+def delivery_proof():
+    return load_shared_lib('protected_brief_detail', anchor=__file__)
 
+
+def _retained_candidate(payload):
+    return delivery_proof().retained_candidate(payload)
 
 def _retained_current(proof):
     try:
@@ -173,7 +103,6 @@ def _retained_current(proof):
     except Exception:
         return False
 
-# ── The constants (this module is their one writer) ──────────────────────────────────────────────
 
 KIND_BRIEF = "brief"
 KIND_DIGEST = "digest"
@@ -183,9 +112,7 @@ STATUS_PENDING = "pending"
 STATUS_DELIVERED = "delivered"
 STATUS_FAILED = "failed"
 STATUS_EXPIRED = "expired"
-# The other lane already sent today's brief, so this copy never will — terminal on the first
-# attempt, never retried. Distinct from `expired` (which is about time) and from `failed` (which is
-# about the channel): nothing went wrong here, another run simply got there first.
+# Another run got today's brief first: terminal on the first attempt; not about time or the channel.
 STATUS_SUPERSEDED = "superseded"
 
 TERMINAL = (STATUS_DELIVERED, STATUS_FAILED, STATUS_EXPIRED, STATUS_SUPERSEDED)
@@ -202,13 +129,20 @@ SUPERSEDED_DETAIL = ("today's brief was already delivered by the other lane — 
 BACKOFF_BASE_SECS = 60        # first retry a minute later: a gateway restart is the common outage
 BACKOFF_MAX_SECS = 900        # …doubling, capped at the */15 cadence every other heartbeat uses
 DRAIN_INTERVAL_SECS = 60      # its own beat, not the valve's: a brief must not wait 15 min to retry
-# The backstop, not the rule: EXPIRY is what normally ends a row, and 96 attempts is a full day at
-# the capped backoff — longer than the longest expiry any kind has. It exists so a row whose day
-# never seems to end (a clock jump, a stuck timezone) still stops, loudly, instead of forever.
+# The backstop, not the rule: expiry ends a row; 96 capped attempts (a day) stops a clock-jumped one.
 MAX_ATTEMPTS = 96
 MAX_EFFECT_ATTEMPTS = 5       # accepted messages never resend; broken effects quarantine after five tries
+UNCONFIRMED_GRACE_SECS = 30 * 60   # an unconfirmed send waits this long past its window for a late receipt
+NOT_FOUND_AFTER_SECS = 120         # a dispatch the runtime still has not seen this long after contact never left
+LATE_RECEIPT_SECS = 24 * 3600      # an unconfirmed close still records a provider receipt this long, never resends
+PROVIDER_MESSAGE_ID_MAX = 512
+UNCONFIRMED_DETAIL = 'could not confirm delivery: no receipt by the end of its window'
+# Owner status notices wait through quiet hours/snooze (receiver gate), so they live 24 h, not a nudge's age.
+OWNER_STATUS_PREFIXES = ('owner-reminder-status:', 'owner-reminder-orphaned:', 'delivery-unconfirmed:')
+HANDOFF_CONTEXT_PREFIXES = ('owner-reminder-orphaned:', 'delivery-unconfirmed:', 'request-feedback:', 'status:no-sources')
 from shared_lib import load_shared_lib  # noqa: E402
-
+TASK_CONTEXT = load_shared_lib('delivered_tasks', anchor=__file__)
+_brief_body_proof = load_shared_lib('accepted_briefs', anchor=__file__).body_proof
 NUDGE_MAX_AGE_MIN = load_shared_lib('funnel_policy', anchor=__file__).VALVE_MAX_AGE_MIN
 RETENTION_SECS = 7 * 24 * 3600   # terminal rows linger a week so "what failed?" has an answer
 
@@ -225,13 +159,7 @@ def _root() -> str:
 
 
 def path() -> str:
-    """$SOTTO_DATA/events/outbox.json — one JSON document `{"rows": [...]}`, not a JSONL append log.
-
-    The rows MUTATE (attempts, status, next attempt), so an append-only log would need compaction to
-    stay readable, and compaction is a second writer. A whole-document rewrite through
-    `connectors.json_transaction` gives the atomicity (tmp → os.replace) AND the cross-thread lock
-    for free, from the helper the rest of the image already uses. Volumes hold a handful of rows a
-    day; there is nothing here to stream."""
+    """$SOTTO_DATA/events/outbox.json, atomically replaced under the connector transaction lock."""
     return os.path.join(_root(), "events", "outbox.json")
 
 
@@ -319,10 +247,7 @@ def reconcile_terminal():
 
 
 def _find(rows: list, key: str):
-    for row in rows:
-        if row.get("id") == key:
-            return row
-    return None
+    return next((r for r in rows if r.get("id") == key), None)
 
 
 def _close(row: dict) -> dict:
@@ -336,6 +261,8 @@ def _close(row: dict) -> dict:
     row.pop('offer_route_at_contact', None)
     row.setdefault("finished_at", time.time())
     row["payload"] = {"label": payload.get("label") or ""}
+    if payload.get('prep_meeting_start') is not None:
+        row['payload']['prep_meeting_start'] = payload['prep_meeting_start']
     return payload
 
 
@@ -365,8 +292,7 @@ def _expiry(row: dict, now: float, today: str):
     valid_until = payload.get('valid_until')
     if valid_until is not None and now >= float(valid_until):
         return STATUS_EXPIRED, 'the useful delivery window has ended'
-    # Missed explicit timers have their own bounded deadline, independent of brief days.
-    if str(payload.get('label', '')).startswith('owner-reminder-status:') and valid_until is not None:
+    if str(payload.get('label', '')).startswith(OWNER_STATUS_PREFIXES) and valid_until is not None:
         return None
     kind = row.get("kind")
     if kind == KIND_NUDGE:
@@ -397,9 +323,7 @@ def _enqueue(key: str, kind: str, payload: dict, now: float, today: str) -> str:
                     routine_digest != routine_payload_digest(payload)):
                 raise RuntimeError('routine outbox handoff digest is invalid')
         if row is None:
-            row = {"id": key, "kind": kind, "created_at": now, "day": today, "attempts": 0,
-                   "next_at": now, "last_error": "", "status": STATUS_PENDING, "payload": payload,
-                   'acceptance': 'not_attempted', 'acceptance_uncertain': False}
+            row = _new_row(key, kind, payload, now, today)
             if routine_digest is not None:
                 row['routine_handoff_digest'] = routine_digest
             rows.append(row)
@@ -419,16 +343,18 @@ def feedback_skill(label: str) -> str | None:
     return None
 
 
+def scheduled_pulse(label):
+    return label in ('cron:sotto-relationship-pulse', 'run-now:sotto-relationship-pulse')
+
+
+def requires_source_scope(label):
+    return bool(scheduled_pulse(label) or label == 'onboarding:history-discovery:sotto-welcome-brief'
+                or label.startswith('meeting-prep:') or feedback_skill(label))
+
+
 def enqueue_work_feedback(job: dict, *, enqueue: bool = True) -> bool | str:
-    """Atomically inspect delivery and enqueue one content-free requested-work outcome.
-
-    True means no notice is owed (or it is already enqueued) and the caller may clear the job's
-    feedback; False means not yet decidable. With enqueue=False nothing is written and a notice
-    that would be enqueued now is reported as 'notice' instead.
-
-    Work completion is only a handoff, not proof of delivery. Unknown acceptance gets an honest
-    status notice after ten minutes, never a replacement send or a claim that nothing arrived.
-    The existing drain owns feedback retries; feedback itself cannot create further work.
+    """True clears feedback, False waits, and a dry run returns 'notice' when one is due.
+    Unknown acceptance waits ten minutes or until two drains before a known meeting.
     """
     if job.get('status') not in ('done', 'failed', 'expired'):
         return False
@@ -448,6 +374,7 @@ def enqueue_work_feedback(job: dict, *, enqueue: bool = True) -> bool | str:
         if quiet_done and skill == 'proactive':
             return True
         uncertain = False
+        meeting_start = meta.get('prep_meeting_start') if skill == 'meeting-prep' else None
         if original is not None:
             if original.get('status') == STATUS_DELIVERED or original.get('acceptance') == 'accepted':
                 return True
@@ -456,15 +383,20 @@ def enqueue_work_feedback(job: dict, *, enqueue: bool = True) -> bool | str:
             if original.get('status') == STATUS_PENDING and not uncertain:
                 return False  # Uncontacted/retryable delivery still owns the original result.
             stamp = float(original.get('finished_at') or original.get('created_at') or now)
+            if meeting_start is None and skill == 'meeting-prep':
+                meeting_start = (original.get('payload') or {}).get('prep_meeting_start')
             if uncertain:
                 stamp = float(original.get('created_at') or now) + 600
+                if meeting_start is not None:
+                    stamp = min(stamp, meeting_start - 2 * DRAIN_INTERVAL_SECS)
         else:
             stamp = float(job.get('finished') or now)
-        # Do not surprise an owner with ancient failures after a long outage. The normal durable
-        # metadata remains available, but these conversational notices have a four-hour window.
+        notice_until = stamp + 4 * 3600
+        if meeting_start is not None:
+            notice_until = min(notice_until, meeting_start)
         if now < stamp:
             return False
-        if now - stamp >= 4 * 3600:
+        if now >= notice_until:
             return True
         descriptions = {'meeting-prep': 'meeting prep', 'ask-research': 'research',
                         'followup': 'follow-up', 'relationship-pulse': 'relationship pulse',
@@ -485,46 +417,79 @@ def enqueue_work_feedback(job: dict, *, enqueue: bool = True) -> bool | str:
         if not enqueue:
             return 'notice'
         payload = {'label': 'request-feedback:' + job['id'], 'body': body, 'target': meta['target'],
-                   'run_id': key, 'effects': [], 'valid_until': stamp + 4 * 3600,
+                   'run_id': key, 'effects': [], 'valid_until': notice_until,
                    'feedback_for': job['id'], 'feedback_owner': meta['owner'],
                    'feedback_chat_id': meta['chat_id']}
+        if meeting_start is not None:
+            payload['prep_meeting_start'] = meeting_start
         if skill:
             payload['feedback_route_digest'] = meta.get('route_digest')
-        rows.append({'id': key, 'kind': KIND_NUDGE, 'created_at': now, 'day': today,
-                     'attempts': 0, 'next_at': now, 'last_error': '', 'status': STATUS_PENDING,
-                     'payload': payload, 'acceptance': 'not_attempted', 'acceptance_uncertain': False})
-
+        rows.append(_new_row(key, KIND_NUDGE, payload, now, today))
     return True
 
 
+def _new_row(key, kind, payload, now, today):
+    return {'id': key, 'kind': kind, 'created_at': now, 'day': today, 'attempts': 0, 'next_at': now,
+            'last_error': '', 'status': STATUS_PENDING, 'payload': payload,
+            'acceptance': 'not_attempted', 'acceptance_uncertain': False}
+
+
+def unconfirmed_notice_body(edition):
+    return (f"I couldn't confirm your {edition} brief was delivered. "
+            "If you don't see it, ask me for your brief and I'll send it now.")
+
+
+_LATE = ('effects', 'run_id', 'coverage_until', 'decision_ids', 'offer_route_at_contact', 'prep_meeting_start')
+
+
+def _awaiting(row):
+    """Pending, or closed unconfirmed while a late receipt may still be recorded."""
+    return row.get('status') == STATUS_PENDING or time.time() < float(row.get('late_until') or 0)
+
+
+def _unconfirmed_close(rows, row, now, today):
+    """Close an ambiguous send as failed; a scheduled brief also queues one content-free notice.
+    Requested work already has its own notice (`enqueue_work_feedback`)."""
+    row['status'], row['last_error'] = STATUS_FAILED, UNCONFIRMED_DETAIL
+    route, payload = row.get('offer_route_at_contact'), _close(row)
+    if row.get('routine_handoff_digest') is None:  # never the words, only what finishes a late delivery
+        row['payload'].update({k: v for k, v in {**payload, 'offer_route_at_contact': route}.items() if v and k in _LATE})
+        row['late_until'] = now + LATE_RECEIPT_SECS
+    edition = re.fullmatch(r'(?!requested:).*:sotto-(morning|evening)-brief', str(payload.get('label') or ''))
+    if edition and payload.get('target'):
+        key = message_key('delivery-unconfirmed', row['id'])
+        rows.append(_new_row(key, KIND_NUDGE, {
+            'label': 'delivery-unconfirmed:' + row['id'], 'body': unconfirmed_notice_body(edition[1]),
+            'target': payload['target'], 'run_id': key, 'effects': [], 'valid_until': now + 24 * 3600}, now, today))
+    return ('aged', payload, (STATUS_FAILED, UNCONFIRMED_DETAIL))
+def _suppress_confirmed_feedback(rows, row):
+    key = (row.get('payload') or {}).get('feedback_for')
+    original = _find(rows, key) if key else None
+    if original and (original.get('status') == STATUS_DELIVERED or original.get('acceptance') == 'accepted'):
+        _supersede_row(row, 'requested delivery confirmed before feedback send', False)
+        return True
+    return False
 
 
 def _claim(key: str, now: float, today: str):
-    """Charge one attempt and hand back what to send, or say why not. One transaction, three
-    answers: `None` (nothing to do — terminal, or not due yet), `aged` (it timed out — terminal),
-    `held` (an ambiguous send stays pending for receipt reconciliation), or `send` (go, with
-    `(attempts, day)` — the brief gate needs the row's own day, not the clock's).
-
-    The attempt is charged BEFORE the send, under the lock: a crash mid-send then looks exactly like
-    a failed attempt (backoff already set, budget already spent) instead of an unbounded replay."""
+    """Charge before sending so a crash preserves backoff; hold ambiguous sends for reconciliation."""
     with HOOKS["json_transaction"](path(), default={"rows": []}) as doc:
         rows = _rows(doc)
         doc["rows"] = rows
         row = _find(rows, key)
         if row is None or row.get("status") != STATUS_PENDING:
             return None
-        feedback_for = (row.get('payload') or {}).get('feedback_for')
-        original = _find(rows, feedback_for) if feedback_for else None
-        if original and (original.get('status') == STATUS_DELIVERED or original.get('acceptance') == 'accepted'):
-            row['status'] = STATUS_SUPERSEDED
-            row['last_error'] = 'requested delivery confirmed before feedback send'
-            _close(row)
+        if _suppress_confirmed_feedback(rows, row):
             return None
         # Once a send crossed the provider boundary, relevance expiry cannot prove it was not
         # accepted. Keep its replay identity and poll only on the existing capped backoff.
         if row.get('acceptance') in ('unknown', 'in_flight'):
             if now < float(row.get('next_at') or 0):
                 return None
+            # Owner reminders keep their receiver-owned reconciliation (`_owner_timer_terminal`).
+            if not str((row.get('payload') or {}).get('label', '')).startswith('owner-reminder') and _expiry(row, now, today):
+                if now >= row.setdefault('window_ended_at', now) + UNCONFIRMED_GRACE_SECS:
+                    return _unconfirmed_close(rows, row, now, today)
             row['attempts'] = min(int(row.get('attempts') or 0) + 1, MAX_ATTEMPTS)
             row['next_at'] = now + backoff_secs(row['attempts'])
             return ('held', {}, (row['attempts'], str(row.get('day') or '')))
@@ -540,57 +505,65 @@ def _claim(key: str, now: float, today: str):
                 (row["attempts"], str(row.get("day") or "")))
 
 
-def _supersede(key: str, detail: str, recompose=False):
-    """Close a row whose brief the other lane already delivered. Terminal like every other ending —
-    the payload leaves the file and no drain will ever claim it again."""
+def _supersede(key, detail, recompose=False):
     with HOOKS["json_transaction"](path(), default={"rows": []}) as doc:
-        rows = _rows(doc)
-        doc["rows"] = rows
-        row = _find(rows, key)
-        if row is None or row.get("status") != STATUS_PENDING:
-            return None
-        row["status"], row["last_error"] = STATUS_SUPERSEDED, detail[:300]
-        payload = _close(row)
-        if recompose:
-            row['effects_pending'] = True
-            row['effect_phase'] = 'invalidate'
-            row['effects_next_at'] = 0
-            row['payload'] = {k: v for k, v in payload.items() if k in ('label', 'valid_until')}
-            if row.get('routine_handoff_digest') is not None:
-                row['payload'].update(target=payload.get('target'),
-                                      routine_handoff_digest=row['routine_handoff_digest'])
-                for field in ('routine_source_revision', 'routine_route_digest'):
-                    if field in payload:
-                        row['payload'][field] = payload[field]
-            row['payload'].update(run_id=payload.get('run_id') or key, day=row.get('day'),
-                                  acceptance=row.get('acceptance', 'unknown'),
-                                  acceptance_uncertain=bool(row.get('acceptance_uncertain')))
-        return payload
+        if (row := _find(_rows(doc), key)) and row.get("status") == STATUS_PENDING:
+            return _supersede_row(row, detail, recompose)
+def _keep_routine(row, payload):
+    """A closed routine handoff keeps only the identity its handoff ledger reconciles against."""
+    if row.get('routine_handoff_digest') is not None:
+        row['payload'].update(target=payload.get('target'), routine_handoff_digest=row['routine_handoff_digest'],
+                              **{f: payload[f] for f in ('routine_source_revision', 'routine_route_digest') if f in payload})
+
+
+def _supersede_row(row, detail, recompose):
+    row["status"], row["last_error"] = STATUS_SUPERSEDED, detail[:300]
+    payload = _close(row)
+    if recompose:
+        row.update(effects_pending=True, effect_phase='invalidate', effects_next_at=0)
+        row['payload'] = {k: v for k, v in payload.items() if k in ('label', 'valid_until')}
+        _keep_routine(row, payload)
+        row['payload'].update(run_id=payload.get('run_id') or row['id'], day=row.get('day'),
+                              acceptance=row.get('acceptance', 'unknown'),
+                              acceptance_uncertain=bool(row.get('acceptance_uncertain')))
+    return payload
 
 
 def invalidated_claim(run_id, day, label):
     """Authoritative evidence for releasing an invalidated brief's unaccepted reservation."""
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
         row = _find(_rows(doc), run_id)
-        if (not row or row.get('status') != STATUS_SUPERSEDED
-                or row.get('effect_phase') != 'invalidate' or row.get('day') != day
-                or (row.get('payload') or {}).get('label') != label):
-            return False
-        return (row.get('acceptance') in ('not_attempted', 'rejected')
-                and not row.get('acceptance_uncertain'))
+        return bool(row and row.get('status') == STATUS_SUPERSEDED and row.get('day') == day
+                    and row.get('effect_phase') == 'invalidate' and definitely_unsent(row)
+                    and (row.get('payload') or {}).get('label') == label)
 
 
-def _begin_send(key, retained_at_contact=False, offer_route=None):
-    """Persist ambiguity before the provider call, including a crash without a response."""
+def definitely_unsent(row) -> bool:
+    """The one proof a closed row never reached the provider; a row with no acceptance field is none."""
+    return (row.get('status') in TERMINAL and row.get('status') != STATUS_DELIVERED and not row.get(
+        'acceptance_uncertain') and row.get('acceptance') in ('not_attempted', 'rejected'))
+
+def _begin_send(key, retained_at_contact=False, offer_route=None, replacement=None):
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
-        row = _find(_rows(doc), key)
-        if not row or row.get('status') != STATUS_PENDING:
+        rows = _rows(doc)
+        row = _find(rows, key)
+        if not row or row.get('status') != STATUS_PENDING or _suppress_confirmed_feedback(rows, row):
             return False
         if row.get('acceptance') in ('unknown', 'in_flight'):
-            return False  # provider acceptance is ambiguous; never resend blindly
-        if row.get('acceptance', 'unknown') in ('unknown', 'in_flight'):
-            row['acceptance_uncertain'] = True
-        row['acceptance'] = 'in_flight'
+            return False
+        payload = row.get('payload') or {}
+        if (payload.get('feedback_for') or feedback_skill(payload.get('label') or '') == 'meeting-prep') and _expiry(row, time.time(), row.get('day') or ''):
+            return False  # Validation crossed the deadline; the next claim records expiry.
+        effects = payload.get('effects') or []
+        if any(e.get('kind') == 'closure_notice' for e in effects) and load_shared_lib(
+                'signal_closes', anchor=__file__).send_reserved(effects, rows, key):
+            return _supersede_row(row, 'closure notice has another delivery receipt', recompose=True)
+        if replacement is not None:
+            if row.get('acceptance') != 'not_attempted' or 'contacted_at' in row:
+                return False
+            row['payload'] = replacement
+        row['acceptance_uncertain'] = 'acceptance' not in row or row.get('acceptance_uncertain', False)
+        row['acceptance'], row['contacted_at'] = 'in_flight', time.time()
         row['retained_proof_at_contact'] = retained_at_contact is True
         if offer_route:
             row['offer_route_at_contact'] = dict(offer_route)
@@ -600,20 +573,26 @@ def _begin_send(key, retained_at_contact=False, offer_route=None):
 
 
 def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None, *, retained_now=False):
-    """Record the channel's answer. Delivered exactly once: a row already terminal is left alone, so
-    two drains racing the same message cannot both mark it delivered or both give up on it."""
+    """Settle an awaiting row once under the outbox lock."""
     with HOOKS["json_transaction"](path(), default={"rows": []}) as doc:
         rows = _rows(doc)
         doc["rows"] = rows
         row = _find(rows, key)
-        if row is None or row.get("status") != STATUS_PENDING:
+        if row is None or not _awaiting(row) or row.get('status') != STATUS_PENDING and not ok:
             return None
         if ok:
-            row['acceptance'] = 'accepted'
+            late = bool(row.pop('late_until', None))
+            notice = _find(rows, message_key('delivery-unconfirmed', key)) if late else None
+            if notice and notice.get('status') == STATUS_PENDING and notice.get('acceptance', 'not_attempted') == 'not_attempted':
+                _supersede_row(notice, 'the brief was confirmed delivered after all', False)
+            row['acceptance'], row['acceptance_uncertain'] = 'accepted', False
             row["status"], row["last_error"] = STATUS_DELIVERED, ""
-            offer_route = row.get('offer_route_at_contact')
+            offer_route = row.get('offer_route_at_contact') or (row.get('payload') or {}).get('offer_route_at_contact')
             payload = _close(row)
-            row['receipt'] = {**(receipt or {}), 'accepted_at': time.time()}
+            row['receipt'] = {**(receipt or {}), 'accepted_at': time.time(), **({'late': True} if late else {}),
+                              **delivery_proof().accepted_notification(payload, receipt, row.get('retained_proof_at_contact'), retained_now),
+                              **_brief_body_proof(payload),
+                              **TASK_CONTEXT.accepted(payload, receipt, row.get('retained_proof_at_contact') and retained_now)}
             visual_id = artifact_id(payload.get('presentation'))
             text_artifact = payload.get('retained_text_artifact')
             text_id = text_artifact.get('id') if isinstance(text_artifact, dict) else None
@@ -631,12 +610,7 @@ def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None, *, ret
             # Drop message text immediately, retain only replayable post-acceptance effects.
             row['payload'] = {k: v for k, v in payload.items() if k in
                               ('label', 'effects', 'run_id', 'coverage_until', 'decision_ids')}
-            if row.get('routine_handoff_digest') is not None:
-                row['payload'].update(target=payload.get('target'),
-                                      routine_handoff_digest=row['routine_handoff_digest'])
-                for field in ('routine_source_revision', 'routine_route_digest'):
-                    if field in payload:
-                        row['payload'][field] = payload[field]
+            _keep_routine(row, payload)
             if offer_route:
                 row['payload']['offer_route_at_contact'] = offer_route
             row['payload']['receipt'] = row['receipt']
@@ -648,13 +622,12 @@ def _settle(key: str, ok: bool, detail: str, attempts: int, receipt=None, *, ret
         if row['acceptance'] == 'unknown':
             row['acceptance_uncertain'] = True
         row["last_error"] = detail[:300]
-        if row['acceptance'] == 'unknown':
-            # Attempt exhaustion cannot turn an ambiguous provider commit into a definitive
-            # failure. Keep the reconciliation identity; `_claim` will hold it without resending.
-            return ("retry", dict(row.get("payload") or {}))
-        if attempts >= MAX_ATTEMPTS:
-            row["status"] = STATUS_FAILED
-            return ("gave_up", _close(row))
+        # Attempt exhaustion cannot turn an ambiguous provider commit into a definitive
+        # failure. Keep the reconciliation identity; `_claim` will hold it without resending.
+        if row['acceptance'] != 'unknown' and attempts >= MAX_ATTEMPTS:
+            row["status"], payload = STATUS_FAILED, _close(row)
+            row['payload'].update({'run_id': payload['run_id']} if payload.get('run_id') else {})  # releases its marker
+            return ("gave_up", payload)
         return ("retry", dict(row.get("payload") or {}))
 
 
@@ -664,9 +637,11 @@ def _definitive_receipt_failure(key: str, acceptance: str) -> None:
         return
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
         row = _find(_rows(doc), key)
-        if row and row.get('status') == STATUS_PENDING:
+        if row and _awaiting(row):
             row['acceptance'] = acceptance
             row['acceptance_uncertain'] = False
+            if row.pop('late_until', None):
+                row.pop('terminal_reconciled', None)  # on_terminal sees the definite answer
 
 
 def _reconcile_ambiguous_send(key: str) -> bool:
@@ -677,12 +652,16 @@ def _reconcile_ambiguous_send(key: str) -> bool:
     """
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
         row = _find(_rows(doc), key)
-        if (not row or row.get('status') != STATUS_PENDING
+        if (not row or not _awaiting(row)
                 or row.get('acceptance') not in ('unknown', 'in_flight')):
             return False
         if time.time() < float(row.get('next_at') or 0):
             return False
+        closed = row.get('status') != STATUS_PENDING  # late: only an explicit no-send reopens it
+        if closed:
+            row['next_at'] = time.time() + BACKOFF_MAX_SECS
         attempts = int(row.get('attempts') or 0)
+        contacted = float(row.get('contacted_at') or row.get('created_at') or 0)
     try:
         late = HOOKS['gallery_receipt'](key)
     except Exception as e:  # lookup failure is never permission to replay an ambiguous gallery
@@ -693,15 +672,18 @@ def _reconcile_ambiguous_send(key: str) -> bool:
     acceptance = late.get('acceptance')
     message_id = late.get('message_id')
     if (acceptance == 'accepted' and isinstance(message_id, str)
-            and 0 < len(message_id) <= 512):
+            and 0 < len(message_id) <= PROVIDER_MESSAGE_ID_MAX):
         with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
-            candidate = _retained_candidate((_find(_rows(doc), key) or {}).get('payload'))
+            payload = (_find(_rows(doc), key) or {}).get('payload') or {}
+            candidate = delivery_proof().contact_scope(payload)
         settled = _settle(key, True, '', attempts, late,
                           retained_now=_retained_current(candidate))
         if settled is not None:
             _payload_receipt(settled[1], STATUS_DELIVERED)
             _apply_effects(key)
         return True
+    if acceptance == 'not_found' and not closed and time.time() - contacted >= NOT_FOUND_AFTER_SECS:
+        acceptance = 'not_attempted'
     _definitive_receipt_failure(key, acceptance)
     return False
 
@@ -766,10 +748,10 @@ def _attempt(key: str) -> bool:
         label = str(payload.get("label") or "")
         try:
             current = bool(HOOKS['valid'](payload))
+            fresh = HOOKS['refresh_brief_offer'](payload) if current else payload
+            current = current and fresh is not None and (fresh is payload or 'contacted_at' not in (snapshot or {}))
         except Exception as e:  # noqa: BLE001 — one row's broken check must not stall the rows behind it
-            # The attempt is already charged, so a check that keeps raising still runs out of
-            # budget; what it can't do any more is abort the whole drain pass at the head of the
-            # queue with the day's brief waiting behind it.
+            # The attempt is charged, so a check that keeps raising still runs out of budget.
             print(f"[sotto] {label or '?'}: validity check failed ({type(e).__name__}) — held for the next pass",
                   flush=True)
             return False
@@ -779,14 +761,12 @@ def _attempt(key: str) -> bool:
                 _payload_receipt(closed, STATUS_SUPERSEDED, 'item no longer current')
             _apply_effects(key)
             return False
-        # THE DELIVER-ONCE GATE, asked before the channel is (Aug 30: the evening brief went out
-        # twice, a full minute after the winning lane's marker existed, because the gate was an
-        # INSTRUCTION in the skill and the run did not honour it). A brief-kind row now proves at
-        # this seam that it owns today's marker; one that doesn't is superseded, not sent.
+        replacement = fresh if fresh is not payload else None
+        payload = fresh
+        # THE DELIVER-ONCE GATE (Aug 30 the evening brief went out twice): a brief-kind row proves
+        # here that it owns today's marker; one that doesn't is superseded, not sent.
         if kind_for(label) == KIND_BRIEF:
-            # A row whose lane did not name a run falls back to its OWN id: the gate's whole
-            # question is "did this copy claim the marker?", and the row id answers it just as
-            # durably across retries as a run id would.
+            # A row with no run id answers "did this copy claim the marker?" with its own id.
             gate = str(HOOKS["brief_gate"](label, day, str(payload.get("run_id") or "") or key)
                        or GATE_SEND)
             if gate == GATE_SUPERSEDED:
@@ -818,20 +798,34 @@ def _attempt(key: str) -> bool:
         receipt = {}
         if not _routine_authorized(payload, routine_digest):
             return False
-        candidate = _retained_candidate(payload)
+        candidate = delivery_proof().contact_scope(payload)
         capture = HOOKS.get('offer_route')
         offer_route = capture(payload) if capture else {}
         if offer_route is None:
             return False
-        if not _begin_send(key, _retained_current(candidate), offer_route):
+        retained = _retained_current(candidate)
+        proof = ((label.startswith(HANDOFF_CONTEXT_PREFIXES) and HOOKS['handoff_context'](label))
+                 or {'source_revision': payload.get('prep_source_revision'), 'route_digest': payload.get('prep_route_digest')})
+        prep = feedback_skill(label) == 'meeting-prep'
+        required = requires_source_scope(label)
+        current_scope = (required or not payload.get('presentation')) and _retained_current(proof)
+        if required and not current_scope:
+            return False  # No provider contact. The next claim rechecks validity and expiry.
+        context = {'source_revision': proof['source_revision']} if current_scope else {}
+        deadline = {}
+        if payload.get('valid_until') is not None and (prep or payload.get('prep_meeting_start') is not None):
+            deadline['valid_until_ms'] = int(payload['valid_until'] * 1000)
+        begun = _begin_send(key, retained, offer_route, replacement)
+        if isinstance(begun, dict):
+            _payload_receipt(begun, STATUS_SUPERSEDED, 'closure notice is already in delivery')
+            _apply_effects(key)
+        if begun is not True:
             return False
         try:
             if payload.get('presentation'):
-                answer = HOOKS['send_gallery'](payload['presentation'], payload.get('target') or '', key)
+                answer = HOOKS['send_gallery'](payload['presentation'], payload.get('target') or '', key, **deadline)
             else:
-                revision = payload.get('prep_source_revision')
-                context = {'source_revision': revision} if isinstance(revision, str) and re.fullmatch(r'[a-f0-9]{64}', revision) else {}
-                answer = HOOKS['send'](payload.get('body') or '', payload.get('target') or '', key, attempts, **context)
+                answer = HOOKS['send'](payload.get('body') or '', payload.get('target') or '', key, attempts, **context, **deadline)
             ok, detail = answer[:2]
             receipt = answer[2] if len(answer) > 2 else {}
         except Exception as e:  # a send that raises has unknown acceptance, never confirmed delivery
@@ -846,10 +840,7 @@ def _attempt(key: str) -> bool:
             _payload_receipt(payload, STATUS_DELIVERED)
             _apply_effects(key)
             return True
-        # LOUD on every failed attempt, exactly as before the outbox existed: a nudge decided and
-        # then not delivered is the thing this whole seam is here to make impossible to miss. What
-        # is NEW is the second half of the sentence — the receipt now says whether this failure is
-        # final or merely the latest attempt, so the Record can't read "failed" as "gone".
+        # LOUD on every failed attempt; the receipt says whether this failure is final or the latest.
         print(f"[sotto] {label or '?'}: delivery FAILED to {payload.get('target')} — {detail[:300]}",
               flush=True)
         if state == "gave_up":
@@ -974,12 +965,14 @@ def deliver(payload: dict) -> bool:
     return _attempt(key)
 
 
-def receipt_for_run(run_id: str, expected_digest: str) -> dict | None:
-    """Outbox-owned compact proof; no body, target, or provider identifier escapes.
+def owns_run(run_id):
+    """An enqueued result belongs to the outbox, including unresolved provider acceptance."""
+    with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
+        return _find(_rows(doc), run_id) is not None
 
-    Terminal receipts retain for seven days only. Missing evidence remains a
-    routine hold, never permission to infer acceptance from WorkQueue.done.
-    """
+
+def receipt_for_run(run_id: str, expected_digest: str) -> dict | None:
+    """Project a seven-day receipt without content. Missing evidence holds the routine."""
     if not isinstance(run_id, str) or not isinstance(expected_digest, str):
         raise ValueError('invalid routine outbox lookup')
     with HOOKS['json_transaction'](path(), default={'rows': []}) as doc:
@@ -989,9 +982,14 @@ def receipt_for_run(run_id: str, expected_digest: str) -> dict | None:
         if row.get('routine_handoff_digest') != expected_digest:
             raise RuntimeError('routine outbox receipt identity conflict')
         receipt = row.get('receipt') or {}
+        uncertain = row.get('acceptance_uncertain')
+        message_id = receipt.get('message_id')
+        if (uncertain is True and row.get('status') == STATUS_DELIVERED and row.get('acceptance') == 'accepted'
+                and isinstance(message_id, str) and 0 < len(message_id) <= PROVIDER_MESSAGE_ID_MAX):
+            uncertain = False  # older accepted rows could retain uncertainty after receipt lookup
         return {'kind': 'outbox', 'run_id': run_id, 'digest': expected_digest,
                 'status': row.get('status'), 'acceptance': row.get('acceptance'),
-                'acceptance_uncertain': row.get('acceptance_uncertain'),
+                'acceptance_uncertain': uncertain,
                 'effects_pending': row.get('effects_pending'),
                 'effects_status': row.get('effects_status'),
                 'accepted_at': receipt.get('accepted_at')}
@@ -1008,11 +1006,14 @@ def drain() -> dict:
                 rows = _prune(_rows(doc), time.time())
                 doc["rows"] = rows
                 keys = [str(r.get("id")) for r in rows if r.get("status") == STATUS_PENDING]
+                late = [str(r.get('id')) for r in rows if r.get('late_until') and _awaiting(r)]
                 effect_keys = [str(r.get('id')) for r in rows if r.get('effects_pending')]
         except Exception:  # noqa: BLE001 — an unreadable outbox must never kill the heartbeat
-            return {"attempted": 0, "delivered": 0}
+            return {"attempted": 0, "delivered": 0}  # a set-aside one is recorded where it is set aside
         for key in effect_keys:
             _apply_effects(key)
+        for key in late:  # never sends: only records a receipt that arrived after the close
+            _reconcile_ambiguous_send(key)
         attempted = delivered = 0
         for key in keys:
             attempted += 1

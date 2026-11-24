@@ -9,9 +9,10 @@ const hex = z.string().regex(/^[a-f0-9]{64}$/);
 const providerId = z.string().min(1).max(512)
   .refine(value => !/[\s\u0000-\u001f\u007f\ud800-\udfff]/u.test(value));
 export const ownerOfferReplyKind = 'owner_offer_reply';
+export const hideContextualOffer = /^\s*hide[ .!…\t\r\n]*$/iu;
 export function ownerOfferReplyAction(text: string): 'declined' | 'resolved' | 'dismissed' | null {
   const phrase = text.toLowerCase().replace(/[ .!…\t\r\n]+$/gu, '').trim().replace(/\s+/gu, ' ');
-  if (['no', 'nah', 'nope', 'no thanks', 'no thank you', 'not now', 'not yet', 'skip', 'skip it', 'leave it', 'forget it'].includes(phrase)) return 'declined';
+  if (['no', 'nah', 'nope', 'no thanks', 'no thank you', 'not now', 'not yet', 'skip', 'skip it', 'leave it', 'forget it', 'hide'].includes(phrase)) return 'declined';
   if (['done', 'handled', 'already handled', 'sorted', 'taken care of'].includes(phrase)) return 'resolved';
   if (['let it go', 'drop it', 'stop tracking this', 'drop this loop'].includes(phrase)) return 'dismissed';
   return null;

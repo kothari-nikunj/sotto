@@ -104,10 +104,12 @@ def test_final_same_session_profile_pin_before_post(sending, monkeypatch):
         address = 'owner@example.com' if len(reads) == 1 else 'switched@example.com'
         return SimpleNamespace(execute=lambda: {'emailAddress': address})
     monkeypatch.setattr(sending[2], 'getProfile', profile)
-    assert sending[-1](body)['status'] == 'unknown'
+    # The pin runs before any send, so the refusal is definite rather than an unknown outcome.
+    assert sending[-1](body) == {'version': 1, 'status': 'rejected', 'code': 'target_changed'}
     assert len(reads) == 2 and not sending[2].posts
-    assert sending[-1]({**body, 'operation': 'inspect'})['status'] == 'unknown'
-    assert len(reads) == 2
+    assert sending[-1]({**body, 'operation': 'inspect'})['status'] == 'rejected'
+    assert sending[-1](body)['code'] == 'target_changed'
+    assert len(reads) == 2 and not sending[2].posts
 
 
 @pytest.mark.parametrize('fault', ['body', 'to', 'from', 'thread'])

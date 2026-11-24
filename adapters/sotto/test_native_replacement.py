@@ -161,6 +161,39 @@ def test_inventory_rescan():
     exercise_inventory_rescan()
 
 
+
+def test_managed_monitor_allows_external_exec_but_still_requires_both_roles(monkeypatch):
+    lifecycle = object.__new__(tenant_lifecycle.Lifecycle)
+    lifecycle._pid = 2
+    lifecycle._native_uid = 10001
+    lifecycle._state = 'replacement'
+    lifecycle._replacement_leaders = {10: (100, 10000), 11: (200, 10001)}
+    lifecycle._assert_lock = lambda: None
+    lifecycle._reap = lambda: None
+    process = tenant_lifecycle._Process
+    inventory = {1: process(1, 0, 0, 1, b'S'), 2: process(2, 1, 0, 50, b'S'),
+                 10: process(10, 2, 10000, 100, b'S'), 11: process(11, 2, 10001, 200, b'S'),
+                 20: process(20, 0, 0, 300, b'S'), 21: process(21, 20, 0, 301, b'S')}
+    monkeypatch.setattr(tenant_lifecycle, '_processes', lambda: inventory)
+    monkeypatch.setattr(tenant_lifecycle, '_read_process', inventory.get)
+
+    lifecycle.check_replacement(allow_external_exec=True)
+    try:
+        lifecycle._replacement_tree()
+    except tenant_lifecycle.LifecycleUnavailableError:
+        pass
+    else:
+        raise AssertionError('strict inventory ignored the external shell')
+
+    inventory[11] = process(11, 0, 10001, 200, b'S')
+    try:
+        lifecycle.check_replacement(allow_external_exec=True)
+    except tenant_lifecycle.LifecycleUnavailableError:
+        pass
+    else:
+        raise AssertionError('external exec handling masked a displaced role leader')
+
+
 def exercise_success(root):
     lifecycle = new_lifecycle(root)
     node, receiver, node_env, receiver_env, node_path, receiver_path = roles(root)

@@ -25,8 +25,11 @@ before caching. Each push selects one primary item, ordered by urgency and deadl
 candidates retain coverage. Optional person-fact read failures do not discard a candidate. A writer
 failure cannot discard a deterministic reminder. Source text cannot select a recipient, create an
 executable action, or introduce candidate IDs. The writer has a 48,000-character total context limit
-(including instructions and schema), a 4,096-token output ceiling and low thinking on known Gemini 3
-models. Oversized or invalid work stays undelivered for existing retry/brief coverage.
+(including owner instructions and schema), a 4,096-token output ceiling and low thinking on known
+Gemini 3 models. It packs complete candidate evidence in priority order and skips candidates that
+do not fit. Only included IDs can be selected, and each offer's evidence checks use the included
+sources. If none fit, the writer is held. Skipped or invalid work stays uncovered for later ticks
+or briefs.
 
 Context reads are fixed: live open items, matching person facts, writing style, and calendar only
 when required. The Google gatherer reads the selected readable calendars and reports partial failures.

@@ -144,7 +144,8 @@ Promotion returns the same {"verdict":"agent","bundle":…} shape triage() does,
 it through the identical sotto-event nudge path; promoted entries leave the queue and land in
 surfaced.jsonl as verdict "promoted". SOTTO_VALVE=0 disables. This is the fix for the audit's worst
 failure: an actionable event arriving during cooldown/quiet/catchup NEVER nudged — it waited for the
-midday digest or the evening brief. (What the valve does not release still rides the digest, which
+midday digest or the evening brief. A summary withheld by the send rule returns for digest review,
+and later valve ticks skip it. (What the valve does not release still rides the digest, which
 reviews on any queued actionable/scheduling_ask/urgent item regardless of SOTTO_DIGEST_MIN; that
 threshold gates only ambient-only days — digest_check.check.)
 
@@ -224,7 +225,7 @@ from textutil import (  # noqa: E402
 from render_local import (  # noqa: E402
     _is_system_message, build_contact_lookup,
 )
-from timeutil import _now_local, _parse_ts, configured_tz, configured_user_email, parse_observed_time  # noqa: E402
+from timeutil import _now_local, _parse_ts, configured_tz, configured_user_email, parse_observed_time, source_observed_time  # noqa: E402
 import gemini as _gemini  # noqa: E402,F401 — compatibility alias for existing provider-seam tests
 import preferences as _prefs  # noqa: E402
 import brief_validate
@@ -283,15 +284,7 @@ PROMOTABLE_CLASSES = frozenset({"quiet", "cooldown", "stale", "budget", "meeting
 # it expires with its meeting and proactive_scan dedupes it once per day per key, so a spent budget
 # used to demote "your pitch starts in 20 minutes" to class "budget" — which the valve refuses to
 # promote (no proactive source ever promotes), leaving a held prep with no path back at all.
-from funnel_policy import BUDGET_EXEMPT_CLASSES  # noqa: E402
-# The in-meeting hold exempts LESS than the budget does: a missed call or a multi-channel escalation
-# is precisely what should reach you mid-meeting, but a tap that fires while you're in your NEXT
-# meeting must still hold (that's the back-to-back case the valve promotes out of). So this is
-# deliberately its own set, not an alias of BUDGET_EXEMPT_CLASSES — taps are hold-able but
-# budget-free.
-# A calendar change is about the user's IMMINENT schedule — the meeting they're in is exactly when
-# "your next one just moved/was declined" is most worth knowing, so it joins the mid-meeting set.
-MEETING_HOLD_EXEMPT_CLASSES = frozenset({"missed_call", "escalation", "calendar_change", "meeting_prep"})
+from funnel_policy import BUDGET_EXEMPT_CLASSES, MEETING_HOLD_EXEMPT_CLASSES  # noqa: E402
 # The per-thread cooldown exempts ONLY the escalation join — deliberately NOT aliased to the budget
 # set. A missed call still respects its thread's cooldown (three calls in ten minutes is one nudge),
 # but an escalation is defined by a SECOND channel arriving inside the window, which is precisely
@@ -842,7 +835,7 @@ def _append_queue(verdict_class: str, sender: str, event: dict, held_class: str 
         _commit_queue([entry])
 
 
-def _commit_queue(entries, surfaces=(), accepted=()):
+def _commit_queue(entries, surfaces=(), accepted=(), *, restoring=False):
     from deferred_queue import append_batch
     accepted = {_ingress_key(row['event']) for row in accepted}
     for surface in surfaces:
@@ -850,10 +843,17 @@ def _commit_queue(entries, surfaces=(), accepted=()):
             _record_surfaced(*surface)
     if entries:
         with _locked(_queue_path()):
-            append_batch(_queue_path(), entries, QUEUE_MAX_BYTES, QUEUE_KEEP_LINES)
+            if restoring:
+                stamp = datetime.now(timezone.utc).isoformat()
+                entries = [{**entry, 'valve_withheld_at': stamp} for entry in entries]
+            append_batch(_queue_path(), entries, QUEUE_MAX_BYTES, QUEUE_KEEP_LINES, restoring=restoring)
     for surface in surfaces:
         if _ingress_key(surface[4]) not in accepted:
             _record_surfaced(*surface)
+
+
+def retain_withheld(entries):
+    _commit_queue(entries, restoring=True)
 
 
 # ── Surfaced ledger (one line per verdict — the "why didn't I get nudged?" substrate) ─────────────
@@ -1096,7 +1096,7 @@ def _tier1_text(value: str, e: dict) -> str:
     text = _TIER1_EMAIL.sub("[email]", text)
 
     # Mask each non-date segment independently. Exempting a whole greedy phone-regex match merely
-    # because it STARTED with a date leaked the number in `2026-08-24 415-555-1234`.
+    # because it STARTED with a date leaked the number in `2026-08-24 415-555-0107`.
     parts = []
     end = 0
     for date in _TIER1_ISO_DATE.finditer(text):
@@ -1453,13 +1453,10 @@ def classify_event(e: dict, ctx: dict) -> tuple[str, str, str, str]:
 
 
 def _event_age_min(e: dict, now_utc: datetime):
-    """Event age in minutes, or None when the timestamp is missing/unparseable (never gate on a
-    guess). Naive timestamps are treated as UTC — the Bridge readers emit UTC wall-clock strings."""
-    ts = parse_observed_time(e.get('timestamp') or e.get('date'))
+    """Source age, never the Mac's local display clock interpreted as UTC."""
+    ts = _event_instant({}, e)
     if ts is None:
         return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
     return max(0.0, (now_utc - ts).total_seconds() / 60.0)
 
 
@@ -1662,15 +1659,31 @@ def triage(payload: dict, now_local=None, now_utc=None) -> dict:
         for row in agent_events:
             _stamp_cooldown(_thread_key(row['event']), now_ts)
     _commit_queue(pending_queue, pending_surfaces, agent_events if job_id else ())
+    if events:
+        _check_open_tasks(events, ctx["snapshot"])
     return {"verdict": overall,
             "reason": "; ".join(reasons[:5]) if reasons else "no events",
             "bundle": bundle, **({'job_id': job_id} if job_id else {})}
 
 
+def _check_open_tasks(events: list, snapshot: dict) -> None:
+    """The owner's own direct message marks that person's open tasks "maybe done" now, not at the
+    next brief (closure_pass); their newer direct message, in this batch or a later one, drops the
+    note. A failure here never costs the event its verdict."""
+    try:
+        scripts = os.path.join(_HERE, "..", "..", "morning-brief", "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import closure_pass  # noqa: PLC0415
+        print("[triage] closure pass: " + json.dumps(closure_pass.run(events, snapshot)), file=sys.stderr)
+    except Exception as error:  # noqa: BLE001
+        print(f"[triage] closure pass failed ({type(error).__name__})", file=sys.stderr)
+
+
 # ── Release valve (the deferred queue's way back to a nudge) ──────────────────────────────────────
 
-def _answered_threads(lines: list) -> dict:
-    """thread key → the latest instant the USER spoke on that thread, read off the queue's own
+def _answered_threads(lines: list, now_utc: datetime) -> dict:
+    """thread key → the latest user reply by this tick, read off the queue's own
     `signal` rows (the Bridge pushes `is_from_me` rows through the funnel; the Gmail poll's
     `in:sent` lane does the same for mail). The valve consults this so a held ask is never promoted
     after the user answered it themselves (Day-9 simulation, Sep 2026: Ben asked at 09:00 during a
@@ -1690,7 +1703,7 @@ def _answered_threads(lines: list) -> dict:
             # a busy room would otherwise kill every held ask from it, permanently.
             continue
         ts = _event_instant(entry, ev)
-        if ts is None:
+        if ts is None or ts > now_utc:
             continue
         key = _thread_key(ev)
         if key not in out or ts > out[key]:
@@ -1699,11 +1712,8 @@ def _answered_threads(lines: list) -> dict:
 
 
 def _event_instant(entry: dict, ev: dict):
-    """When an event happened, as an aware UTC datetime: the Bridge's ISO `timestamp`, else a mail
-    event's `date` (Gmail's RFC-2822 header, or the epoch-ms `internalDate` the poll falls back
-    to), else the instant the entry was queued. None only when nothing parses."""
-    return (parse_observed_time(ev.get('timestamp') or ev.get('date'))
-            or parse_observed_time(entry.get('ts')))
+    """Source instant, else recorded queue observation; neither rewrites event identity."""
+    return source_observed_time(ev) or parse_observed_time(entry.get('ts'))
 
 
 def _user_spoke_since(entry: dict, ev: dict, answered: dict) -> bool:
@@ -1749,7 +1759,7 @@ def _valve_candidate(entry: dict, now_utc: datetime, now_ts: float, max_age: int
     `drop`/`muted` receipt: the ingress drop writes one, so the held copy of the same person's
     message must not vanish silently — and checking it here means one receipt when the item was
     actually ready to go, not one an hour for as long as it sits in the queue."""
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or entry.get("valve_expired"):
         return None
     cls = _s(entry.get("verdict_class"))
     if cls not in PROMOTABLE_CLASSES:
@@ -1948,7 +1958,7 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
         # interrupt. The first non-exempt promotion spends the day's unit (atomically); the second
         # rides it free. `budget_snapshot` is diagnostic only — the real check is the spend.
         budget_snapshot = _budget_left(day)
-        answered = _answered_threads(lines)
+        answered = _answered_threads(lines, now_utc)
         promoted, promoted_idx, charged, budget_blocked = [], set(), False, False
         expired = False                   # an entry aged out on this tick → its marker needs saving
         cooldowns = []
@@ -1959,7 +1969,7 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
                 entry = json.loads(line)
             except (json.JSONDecodeError, ValueError):
                 continue
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or entry.get('valve_withheld_at'):
                 continue
             # PROMOTABLE_CLASSES / known sender / age window (meeting_hold exempt: an ask Sotto
             # itself held is never too old to deliver) / the user hasn't answered it since /
@@ -1993,7 +2003,7 @@ def release_valve(now_local=None, now_utc=None, now_ts=None) -> dict:
                               if cand['held'] == 'scheduling_ask' and cand['relevance_deadline']
                               else cand['event'])
             promoted.append({"event": promoted_event, "sender": cand["sender"],
-                             'deferred_class': cand['cls'],
+                             'deferred_class': cand['cls'], '_deferred_entry': entry,
                              "class": cand["held"],
                              "why": f"promoted from the deferred queue ({reason})",
                              "decision_id": decision_id,

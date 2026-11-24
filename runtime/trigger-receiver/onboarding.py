@@ -1,13 +1,14 @@
 """One automatic first useful look; the receiver/outbox remain the only delivery lane."""
 from datetime import datetime, timezone
 from functools import lru_cache
-import importlib.util
 import json
 from pathlib import Path
 import re
 import time
 
 from connectors import json_transaction
+import outbox  # pure predicates only; receiver.py owns the wired instance
+from shared_lib import load_shared_lib
 
 LABEL = 'onboarding:sotto-welcome-brief'
 LEASE_SECONDS = 20 * 60
@@ -15,6 +16,7 @@ RETRY_SECONDS = 30 * 60
 ATTEMPTS_PER_DAY = 3
 _MARKER = re.compile(r'(\d{4}-\d{2}-\d{2})\.(morning|evening)\.delivered\Z')
 _RUN_ID = re.compile(r'[0-9a-f]{32}\Z')
+_SCHEDULED = tuple(f'{lane}:sotto-{kind}-brief' for lane in ('cron', 'brief') for kind in ('morning', 'evening'))
 
 
 def _markers(root):
@@ -43,15 +45,10 @@ def _outbox_rows(root):
 def _tzchain():
     # The same tzchain file receiver/dashboard use; a UTC date can differ from
     # the local date embedded in a brief marker near midnight.
-    here = Path(__file__).resolve()
-    for candidate in (here.with_name('tzchain.py'),
-                      here.parents[2] / 'sotto-chief-of-staff/_shared/lib/tzchain.py'):
-        if candidate.is_file():
-            spec = importlib.util.spec_from_file_location('onboarding_tzchain', candidate)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
-    return None
+    try:
+        return load_shared_lib('tzchain', anchor=__file__)
+    except RuntimeError:
+        return None
 
 
 def _accepted_scheduled_brief(root):
@@ -128,23 +125,19 @@ def _pending_state(row):
     return 'queued'
 
 
-def _unresolved_scheduled_brief(root):
-    """A claimed scheduled send may still land, or may already have landed."""
-    # The receiver persists composed work in the outbox before the send seam
-    # creates its brief marker. Do not admit welcome through that gap.
+def _unresolved_scheduled_brief(root, rows=None):
+    # Pending rows can exist before the send creates its marker.
+    rows = _outbox_rows(root) if rows is None else rows
     pending = set()
-    for row in _outbox_rows(root):
+    for row in rows:
         payload = row.get('payload') if isinstance(row, dict) else None
         label = payload.get('label', '') if isinstance(payload, dict) else ''
-        if (label in ('cron:sotto-morning-brief', 'cron:sotto-evening-brief',
-                      'brief:sotto-morning-brief', 'brief:sotto-evening-brief')
-                and row.get('status') == 'pending'):
+        if label in _SCHEDULED and row.get('status') == 'pending':
             pending.add(_pending_state(row))
     if pending:
-        # A genuinely queued brief still holds later scheduled work until it is attempted.
         return 'queued' if 'queued' in pending else 'waiting'
     markers = {(day, kind, owner) for day, kind, owner, _ in _markers(root) if owner}
-    for row in _outbox_rows(root):
+    for row in rows:
         if not isinstance(row, dict):
             continue
         payload = row.get('payload') or {}
@@ -182,10 +175,25 @@ _UNCERTAIN = ('unknown', 'in_flight', 'accepted')
 
 
 def _welcome_ambiguous(rows):
-    """A welcome send that may have landed; like a scheduled brief, it never authorizes a replay."""
-    return any(isinstance(r, dict) and r.get('status') != 'delivered'
-               and (r.get('acceptance_uncertain') or r.get('acceptance') in _UNCERTAIN)
-               for r in rows)
+    """Ids of sends that may have landed (truthy iff any); none permits a replay."""
+    return [r.get('id') for r in rows if isinstance(r, dict) and r.get('status') != 'delivered'
+            and (r.get('acceptance_uncertain') or r.get('acceptance') in _UNCERTAIN)]
+
+
+def _labelled(root, labels, rows=None):
+    return [r for r in (_outbox_rows(root) if rows is None else rows) if isinstance(r, dict)
+            and isinstance(r.get('payload'), dict) and r['payload'].get('label') in labels]
+
+
+def _ambiguity_holds(root, state, flag, rows=None, clear=False):
+    """A hold lifts only when each row that set it has a definite answer."""
+    rows = {r.get('id'): r for r in (_labelled(root, _SCHEDULED) if rows is None else rows)}
+    holds = bool(state.get(flag)) and any(
+        i not in rows or _welcome_ambiguous([rows[i]]) for i in state.get(flag + '_ids') or [None])
+    if clear and not holds and state.pop(flag, None):
+        with json_transaction(str(root / 'config/onboarding.json'), default={}) as saved:
+            saved.pop(flag, None), saved.pop(flag + '_ids', None)
+    return holds
 
 
 def tick(data, ready, start, now=None, *, model_ready=None):
@@ -203,25 +211,24 @@ def tick(data, ready, start, now=None, *, model_ready=None):
     if _adopt_existing(root, now):
         return 'existing'
     if not snapshot.get('phase'):
-        if snapshot.get('scheduled_ambiguous'):
-            return 'waiting'  # terminal outbox evidence may have been pruned
-        unresolved = _unresolved_scheduled_brief(root)
+        if _ambiguity_holds(root, snapshot, 'scheduled_ambiguous', clear=True):
+            return 'waiting'
+        rows = _outbox_rows(root)
+        unresolved = _unresolved_scheduled_brief(root, rows)
         if unresolved:
             if unresolved == 'waiting':
                 with json_transaction(str(root / 'config/onboarding.json'), default={}) as state:
                     if not state.get('phase'):
                         state['scheduled_ambiguous'] = True
+                        state['scheduled_ambiguous_ids'] = _welcome_ambiguous(_labelled(root, _SCHEDULED, rows))
             return unresolved
-    try:
-        outbox_rows = json.loads((root / 'events/outbox.json').read_text()).get('rows', [])
-    except (OSError, ValueError, AttributeError):
-        outbox_rows = []
-    welcome_rows = [r for r in outbox_rows if r.get('payload', {}).get('label') == LABEL]
+    welcome_rows = _labelled(root, (LABEL,))
     if not any(r.get('status') in ('delivered', 'pending') for r in welcome_rows) and (
-            snapshot.get('welcome_ambiguous') or _welcome_ambiguous(welcome_rows)):
+            _ambiguity_holds(root, snapshot, 'welcome_ambiguous', welcome_rows, clear=True)
+            or _welcome_ambiguous(welcome_rows)):
         if not snapshot.get('welcome_ambiguous'):
             with json_transaction(str(root / 'config/onboarding.json'), default={}) as state:
-                state['welcome_ambiguous'] = True
+                state.update(welcome_ambiguous=True, welcome_ambiguous_ids=_welcome_ambiguous(welcome_rows))
         return 'waiting'
     if snapshot.get('phase') == 'model_held':
         # A provider-accepted composition wins even if a stale worker later reported a model hold.
@@ -316,12 +323,7 @@ def status(data, now=None):
             return 'waiting'
     except (OSError, ValueError):
         state = {}
-    try:
-        rows = json.loads((root / 'events/outbox.json').read_text()).get('rows', [])
-        welcome = [r for r in rows if isinstance(r, dict) and
-                   isinstance(r.get('payload'), dict) and r['payload'].get('label') == LABEL]
-    except (OSError, ValueError, AttributeError, TypeError):
-        welcome = []
+    welcome = _labelled(root, (LABEL,))
     if any(r.get('status') == 'delivered' for r in welcome):
         return 'delivered'
     if any(r.get('status') == 'pending' for r in welcome):
@@ -331,15 +333,12 @@ def status(data, now=None):
         return phase
     if _accepted_scheduled_brief(root):
         return 'existing'
-    if state.get('welcome_ambiguous') or _welcome_ambiguous(welcome):
+    if _ambiguity_holds(root, state, 'welcome_ambiguous', welcome) or _welcome_ambiguous(welcome):
         return 'waiting'  # acceptance unknown: never shown as retrying or sent
     if phase == 'model_held':
-        unresolved = _unresolved_scheduled_brief(root)
-        if unresolved:
-            return unresolved
-        return 'model_held'
+        return _unresolved_scheduled_brief(root) or 'model_held'
     if not phase:
-        if state.get('scheduled_ambiguous'):
+        if _ambiguity_holds(root, state, 'scheduled_ambiguous'):
             return 'waiting'
         unresolved = _unresolved_scheduled_brief(root)
         if unresolved:
@@ -369,7 +368,7 @@ def discovery_context(data, pack, permitted):
     sys.path.insert(0, str(Path(pack) / '_shared/scripts'))
     import knowledge as kg
     import yaml
-    from knowledge_query import _conflicts
+    import fact_hygiene as fh
     from relationship_importance import for_contact
     import preferences
     import jsonstore
@@ -489,7 +488,6 @@ def discovery_context(data, pack, permitted):
                    for identifier in ['', *person.identifiers]):
                 continue
             unique_name = sum(p.name.casefold() == person.name.casefold() for p in people) == 1
-            disputed = {fid for pair in _conflicts(person, conflicts) for fid in pair}
             record = history.get(person.canonical_id, {}) if isinstance(history, dict) else {}
             channels = set((record.get('channels') or {}).keys()) if isinstance(record, dict) else set()
             channels = {'gmail' if source == 'email' else source for source in channels}
@@ -499,31 +497,32 @@ def discovery_context(data, pack, permitted):
                 record = {**record, 'importance_evidence': {
                     key: [day for day in days if isinstance(day, str) and day > since]
                     for key, days in (record.get('importance_evidence') or {}).items()}}
-            # Aggregated dated importance cannot be split by source: retain it only when every
-            # contributing channel is covered and permitted. Canonical identity avoids name collisions.
             history_allowed = bool(person.canonical_id and channels and channels <= eligible_sources.keys())
             importance = for_contact({'canonical_id': person.canonical_id, 'name': person.name},
                 {person.canonical_id: record} if history_allowed else {},
                 explicit if unique_name else [], datetime.now(timezone.utc))
             if not history_allowed:
                 channels = set()
-            for _fid, fact in kg.sorted_active_facts(person.facts, datetime.now(timezone.utc)):
+            saved = {}
+            for fid, fact in kg.sorted_active_facts(person.facts, datetime.now(timezone.utc)):
                 refs = list(dict.fromkeys([fact.source_ref, *fact.evidence_refs]))
                 refs = [ref for ref in refs if isinstance(ref, str) and ref]
                 cited = {ref.split(':', 1)[0] for ref in refs}
-                if (_fid in disputed or fact.source != 'observed_message' or not refs
+                if (fact.source != 'observed_message' or not refs
                         or not cited <= eligible_sources.keys()
                         or not fact.text.strip() or not person.name.strip()):
                     continue
                 cutoff = max((regrants.get(source, 0) for source in cited), default=0)
                 if cutoff and (not isinstance(fact.last, str) or fact.last[:10] <=
                         datetime.fromtimestamp(cutoff, timezone.utc).date().isoformat()):
-                    continue  # date-only facts cannot prove observation after a same-day regrant
-                candidate = {'canonical_id': person.canonical_id,
+                    continue  # no proof after a same-day regrant
+                saved[fid] = {'canonical_id': person.canonical_id,
                         'person': person.name[:200], 'fact': fact.text[:700],
                         'observed_date': fact.last, 'source_refs': refs[:12],
                         'fact_sources': sorted(cited), 'importance': importance}
-                candidates.append(candidate)
+            readable = fh.readable_facts([(fid, person.facts[fid]) for fid in saved],
+                                         person, fh.readable_conflicts(person, conflicts))
+            candidates.extend(saved[fid] for fid, _ in readable)
         candidates.sort(key=lambda candidate: (
             -{'vvip': 2, 'vip': 1}.get(candidate['importance'].get('tier'), 0),
             -len(candidate['fact_sources']), candidate['person']))
@@ -539,7 +538,7 @@ def discovery_context(data, pack, permitted):
                     del by_person[identity]
                 if len(observations) == DISCOVERY_OBSERVATION_LIMIT:
                     break
-        # Bind every permission represented in coverage to the composition/outbox recheck.
+        # Recheck these source permissions at composition and delivery.
         return {'observations': observations, 'sources': sorted(coverage),
                 'coverage': coverage} if observations else None
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, jsonstore.Unreadable):
@@ -549,13 +548,6 @@ def discovery_context(data, pack, permitted):
 def discovery_delivered(data, now=None):
     with json_transaction(str(Path(data) / 'config/onboarding.json'), default={}) as state:
         state['discovery'] = {'phase': 'delivered', 'completed_at': time.time() if now is None else now}
-
-
-def _definite_non_send(row):
-    """A closed row that provably never reached the provider; nothing else may release a claim."""
-    return (row.get('status') not in ('pending', 'delivered')
-            and row.get('acceptance') in ('not_attempted', 'rejected')
-            and not row.get('acceptance_uncertain'))
 
 
 def _discovery_claims_unresolved(discovery, rows):
@@ -571,7 +563,7 @@ def _discovery_claims_unresolved(discovery, rows):
     by_id = {row.get('id'): row for row in rows if row.get('id')}
     for run_id in list(claims):
         row = by_id.get(run_id)
-        if row is not None and _definite_non_send(row):
+        if row is not None and outbox.definitely_unsent(row):
             del claims[run_id]
     return bool(claims)
 

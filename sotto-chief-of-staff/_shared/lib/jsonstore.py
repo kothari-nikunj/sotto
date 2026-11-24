@@ -176,10 +176,20 @@ def transaction(path: str, default=None, mode: int = 0o600, indent: int | None =
 
     Yields the parsed value (or `default`). Mutate it in place; on a clean exit it is written back
     atomically, under the same lock that produced the read — which is what makes the update safe.
-    To abort without touching the file, raise. `strict=True` turns a corrupt file into `Unreadable`
-    BEFORE the block runs, so a strict caller cannot mint a fresh file over one it
-    couldn't parse. Built ON `lock()` — one flock implementation, and the reentrancy comes along."""
+    To abort without touching the file, raise. Only a MISSING file yields `default`: a file that
+    cannot be read raises `Unreadable` BEFORE the block runs, so no caller can mint a fresh file over
+    it; a corrupt one is first moved to `<path>.corrupt.<unix-ts>` (the next transaction starts
+    fresh). `strict` is accepted for old callers and changes nothing here. Built ON `lock()` — one
+    flock implementation, and the reentrancy comes along."""
     with lock(path):
-        data = read(path, default, strict=strict)
+        try:
+            data = read(path, default, strict=True)
+        except Unreadable as e:
+            if not isinstance(e.__cause__, OSError):
+                import time
+                aside = f"{path}.corrupt.{int(time.time())}"
+                os.replace(path, aside)
+                os.utime(aside)  # retention ages the copy from when it was set aside
+            raise
         yield data
         write_atomic(path, data, mode=mode, indent=indent)

@@ -94,6 +94,37 @@ for (const acceptance of ['rejected','unknown'] as const) test(`${acceptance} de
   } finally {await run.close();await f.cleanup();}
 });
 
+
+test('scheduled catch-up keeps same-day journal conversation across retries and restart',async t=>{
+  const f=await fixture();
+  t.mock.timers.enable({apis:['Date'],now:Date.UTC(2026,8,2,1)});
+  let run=await f.start();
+  try {
+    f.answer='Yesterday reply BRAVO.';
+    await run.app.receive(inbound('1','Yesterday detail ALPHA.'));
+    t.mock.timers.setTime(Date.UTC(2026,8,2,8));
+    f.answer='Morning brief CHARLIE.';
+    await run.app.receive(inbound('2','Give me the morning brief DELTA.'));
+    t.mock.timers.setTime(Date.UTC(2026,8,2,9));
+    const port=await run.app.listen();
+    const rotate=async()=>fetch('http://127.0.0.1:'+port+'/v1/sessions',{method:'POST',
+      headers:{authorization:'Bearer fixture-only-bearer-for-local-tests-000','content-type':'application/json'},
+      body:JSON.stringify({action:'rotate',before:'2026-09-02T03:30:00Z'})});
+    const first=await rotate();
+    assert.equal(first.status,200,'receiver can send the original sweep cutoff');
+    assert.deepEqual(await first.json(),{rotated:true,count:1});
+    const retry=await rotate();
+    assert.deepEqual(await retry.json(),{rotated:true,count:0},'retrying the same cutoff leaves the replacement session intact');
+    await run.close();run=await f.start();
+    assert.equal(f.posts.length,2,'rebuilding memory never resends a brief');
+    f.answer='Here is the next step.';
+    await run.app.receive(inbound('3','What should I prioritize?'));
+    const prompt=f.prompts.at(-1)!;
+    assert.ok(prompt.includes('CHARLIE')&&prompt.includes('DELTA'),'same-day accepted conversation survives');
+    assert.equal(prompt.includes('ALPHA')||prompt.includes('BRAVO'),false,'pre-sweep conversation is retired');
+  } finally {await run.close();await f.cleanup();}
+});
+
 test('accepted projection repairs after restart without another send or duplicate native messages',async()=>{
   const f=await fixture();let run=await f.start();
   try {

@@ -52,4 +52,6 @@ docker run --rm \
     "$image" -ceu '\
         python3 -I -B /tmp/sotto-fixture/hermes-retirement-check.py; \
         python3 -I -B /tmp/sotto-fixture/package-runtime-smoke.py; \
+        python3 -I -B /tmp/sotto-fixture/requested-prep-smoke.py offer; \
+        python3 -I -B /tmp/sotto-fixture/requested-prep-smoke.py direct; \
         node /tmp/sotto-fixture/activation-image-contract.mjs'

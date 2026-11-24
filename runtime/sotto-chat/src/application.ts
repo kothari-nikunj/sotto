@@ -1,3 +1,4 @@
+import type {GatewayEvent} from './channels/gateway.js';
 import {projectTaskToolDiagnostics, type TaskToolDiagnosticBatch} from './agent/tool-diagnostics.js';
 import {projectConversationContext} from './background-context.js';
 import type {OwnerBridgeSendClient} from './tools/owner-bridge-send-client.js';
@@ -59,7 +60,7 @@ export interface ApplicationCloseOptions { retainOwnership?: boolean }
 export interface ApplicationAgent extends UnattendedAgent {
   projectConversation?(input: ConversationMemoryProjection): Promise<ConversationMemoryResult>;
   generateChat(request: ModelRequest): Promise<{ text: string; sourceRevision?: string }>;
-  canDeliverReplySource?(revision?: string): Promise<boolean>;
+  canDeliverReplySource?(revision?: string, reportChange?: boolean): Promise<boolean>;
   rotateThread(threadId: string): Promise<void>;
   purgeThreadsBefore(before: Date): Promise<number>;
 }
@@ -209,12 +210,21 @@ export async function startApplication(
       const threads = thread ? [thread] : boundThread() ? [boundThread()!] : [];
       for (const providerThread of threads) await projection.sync(providerThread);
     };
-    const rotateThread = async (providerThread: string, throughEventId?: string) => {
+    const rotateThread = async (providerThread: string, throughEventId?: string, before?: number) => {
       const rotate = async () => {
         const row = db.prepare('SELECT memory_thread FROM memory_sessions WHERE provider_thread=?').get(providerThread);
         if (row) await dependencies.agent.rotateThread(String(row.memory_thread));
-        projection?.rotate(providerThread, throughEventId);
-        db.prepare('DELETE FROM memory_sessions WHERE provider_thread=?').run(providerThread);
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          projection?.rotate(providerThread, throughEventId, before);
+          if (before === undefined) db.prepare('DELETE FROM memory_sessions WHERE provider_thread=?').run(providerThread);
+          else {
+            const id = hash([identity, providerThread, randomUUID()]);
+            db.prepare('UPDATE memory_sessions SET memory_thread=?, created_at=? WHERE provider_thread=?')
+              .run(id, before, providerThread);
+          }
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
       };
       await (projection ? projection.exclusive(rotate) : rotate());
     };
@@ -278,7 +288,7 @@ export async function startApplication(
           historyInputIds:projection?.currentInputIds(request.threadId, request.messages.map(message => message.eventId)),
         });
       } },
-      canPostPrepared: revision => dependencies.agent.canDeliverReplySource?.(revision) ?? Promise.resolve(true),
+      canPostPrepared: (revision,reportChange) => dependencies.agent.canDeliverReplySource?.(revision,reportChange) ?? Promise.resolve(true),
       postPrepared: async request => {
         if (request.destination !== options.target) return { acceptance: 'not_attempted' };
         const thread = boundThread();
@@ -289,9 +299,10 @@ export async function startApplication(
       },
       rotateSession: rotateThread,
     });
-    const rotateSessions = async (): Promise<{ rotated: true; count: number }> => coordinator.exclusive(async () => {
-      const rows = db.prepare('SELECT provider_thread FROM memory_sessions').all();
-      for (const row of rows) await rotateThread(String(row.provider_thread));
+    const rotateSessions = async (before?: number): Promise<{ rotated: true; count: number }> => coordinator.exclusive(async () => {
+      const rows = before === undefined ? db.prepare('SELECT provider_thread FROM memory_sessions').all()
+        : db.prepare('SELECT provider_thread FROM memory_sessions WHERE created_at<?').all(before);
+      for (const row of rows) await rotateThread(String(row.provider_thread), undefined, before);
       return { rotated: true, count: rows.length };
     });
     await coordinator.recover();
@@ -313,7 +324,7 @@ export async function startApplication(
       delivery, agent: unattendedAgent, allowedSkills: options.allowedSkills ?? new Set(),
       sessions: { execute: async request => {
         if (request.action === 'list') return { sessions: db.prepare('SELECT memory_thread AS id, created_at FROM memory_sessions').all() };
-        if (request.action === 'rotate') return rotateSessions();
+        if (request.action === 'rotate') return rotateSessions(request.before === undefined ? undefined : Date.parse(request.before));
         return coordinator.exclusive(async () => {
           return { purged: await dependencies.agent.purgeThreadsBefore(new Date(request.before)) };
         });
@@ -393,7 +404,7 @@ export async function startApplication(
       listen,
       rotateSessions,
       /** Synchronous admission happens before the returned turn promise yields. */
-      receive(inbound: Inbound, provider?: { threadId: string; sentAtMs?: number }) {
+      receive(inbound: Inbound, provider?: GatewayEvent) {
         if (closed) return Promise.reject(new Error('Application is closed'));
         const thread = discoverySeed ? provider?.threadId : options.providerThreadId;
         if (!thread || (!discoverySeed && provider && provider.threadId !== thread)) {
@@ -407,7 +418,7 @@ export async function startApplication(
           line_key: discoverySeed.line_key, provider_thread_id: thread,
         }) : undefined;
         const work = coordinator.receive(inbound, { threadId: thread, lineKey: options.lineKey,
-          destination: options.target, activation: candidate }, provider?.sentAtMs);
+          destination: options.target, activation: candidate }, provider?.sentAtMs, provider?.callbackAtMs);
         if (discoverySeed) syncScheduledDestination();
         return work.then(async result => {
           try { await projectConversation(thread); } catch { /* Repaired before the next model turn or on recovery. */ }

@@ -25,21 +25,21 @@ def test_payload_write_failure_releases_claim_and_retry_succeeds(tmp_path, monke
     monkeypatch.setattr(rec, "run_skill", lambda *a: spawned.append(a))
     # This test exercises the normal trigger enqueue path regardless of the wall-clock cron slot.
     monkeypatch.setattr(rec, "_in_brief_cron_window", lambda _skill: False)
-    real_dump = json.dump
+    real_write = rec.CONNECTORS.write_json
     payload_path = os.path.join(
         str(tmp_path), "briefs", "2026-06-23.morning_ready.payload.json")
     failed_payload_write = {"value": False}
 
-    def flaky_dump(obj, fp, **kw):
+    def flaky_write(path, obj, *a, **kw):
         # receiver.py has daemon workers that can write unrelated JSON during the test suite. Fail
-        # the brief payload write itself rather than whichever process-wide json.dump runs first.
+        # the brief payload write itself rather than whichever process-wide write runs first.
         if (not failed_payload_write["value"]
-                and os.path.abspath(fp.name) == os.path.abspath(payload_path)):
+                and os.path.abspath(path) == os.path.abspath(payload_path)):
             failed_payload_write["value"] = True
             raise OSError("disk full")
-        return real_dump(obj, fp, **kw)
+        return real_write(path, obj, *a, **kw)
 
-    monkeypatch.setattr(rec.json, "dump", flaky_dump)
+    monkeypatch.setattr(rec.CONNECTORS, "write_json", flaky_write)
     code, r = rec.handle_trigger({"type": "morning_ready", "date": "2026-06-23", "local_data": {}})
     assert failed_payload_write["value"], (
         f"the injected failure must hit the brief payload write; got {code}: {r}")

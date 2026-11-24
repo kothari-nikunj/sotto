@@ -1,27 +1,15 @@
 """digest_check.py — the adaptive midday digest gate: threshold, dedup/order/cap, stamp window."""
-import hashlib
 import importlib.util
 import json
 import os
 import pytest
 from datetime import datetime, timedelta, timezone
 
-HERE = os.path.dirname(__file__)
-ROOT = os.path.join(HERE, "..")
+from digest_fixture import NOW, _entry, _excerpt, _proactive_entry, _write_queue
 
-spec = importlib.util.spec_from_file_location(
-    "dc", os.path.join(ROOT, "event-triage", "scripts", "digest_check.py"))
-dc = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(dc)
+import digest_check as dc
 
-NOW = datetime(2026, 8, 6, 12, 30, tzinfo=timezone.utc)
-
-
-def _entry(i, sender="Sarah Chen", cls="ambient", minutes_ago=0, text=None):
-    ts = (NOW - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"ts": ts, "verdict_class": cls, "sender": sender,
-            "event": {"source": "imessage", "rowid": i, "handle": "+1" + str(int(hashlib.sha256(sender.encode()).hexdigest()[:10], 16))[-10:],
-                      "text": text or f"message {i}"}}
+ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 
 @pytest.fixture(autouse=True)
@@ -32,14 +20,8 @@ def offline_review(monkeypatch):
                  "class": "actionable" if any(m["prior_class"] in dc.ACTIONABLE_CLASSES
                                                for m in c["messages"]) else "ambient",
                  "sender_role": "person",
-                 "why": "fixture's already-established relevance"} for c in conversations]
+                 "why": "fixture's already-established relevance", **_excerpt(c)} for c in conversations]
     monkeypatch.setattr(dc, "review_conversations", review)
-
-
-def _write_queue(tmp_path, entries):
-    d = tmp_path / "events"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "queue.jsonl").write_text("\n".join(json.dumps(e) for e in entries) + "\n")
 
 
 def test_below_threshold_stays_silent(tmp_path, monkeypatch):
@@ -93,7 +75,7 @@ def test_existing_queued_assistant_items_do_not_trigger_or_enter_digest_review(t
     human = _entry(2, sender="Maya's teacher", cls="actionable", text="Please sign Maya's waiver")
     seen = []
     monkeypatch.setattr(dc, "review_conversations", lambda rows: seen.extend(rows) or [
-        {"id": row["id"], "class": "actionable", "why": "human waiver remains open"}
+        {"id": row["id"], "class": "actionable", "why": "human waiver remains open", **_excerpt(row)}
         for row in rows])
     out = dc.check([assistant, human], min_n=1)
     assert out["deliver"] is True
@@ -112,7 +94,7 @@ def test_current_person_and_sender_mutes_exclude_legacy_phone_rows_from_digest(t
     seen = []
     monkeypatch.setattr(dc, "review_conversations", lambda rows: seen.extend(rows) or [
         {"id": row["id"], "class": "actionable", "sender_role": "person",
-         "why": "human waiver remains open"} for row in rows])
+         "why": "human waiver remains open", **_excerpt(row)} for row in rows])
     out = dc.check([poke, instinct, human], min_n=1)
     assert [row["sender"] for row in seen] == ["Maya's teacher"]
     assert [row["sender"] for row in out["items"]] == ["Maya's teacher"]
@@ -135,11 +117,11 @@ def test_a_muted_persons_words_never_reach_the_review_model_or_the_item(tmp_path
         return entry
 
     muted = _group(1, "Poke", "12025550171@s.whatsapp.net", secret, 40)
-    colleague = _group(2, "Maya's teacher", "+14155559999", "Please sign the waiver", 20)
+    colleague = _group(2, "Maya's teacher", "+14155550116", "Please sign the waiver", 20)
     seen = []
     monkeypatch.setattr(dc, "review_conversations", lambda rows: seen.extend(rows) or [
         {"id": row["id"], "class": "actionable", "sender_role": "person",
-         "why": "the waiver is still open"} for row in rows])
+         "why": "the waiver is still open", **_excerpt(row)} for row in rows])
     out = dc.check([muted, colleague], min_n=1)
     assert [row["sender"] for row in seen] == ["Maya's teacher"]
     assert secret not in json.dumps(seen)                  # never shown to the review model
@@ -361,14 +343,6 @@ def test_budget_and_snooze_held_rows_count_as_deferred_actionable(tmp_path, monk
     held = {"budget", "snoozed", "meeting_hold"}
     assert held <= dc.COUNT_CLASSES and held <= dc.ACTIONABLE_CLASSES
 
-def _proactive_entry(kind, title, cls="budget", minutes_ago=10):
-    """A held proactive nudge, exactly as proactive_scan queues it: Sotto's own voice, with the
-    nudge's title standing in for a sender."""
-    ts = (NOW - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"ts": ts, "verdict_class": cls, "sender": title, "held_class": kind,
-            "event": {"source": "proactive", "kind": kind, "key": f"{kind}:1", "text": title}}
-
-
 def test_sottos_own_held_nudges_never_trip_the_heavy_day_gate(tmp_path, monkeypatch):
     """The gate measures "real signals from people you know". A birthday reminder and a tidy-up
     offer are neither — counting them as known senders inflated the threshold with Sotto's own
@@ -490,7 +464,7 @@ def test_relevance_precedes_delivery_cap_and_can_choose_silence(monkeypatch):
     def review(conversations):
         seen.extend(conversations)
         return [{"id": c["id"], "class": "actionable" if c["sender"] == "Person 0" else "ignore",
-                 "why": "Only this invitation remains unanswered"} for c in conversations]
+                 "why": "Only this invitation remains unanswered", **_excerpt(c)} for c in conversations]
     monkeypatch.setattr(dc, "review_conversations", review)
     out = dc.check(entries)
     assert len(seen) == 12  # the old six-item cap must not discard candidates before judgment
@@ -570,7 +544,7 @@ def test_reviewed_urgency_precedes_recency_at_the_cap(monkeypatch):
     entries = [_entry(i, sender=f"Person {i}") for i in range(8)]
     monkeypatch.setattr(dc, "review_conversations", lambda cs: [
         {"id": c["id"], "class": "urgent" if c["sender"] == "Person 0" else "actionable",
-         "why": "current consequence"} for c in cs])
+         "why": "current consequence", **_excerpt(c)} for c in cs])
     out = dc.check(entries)
     assert len(out["items"]) == 6
     assert out["items"][0]["sender"] == "Person 0"  # oldest must not lose to six newer routine asks
@@ -587,7 +561,7 @@ def test_same_display_name_and_matching_time_do_not_merge_distinct_threads(monke
     seen = []
     def review(conversations):
         seen.extend(conversations)
-        return [{'id': c['id'], 'class': 'actionable', 'why': 'separate unanswered invitation'} for c in conversations]
+        return [{'id': c['id'], 'class': 'actionable', 'why': 'separate unanswered invitation', **_excerpt(c)} for c in conversations]
     monkeypatch.setattr(dc, 'review_conversations', review)
     assert len(dc.check([a, b])['items']) == 2
     assert len(seen) == 2 and all(len(c['messages']) == 1 for c in seen)
@@ -629,7 +603,7 @@ def test_single_unreviewed_triage_busy_item_gets_digest_review_after_busy_retry(
                 'https://proxy.example/native/v1beta/models/gemini-3.8-flash:generateContent',
                 429, 'private response', {'X-Sotto-Admission': 'busy'}, None)
         return [{'id': 0, 'class': 'actionable', 'sender_role': 'person',
-                 'why': 'Launch call needs a reply'}]
+                 'why': 'Launch call needs a reply', **_excerpt(conversations[0])}]
     monkeypatch.setattr(dc, 'review_conversations', review)
     first = dc.run_check(NOW)
     assert first['admission_busy'] is True and dc.read_stamp() is None
@@ -647,7 +621,7 @@ def test_unreviewed_triage_busy_item_survives_digest_review_cap(monkeypatch):
     def review(conversations):
         reviewed.extend(conversations)
         return [{'id': row['id'], 'class': 'actionable', 'sender_role': 'person',
-                 'why': 'Needs attention'} for row in conversations]
+                 'why': 'Needs attention', **_excerpt(row)} for row in conversations]
     monkeypatch.setattr(dc, 'review_conversations', review)
     out = dc.check(entries)
     assert out['deliver'] is True
@@ -664,7 +638,7 @@ def test_over_hundred_busy_items_keep_coverage_open_until_remaining_ids_reviewed
     def review(conversations):
         batches.append([row['sender'] for row in conversations])
         return [{'id': row['id'], 'class': 'actionable', 'sender_role': 'person',
-                 'why': 'Needs attention'} for row in conversations]
+                 'why': 'Needs attention', **_excerpt(row)} for row in conversations]
     monkeypatch.setattr(dc, 'review_conversations', review)
     first = dc.run_check(NOW)
     assert first['deliver'] and 'coverage_until' not in first
@@ -689,7 +663,7 @@ def test_provider_failure_preserves_review_window_and_success_can_ack_exact_cuto
     assert dc.run_check(NOW)['retryable'] is True
     assert dc.read_stamp() == before and len(dc.entries_since(before)) == 1
     monkeypatch.setattr(dc, 'review_conversations', lambda cs: [
-        {'id': c['id'], 'class': 'actionable', 'why': 'outstanding waiver'} for c in cs])
+        {'id': c['id'], 'class': 'actionable', 'why': 'outstanding waiver', **_excerpt(c)} for c in cs])
     success = dc.run_check(NOW)
     assert success['deliver'] and dc.read_stamp() == before
     dc.advance_stamp(dc._parse_iso(success['coverage_until']))

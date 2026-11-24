@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { RequestContext } from '@mastra/core/request-context';
+import { executeTool } from './helpers/execute-tool.js';
 import { MockLanguageModelV4 } from 'ai/test';
 import {createTool} from '@mastra/core/tools';
 import {z} from 'zod';
@@ -46,10 +46,8 @@ function fixture(folder: string) {
   const sourceAuthority = {read: async () => state};
   const tools = createOwnerTaskTools({client, journal: () => journal, sourceAuthority});
   const callTool = async (name: keyof typeof tools, input: unknown, request: ModelRequest, overrides: Record<string, unknown> = {}) => {
-    const requestContext = new RequestContext();
-    for (const [key, value] of Object.entries({mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey,
-      sourceRevision: state.revision, allowOwnerTask: request.allowOwnerTask, ...overrides})) requestContext.set(key, value);
-    return tools[name].execute!(input as never, {requestContext, abortSignal: request.signal} as never);
+    return executeTool(tools[name], input, request.signal, {mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey,
+      sourceRevision: state.revision, allowOwnerTask: request.allowOwnerTask, ...overrides});
   };
   return {get journal() {return journal;}, client, calls, tools, sourceAuthority, callTool,
     set loseCreate(value: boolean) {loseCreate = value;}, set hideInspect(value: boolean) {hideInspect = value;},
@@ -317,15 +315,15 @@ test('task add refuses invented contact and identifier before action or receiver
 
 import {resolveManyOwnerTextMatches,namedLoopDescriptionMatches,namedLoopSelection} from '../src/tools/owner-task-tool-contract.js';
 test('possessive completion phrases retain exact asks and reject contradictions or mismatched counts',()=>{
- const items=['Tina’s offer check-in','Shimolee’s family photo plans'].map(name=>({name,correction:name}));
+ const items=['Wren’s offer check-in','Ines’s family photo plans'].map(name=>({name,correction:name}));
  assert.equal(resolveManyOwnerTextMatches(items,items.map(item=>item.name).join(' and ')+' are both done. Close those two.','named_people'),true);
  for(const ending of ['are not done. Close those two.','are both done. Close those three.','might be done. Close those two.','are both done. Leave those two open.'])
   assert.equal(resolveManyOwnerTextMatches(items,items.map(item=>item.name).join(' and ')+' '+ending,'named_people'),false,ending);
- assert.deepEqual(namedLoopSelection(items[0]!.name),{person:'tina',words:['offer','check','in']});
+ assert.deepEqual(namedLoopSelection(items[0]!.name),{person:'wren',words:['offer','check','in']});
  assert.equal(namedLoopDescriptionMatches(items[0]!.name,'Discuss her offer','Schedule the check-in'),true);
  assert.equal(namedLoopDescriptionMatches(items[1]!.name,'Choose dates for family photos'),true);
- assert.equal(namedLoopDescriptionMatches('Tina’s school application','Discuss her offer','Schedule the check-in'),false);
- assert.equal(namedLoopDescriptionMatches('Tina’s plans','Discuss her offer'),false);
+ assert.equal(namedLoopDescriptionMatches('Wren’s school application','Discuss her offer','Schedule the check-in'),false);
+ assert.equal(namedLoopDescriptionMatches('Wren’s plans','Discuss her offer'),false);
  assert.equal(resolveManyOwnerTextMatches(items,'Those two are done','named_people'),false);
 });
 

@@ -12,7 +12,8 @@ nobody who installed Sotto can run is not a retention tool.
 
 Verbs (combine freely; `--all` is every one of them):
 
-    --snapshot    delete knowledge/last_local_snapshot.json, staged brief wake payloads, and
+    --snapshot    delete knowledge/last_local_snapshot.json, the dated archive copies
+                  knowledge/snapshots/*.json, staged brief wake payloads, and
                   resumable brief inputs/artifacts under events/work-inputs/brief-*/
     --caches      delete cache/research_*.json and cache/calendar_today.json — render caches, both
                   rebuilt on the next run
@@ -21,7 +22,8 @@ Verbs (combine freely; `--all` is every one of them):
                   every later line to a file nobody can read
     --receipts    delete events/delivery.jsonl and events/sends.jsonl — the "did it land" and
                   "what did Sotto send" ledgers, plus bounded unresolved-learning diagnostics
-                  and their content-free lock sidecars
+                  and their content-free lock sidecars, and unreadable state files set aside
+                  as `<file>.corrupt.<ts>`
 
 Prints ONE JSON object saying exactly what went, with byte counts, and exits 0 — including when
 there was nothing to do, because "already clean" is a success, not an error.
@@ -70,6 +72,7 @@ def _targets(verbs: set) -> list:
 
     if "snapshot" in verbs:
         add("knowledge/last_local_snapshot.json", "deleted")
+        add("knowledge/snapshots/*.json", "deleted")
         add("briefs/????-??-??.*.payload.json", "deleted")
         add("events/work-inputs/brief-*/*.json", "deleted")
         add("events/work-inputs/brief-*/current/*.json", "deleted")
@@ -83,11 +86,15 @@ def _targets(verbs: set) -> list:
         add("cache/visual-briefs/*/*", "deleted")
     if "logs" in verbs:
         add("logs/compose_brief.log", "truncated")
+        add("logs/mcp-access-????-??-??.jsonl", "deleted")
     if "receipts" in verbs:
         add("events/delivery.jsonl", "deleted")
         add("events/sends.jsonl", "deleted")
         add("events/learning-diagnostics/*.json", "deleted")
         add("events/learning-diagnostics/*.json.lock", "deleted")
+        add("events/loop-checks.json", "deleted")
+        add("*.corrupt.*", "deleted")
+        add("*/*.corrupt.*", "deleted")
     return out
 
 
@@ -171,10 +178,10 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="forget.py",
         description="Delete Sotto's exhaust from $SOTTO_DATA. Never touches the knowledge graph.")
-    p.add_argument("--snapshot", action="store_true", help="raw snapshot and staged brief inputs")
+    p.add_argument("--snapshot", action="store_true", help="raw snapshot, its dated archive copies and staged brief inputs")
     p.add_argument("--caches", action="store_true",
                    help="cache/research_*.json, cache/calendar_today.json")
-    p.add_argument("--logs", action="store_true", help="truncate logs/compose_brief.log")
+    p.add_argument("--logs", action="store_true", help="clear brief diagnostics and assistant access logs")
     p.add_argument("--receipts", action="store_true",
                    help="events/delivery.jsonl, events/sends.jsonl")
     p.add_argument("--all", action="store_true", help="every verb above")

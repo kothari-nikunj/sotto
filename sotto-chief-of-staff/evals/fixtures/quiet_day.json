@@ -13,7 +13,7 @@
   "stub_response": {
     "brief_markdown": "# Your morning brief\n\nQuiet one today. Nothing needs a decision from you.\n\n## Coming up\n- Eng Standup at 9.\n\n## FYI\n- A couple of routine notifications, nothing actionable.",
     "actions": [
-      {"id": "q1", "type": "reply", "channel": "email", "contactName": "Priya Anand", "emailReplyTo": "priya@sotto.com", "emailSubject": "Standup notes"},
+      {"id": "q1", "type": "reply", "channel": "email", "contactName": "Priya Anand", "emailReplyTo": "priya@sotto.test", "emailSubject": "Standup notes"},
       {"id": "q2", "type": "review", "channel": "email", "contactName": "AWS", "emailThreadId": "t-aws"}
     ],
     "extracted_knowledge": {"person_updates": [], "company_updates": []}
@@ -23,13 +23,13 @@
     "first_run": false,
     "window_hours": 24,
     "google": {
-      "userEmail": "you@sotto.com",
+      "userEmail": "you@sotto.test",
       "userTimezone": "+00:00",
       "events": [
-        {"id": "evt-standup", "summary": "Eng Standup", "start": "{{ISO+1h}}", "attendees": [{"email": "you@sotto.com", "displayName": "You", "self": true}, {"email": "priya@sotto.com", "displayName": "Priya Anand"}, {"email": "mara@sotto.com", "displayName": "Mara Diaz"}]}
+        {"id": "evt-standup", "summary": "Eng Standup", "start": "{{ISO+1h}}", "attendees": [{"email": "you@sotto.test", "displayName": "You", "self": true}, {"email": "priya@sotto.test", "displayName": "Priya Anand"}, {"email": "mara@sotto.test", "displayName": "Mara Diaz"}]}
       ],
       "emails": [
-        {"from": "Priya Anand <priya@sotto.com>", "subject": "Standup notes", "snippet": "Notes from yesterday's standup.", "body": "Quick standup notes: nothing blocking, QA on track for Thursday.", "date": "{{ISO-3h}}", "threadId": "t-standup", "labelIds": ["INBOX"]},
+        {"from": "Priya Anand <priya@sotto.test>", "subject": "Standup notes", "snippet": "Notes from yesterday's standup.", "body": "Quick standup notes: nothing blocking, QA on track for Thursday.", "date": "{{ISO-3h}}", "threadId": "t-standup", "labelIds": ["INBOX"]},
         {"from": "AWS <no-reply@amazon.com>", "subject": "Your March bill", "snippet": "Your bill is ready.", "body": "Your AWS bill for March is now available.", "date": "{{ISO-5h}}", "threadId": "t-aws", "labelIds": ["INBOX", "CATEGORY_UPDATES"]},
         {"from": "Notion <team@makenotion.com>", "subject": "Weekly digest", "snippet": "Workspace activity.", "body": "Here is what happened in your workspace this week.", "date": "{{ISO-7h}}", "threadId": "t-notion", "labelIds": ["INBOX", "CATEGORY_UPDATES"]}
       ]
@@ -40,7 +40,7 @@
       "window_hours": 24,
       "source_status": {"imessage": "ok", "whatsapp": "ok"},
       "contacts": [
-        {"name": "Priya Anand", "emails": ["priya@sotto.com"], "phones": ["+14155550123"]}
+        {"name": "Priya Anand", "emails": ["priya@sotto.test"], "phones": ["+14155550123"]}
       ],
       "imessage": [],
       "whatsapp": [],

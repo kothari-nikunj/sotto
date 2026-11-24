@@ -24,11 +24,11 @@ const grpcPackage = await resolvedPackage('@grpc/grpc-js', pathToFileURL(advance
 const grpcFromNiceGrpc = await resolvedPackage('@grpc/grpc-js', pathToFileURL(join(dirname(niceGrpcPackage.path), 'index.js')));
 assert.equal(await realpath(grpcFromNiceGrpc.path), await realpath(grpcPackage.path),
   'nice-grpc and Advanced iMessage resolve the same grpc-js package');
-assert.equal(advancedFromSpectrum.path, advancedRootPackage.path, 'Spectrum12 shares Advanced2.4');
-assert.equal(advancedRootPackage.version, '2.4.0');
+assert.equal(advancedFromSpectrum.path, advancedRootPackage.path, 'Spectrum12 shares Advanced2.5');
+assert.equal(advancedRootPackage.version, '2.5.0');
 assert.deepEqual(
   { spectrum: spectrumPackage.version, advanced: advancedFromSpectrum.version, niceGrpc: niceGrpcPackage.version, grpc: grpcPackage.version },
-  { spectrum: '12.14.0', advanced: '2.4.0', niceGrpc: '2.1.18', grpc: '1.14.6' },
+  { spectrum: '12.16.0', advanced: '2.5.0', niceGrpc: '2.2.0', grpc: '1.14.7' },
   'the observed RPC contract is tied to the actual installed transport dependency chain',
 );
 await assertBaseAwareResolution();

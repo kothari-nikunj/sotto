@@ -16,7 +16,7 @@ def test_company_lookup_failure_disclosed_and_person_not_fresh(tmp_path, monkeyp
     result = pp.persist(FOCUS_RESEARCH)
     assert "company lookup unavailable" in result.get("error", "")
     assert result["complete"] is False
-    assert not pp.profile_is_fresh("spencer", "spencer@commenda.io")
+    assert not pp.profile_is_fresh("rowan", "rowan@larkspur.example")
 
 
 def test_company_write_failure_receipt_and_replay(tmp_path, monkeypatch):
@@ -28,11 +28,11 @@ def test_company_write_failure_receipt_and_replay(tmp_path, monkeypatch):
     result = pp.persist(FOCUS_RESEARCH)
     assert result["persisted"] == 1
     assert result["complete"] is False and result["companies"] == []
-    assert not pp.profile_is_fresh("spencer", "spencer@commenda.io")
+    assert not pp.profile_is_fresh("rowan", "rowan@larkspur.example")
     monkeypatch.setattr(ku, "_write_company", writer)
     result = pp.persist(FOCUS_RESEARCH)
-    assert result["complete"] is True and result["companies"] == ["Commenda"]
-    assert pp.profile_is_fresh("spencer", "spencer@commenda.io")
+    assert result["complete"] is True and result["companies"] == ["Larkspur"]
+    assert pp.profile_is_fresh("rowan", "rowan@larkspur.example")
 
 
 def test_owner_bio_correction_invalidates_typed_identity_and_survives_research(tmp_path, monkeypatch):
@@ -78,7 +78,7 @@ def test_partial_retry_skips_saved_company_and_rejects_changed_input_receipt(tmp
         return writer(payload)
     monkeypatch.setattr(ku, 'apply', fail_person)
     receipt = pp.persist(FOCUS_RESEARCH)
-    assert not receipt['complete'] and receipt['companies'] == ['Commenda']
+    assert not receipt['complete'] and receipt['companies'] == ['Larkspur']
     def track(payload):
         writes.append(payload)
         return writer(payload)
@@ -172,21 +172,21 @@ def test_company_failure_withholds_coverage_then_retry_stamps_protected_person(t
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     old = datetime.now(timezone.utc) - timedelta(days=40)
     pp.persist(FOCUS_RESEARCH, now=old)
-    path, person = _person(tmp_path, 'spencer', 'spencer@commenda.io')
+    path, person = _person(tmp_path, 'rowan', 'rowan@larkspur.example')
     edit = _load('protected_retry_edit', '_shared/knowledge/knowledge_edit.py')
-    edit.op_correct(os.path.basename(path)[:-3], next(iter(person.facts)), 'Spencer is CTO, not CEO.')
+    edit.op_correct(os.path.basename(path)[:-3], next(iter(person.facts)), 'Rowan is CTO, not CEO.')
     writer = ku._write_company
     def fail(*args, **kwargs):
         raise OSError('fixture company write failed')
     monkeypatch.setattr(ku, '_write_company', fail)
     receipt = pp.persist(FOCUS_RESEARCH)
     assert not receipt['complete'] and not receipt['outcomes']['people'][0]['fresh']
-    assert not pp.profile_is_fresh('spencer', 'spencer@commenda.io')
+    assert not pp.profile_is_fresh('rowan', 'rowan@larkspur.example')
     monkeypatch.setattr(ku, '_write_company', writer)
     result = pp.persist(FOCUS_RESEARCH, previous_receipt=receipt)
     assert result['complete'] and result['outcomes']['people'][0]['fresh']
     assert result['persisted'] == 0
-    assert pp.profile_is_fresh('spencer', 'spencer@commenda.io')
+    assert pp.profile_is_fresh('rowan', 'rowan@larkspur.example')
 
 
 def test_low_overlap_owner_correction_is_traced_research_coverage(tmp_path, monkeypatch):

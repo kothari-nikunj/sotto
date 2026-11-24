@@ -11,7 +11,10 @@ import { startApplication, type ApplicationOptions } from '../src/application.js
 import { photonProjectFingerprint } from '../src/activation.js';
 import { loadRuntimeConfig } from '../src/bootstrap/config.js';
 import { configuredChannelIdentityForConfig } from '../src/configured-identity.js';
-import { readBriefDetail } from '../src/agent/brief-detail.js';
+import { MockLanguageModelV4 } from 'ai/test';
+import { createSottoAgentRuntime } from '../src/agent/runtime.js';
+import { createBriefDetailTool, readBriefDetail } from '../src/agent/brief-detail.js';
+import type { ModelRequest } from '../src/conversation.js';
 import { routeDigest } from '../src/route-proof.js';
 
 const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -19,7 +22,8 @@ const child = join(sourceRoot, 'runtime/sotto-chat/test/brief-gallery-chain-chil
 const python = process.env.PYTHON || (existsSync(join(sourceRoot, '.venv/bin/python'))
   ? join(sourceRoot, '.venv/bin/python') : 'python3');
 
-test('saved brief uses receiver-private PNG bytes, actual Node acceptance and current route to permit typed read',
+for (const order of ['receipt', 'provider_history'] as const) {
+test(`saved gallery uses accepted receipt and exact detail before drafting: ${order}`,
   { timeout: 90_000 }, async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sotto-brief-gallery-chain-'));
     const data = join(directory, 'receiver');
@@ -46,13 +50,32 @@ test('saved brief uses receiver-private PNG bytes, actual Node acceptance and cu
         owner_id: owner, account_id: raw.owner.accountId, line_key: raw.lineKey,
         provider_thread_id: thread } };
     const media: Array<{ threadId: string; summary: string; hashes: string[] }> = [];
-    const dependencies = { agent: { generateChat: async () => ({ text: '' }),
+    const turns: ModelRequest[] = [];
+    let gallerySentAtMs = 0;
+    let historyReads = 0;
+    let runtime: ReturnType<typeof createSottoAgentRuntime> | undefined;
+    let generateDraft = false;
+    const answers: string[] = [];
+    const dependencies = { agent: { generateChat: async (turn: ModelRequest) => {
+      turns.push(turn);
+      return generateDraft ? runtime!.generateChat(turn) : { text: '' };
+    },
       generateUnattended: async () => ({ text: '' }), rotateThread: async () => {},
       purgeThreadsBefore: async () => 0 },
+    resolvePrepContinuation: async () => {
+      historyReads++;
+      return {messageId:'offline-parent-guid',sentAtMs:gallerySentAtMs};
+    },
     transport: { send: async (request: { threadId: string; text?: string; media?: Array<{ data?: Buffer }> }) => {
-      if (request.media) media.push({ threadId: request.threadId, summary: request.text!,
-        hashes: request.media.map(item => createHash('sha256').update(item.data!).digest('hex')) });
-      return { acceptance: 'accepted' as const, providerMessageIds: ['offline-parent-guid'] };
+      if (request.media) {
+        gallerySentAtMs = Date.now();
+        media.push({ threadId: request.threadId, summary: request.text!,
+          hashes: request.media.map(item => createHash('sha256').update(item.data!).digest('hex')) });
+        return { acceptance: 'accepted' as const, providerMessageIds: ['offline-parent-guid'],
+          ...(order === 'receipt' ? {providerSentAtMs:gallerySentAtMs} : {}) };
+      }
+      answers.push(request.text!);
+      return { acceptance: 'accepted' as const, providerMessageIds: [`answer-${answers.length}`] };
     } } };
     let app: Awaited<ReturnType<typeof startApplication>> | undefined;
     let proc: ReturnType<typeof spawn> | undefined;
@@ -77,7 +100,7 @@ test('saved brief uses receiver-private PNG bytes, actual Node acceptance and cu
       let stdout = '';
       proc.stdout!.setEncoding('utf8');
       const ready = await new Promise<{ url: string; bearer: string; artifact: string;
-        route_digest: string; payload_hash: string; image_hashes: string[]; revision: string }>((resolveReady, reject) => {
+        route_digest: string; payload_hash: string; dispatch_id: string; image_hashes: string[]; revision: string }>((resolveReady, reject) => {
         const timer = setTimeout(() => reject(new Error(`brief chain child timed out: ${stderr}`)), 40_000);
         proc!.stdout!.on('data', chunk => {
           stdout += String(chunk);
@@ -102,14 +125,73 @@ test('saved brief uses receiver-private PNG bytes, actual Node acceptance and cu
       })).digest('hex'));
       const sourceAuthority = { read: async () => ({ version: 2 as const, complete: true,
         revision: ready.revision, google_sources: [], bridge_sources: [] }) };
+      const reads: unknown[] = [];
       const tool = { bridgeUrl: ready.url, readBearer: ready.bearer, sourceAuthority };
-      const result = await readBriefDetail(tool, { latest: true, offset: 0, limit: 80 }, ready.revision);
+      const detail = createBriefDetailTool({ ...tool, fetch: async (url, init) => {
+        reads.push(JSON.parse(String(init?.body)));
+        return fetch(url, init);
+      } });
+      const draft = 'Jordan, thanks for inviting me to lunch on Thursday.';
+      const usage = {inputTokens:{total:1,noCache:1,cacheRead:0,cacheWrite:0},outputTokens:{total:1,text:1,reasoning:0}};
+      let step = 0;
+      const model = new MockLanguageModelV4({doGenerate: async request => {
+        const prompt = JSON.stringify(request.prompt);
+        if (step++ === 0) {
+          assert.match(prompt, /A photo brief immediately precedes this message/);
+          assert.ok(!prompt.includes('I can draft a reply'));
+          return {content:[{type:'tool-call',toolCallId:'gallery-detail',toolName:'accepted_brief_detail',
+            input:JSON.stringify({current_gallery:true,offset:0,limit:4000})}],
+            finishReason:{unified:'tool-calls',raw:'STOP'},usage,warnings:[]};
+        }
+        if (step === 2) {
+          assert.match(prompt, /I can draft a reply[.]/);
+          assert.ok(prompt.includes(ready.artifact));
+          return {content:[{type:'tool-call',toolCallId:'draft-skill',toolName:'skill',
+            input:JSON.stringify({name:'sotto-draft-reply'})}],
+            finishReason:{unified:'tool-calls',raw:'STOP'},usage,warnings:[]};
+        }
+        assert.match(prompt, /Sotto — Draft a Reply/);
+        return {content:[{type:'text',text:draft}],finishReason:{unified:'stop',raw:'STOP'},usage,warnings:[]};
+      }});
+      runtime = createSottoAgentRuntime({model,storagePath:join(directory,'model.db'),instructions:'Offline gallery fixture.',
+        skillPaths:[join(sourceRoot,'sotto-chief-of-staff/draft-reply/SKILL.md')],
+        sourceAuthority,chatTools:()=>({accepted_brief_detail:detail})});
+      generateDraft = true;
+      assert.ok(!media[0].summary.includes('I can draft a reply'));
+      const agreement = order === 'receipt' ? 'yes' : 'Sounds good';
+      await app.receive({ channel: 'photon', eventId: 'owner-gallery-yes',
+        accountId: raw.owner.accountId, senderId: owner, isDirect: true, text: agreement },
+        { threadId: thread, sentAtMs: gallerySentAtMs + 1 });
+      const continuation = turns.at(-1);
+      assert.equal(continuation?.text, agreement);
+      assert.ok('acceptedGalleryContext' in continuation, 'yes should select the exact accepted gallery receipt');
+      const galleryReceipt = {dispatch_id:ready.dispatch_id,message_id:'offline-parent-guid',payload_hash:ready.payload_hash};
+      assert.deepEqual(continuation.acceptedGalleryContext, galleryReceipt);
+      assert.deepEqual(reads, [{gallery_receipt:galleryReceipt,offset:0,limit:4000}]);
+      assert.deepEqual(answers, [draft]);
+      assert.equal(step, 3);
+      assert.equal(historyReads, order === 'receipt' ? 0 : 1);
+      generateDraft = false;
+      await app.receive({ channel:'photon',eventId:'owner-after-draft-yes',
+        accountId:raw.owner.accountId,senderId:owner,isDirect:true,text:'yes' },
+        {threadId:thread,sentAtMs:gallerySentAtMs+2});
+      const later = turns.at(-1);
+      assert.equal(later?.text, 'yes');
+      assert.ok(later && (!('acceptedGalleryContext' in later) || !later.acceptedGalleryContext),
+        'an intervening accepted response fences the old gallery');
+      assert.deepEqual(await readBriefDetail(tool, {gallery_receipt:{...galleryReceipt,payload_hash:'0'.repeat(64)},
+        offset:0,limit:80}, ready.revision), {status:'withheld',coverage:'accepted_artifacts_only'});
+
+      const result = await readBriefDetail(tool, { latest: true, offset: 0, limit: 4000 }, ready.revision);
       assert.equal(result.status, 'found');
       if (result.status !== 'found') throw new Error('accepted brief withheld');
       assert.equal(result.id, ready.artifact);
       assert.match(result.text, /Good morning/);
+      assert.match(result.text, /I can draft a reply[.]/);
       assert.equal(JSON.stringify(result).includes(ready.payload_hash), false);
       await writeFile(join(directory, 'revoked'), 'off');
+      assert.deepEqual(await readBriefDetail(tool, {gallery_receipt:galleryReceipt,offset:0,limit:80}, ready.revision),
+        {status:'withheld',coverage:'accepted_artifacts_only'});
       assert.deepEqual(await readBriefDetail(tool, { latest: true, offset: 0, limit: 80 }, ready.revision),
         { status: 'withheld', coverage: 'accepted_artifacts_only' });
     } finally {
@@ -119,6 +201,8 @@ test('saved brief uses receiver-private PNG bytes, actual Node acceptance and cu
         try { assert.equal(await closed, 0); } finally { clearTimeout(timeout); }
       }
       await app?.close();
+      await runtime?.close();
       await rm(directory, { recursive: true, force: true });
     }
   });
+}

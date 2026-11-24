@@ -187,6 +187,7 @@ block; the helper writes `SOTTO_TIMEZONE` and the explicit/default-off
 |---|---|---|
 | *(internal — do not set)* `SOTTO_CAPTURED_SOURCES` · `SOTTO_PROACTIVE_CAPTURED_SOURCES` | set by the receiver on one child run: the JSON list of sources the owner had granted when an attended live read (Granola history, triage queue) or a proactive run started, so that child reads only those. | — |
 | *(internal — do not set)* `SOTTO_SKILL_COMPOSITION_PROOF` | set by the receiver on a meeting-prep, ask-research, follow-up, relationship-pulse or proactive skill run: the source-revision proof the child rechecks before it acts. | — |
+| *(internal — do not set)* `SOTTO_BRIEF_FEEDBACK_PROOF` | The receiver supplies the current source revision and delivery route to a morning or evening brief for lookup of rated Gmail notifications. | — |
 | *(internal — do not set)* `SOTTO_READ_ONLY` | `1` on an attended read child: knowledge queries then never repair or write the graph. | — |
 | *(internal — do not set)* `SOTTO_SETUP_LOG_FD` | the supervisor's one-use descriptor for the receiver's private setup-link boot line. Removed and closed before worker threads start; ordinary receiver/Node output stays suppressed. | — |
 | *(internal — do not set)* `SOTTO_UNATTENDED` | `1` on every skill run the receiver spawns — the seam `google_action.py`'s send gate reads. | — |
@@ -221,6 +222,7 @@ passes them to the receiver, so on the supervised image each one is fixed at the
 | `SOTTO_DIGEST_MIN` | `8` queued **signals from people you know** before the 12:30 midday digest delivers; below it the digest stays silent. The window starts at the last brief that actually delivered. | fixed (events) |
 | `SOTTO_PROACTIVE` · `SOTTO_DIGEST` · `SOTTO_PROACTIVE_CRON` | on, on, `*/15 * * * *`: the proactive watcher and the midday digest always run on the receiver's schedule. The fixed-five profile refuses any other value. | fixed |
 | `SOTTO_DASHBOARD` · `SOTTO_UPDATE_CHECK` | on: the `/app` dashboard, and the once-a-day "a newer Sotto is published" check (one GET of the repo's `VERSION`; silent on an unstamped build). | fixed |
+| Hosted assistant OAuth | On when the supervisor supplies the verified public domain. The supervised receiver does not accept a host variable to disable it; disconnect individual connections from the dashboard. Direct receiver launches can set `SOTTO_MCP_OAUTH=0` or `SOTTO_DASHBOARD=0` to disable hosted sign-in, and can set `SOTTO_MCP_OAUTH_ORIGIN` to their public HTTPS origin. | fixed |
 | `SOTTO_VISUAL_BRIEFS` | `1`: Photon morning/evening briefs and focused meeting backgrounds use the shared card renderer ([visual briefs](docs/VISUAL-BRIEFS.md)). | fixed |
 | `SOTTO_SETUP_CODE` | unset: the setup code is generated once and persisted at `/data/setup_code`. | fixed |
 | `SOTTO_TRIGGER_TOKEN` | unset: the Bridge wake-push authenticates with the Bridge bearer. | fixed |
@@ -256,7 +258,7 @@ reason a default can't serve). Nothing reads them.
 | `SOTTO_STALE_AGE_DAYS` · `SOTTO_STALE_SURFACED` | `STALE_AGE_DAYS` (4) · `STALE_SURFACED` (3) |
 | `SOTTO_RESEARCH_RECENCY_DAYS` | `DEFAULT_RECENCY_DAYS` (90) |
 | `SOTTO_PREWARM_MAX` | `MAX_PREWARM` (12) |
-| `SOTTO_RESEARCH_CONCURRENCY` | `RESEARCH_CONCURRENCY` (5) |
+| `SOTTO_RESEARCH_CONCURRENCY` | `MAX_CONCURRENCY` (5) |
 
 ## Staying updated
 

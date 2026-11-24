@@ -292,7 +292,7 @@ def test_recency_sweep_and_company_fallback_join_into_context():
     inputs = {"google": {"userEmail": "me@myco.com",
                          "events": [_event("Coffee with Taylor", _soon(), [
                              {"email": "taylor@startup.com", "displayName": "Taylor Reed"},
-                             {"email": "nelson@cobalt-research.com", "displayName": "Nelson"}])]},
+                             {"email": "nelson@cobalt-research.example", "displayName": "Nelson"}])]},
               "attendee_research": [
                   {"email": "taylor@startup.com", "title": "CEO", "company": "Startup Inc",
                    "relevance": [], "summary": "CEO of Startup Inc.",
@@ -301,7 +301,7 @@ def test_recency_sweep_and_company_fallback_join_into_context():
                    "personal": ["Ran the SF Marathon (https://x.com/t/1)"],
                    # A stale cache row may still carry a hook; the context must not resurrect it.
                    "conversation_hooks": ["His agent-memory piece last week fits your roadmap."]},
-                  {"email": "nelson@cobalt-research.com", "title": None, "company": "Cobalt Research",
+                  {"email": "nelson@cobalt-research.example", "title": None, "company": "Cobalt Research",
                    "relevance": [], "summary": "No public profile found.",
                    "company_summary": "Cobalt Research does battery-materials analytics."}]}
     ctx, _ = mp.build_context(inputs)
@@ -364,13 +364,13 @@ def test_text_lines_matched_via_contact_index_phone_bridge(monkeypatch):
     inputs = _taylor_inputs(
         prior_knowledge={"person_knowledge": {},
                          "contact_index": [{"canonical_id": "c1", "display_name": "Taylor Reed",
-                                            "identifiers": ["taylor@startup.com", "+14155551234"]}]},
+                                            "identifiers": ["taylor@startup.com", "+14155550107"]}]},
         local={"imessage": [
-            {"handle": "+14155551234", "text": "let's push our coffee to 3pm?",
+            {"handle": "+14155550107", "text": "let's push our coffee to 3pm?",
              "timestamp": "2026-08-05T09:00:00Z", "is_from_me": False},
-            {"handle": "+14155551234", "text": "sure, works", "timestamp": "2026-08-05T09:05:00Z",
+            {"handle": "+14155550107", "text": "sure, works", "timestamp": "2026-08-05T09:05:00Z",
              "is_from_me": True},
-            {"handle": "+14155551234", "text": "old one", "timestamp": "2026-08-01T09:00:00Z",
+            {"handle": "+14155550107", "text": "old one", "timestamp": "2026-08-01T09:00:00Z",
              "is_from_me": False},
             {"handle": "+19998887777", "text": "someone else entirely",
              "timestamp": "2026-08-05T10:00:00Z", "is_from_me": False}]})
@@ -386,7 +386,7 @@ def test_group_chats_and_unmatched_attendees_degrade_silently(monkeypatch):
         {"contact_identifier": "other@person.com", "contact_name": "Someone Else",
          "status": "open", "summary": "unrelated loop"}])
     inputs = _taylor_inputs(local={"imessage": [
-        {"handle": "+14155551234", "text": "group noise", "timestamp": "2026-08-05T09:00:00Z",
+        {"handle": "+14155550107", "text": "group noise", "timestamp": "2026-08-05T09:00:00Z",
          "is_from_me": False, "is_group_chat": True, "chat_guid": "g1"}]})
     ctx, _ = mp.build_context(inputs)
     # No comms file, no contact_index match, foreign loop, group-only texts → zero private lines.
@@ -399,11 +399,11 @@ def test_loop_line_from_continuity_ledger(monkeypatch):
         {"contact_identifier": "taylor@startup.com", "contact_name": "Taylor Reed",
          "status": "open", "summary": "you said you'd send the deck", "times_surfaced": 99,
          "delivery_surface": {"schema": 1, "count": 2, "delivery_keys": ["a", "b"]},
-         "action_type": "follow_up"},
-        {"contact_identifier": "other@x.com", "status": "open", "summary": "unrelated"}])
-    ctx, _ = mp.build_context(_taylor_inputs())
+         "action_type": "follow_up", "anchor_key": "deck"},
+        {"contact_identifier": "other@x.com", "status": "open", "summary": "unrelated", "anchor_key": "x"}])
+    ctx, meetings = mp.build_context(_taylor_inputs())
     assert "loop: open — you said you'd send the deck (surfaced 2x)" in ctx
-    assert "unrelated" not in ctx
+    assert "unrelated" not in ctx and list(meetings[0]["_offered_tasks"]) == ["deck"]
 
 
 def test_granola_line_is_per_attendee_most_recent(monkeypatch):
@@ -433,11 +433,11 @@ def test_private_block_hard_cap_six_lines(monkeypatch):
         attendee_comms={"taylor@startup.com": rows},
         prior_knowledge={"person_knowledge": {},
                          "contact_index": [{"canonical_id": "c1", "display_name": "Taylor Reed",
-                                            "identifiers": ["taylor@startup.com", "+14155551234"]}]},
+                                            "identifiers": ["taylor@startup.com", "+14155550107"]}]},
         local={"granola_meetings": [{"title": "Sync", "date": "2026-07-20", "ai_summary": "notes",
                                      "attendee_emails": ["taylor@startup.com"]}],
                "imessage": [
-                   {"handle": "+14155551234", "text": f"msg {i}",
+                   {"handle": "+14155550107", "text": f"msg {i}",
                     "timestamp": f"2026-08-0{i+1}T09:00:00Z", "is_from_me": False}
                    for i in range(2)]})
     ctx, _ = mp.build_context(inputs)
@@ -452,26 +452,26 @@ def test_private_block_hard_cap_six_lines(monkeypatch):
 # ── Focus mode: one named person → one meeting, the deep dive ──────────────────────────────────
 
 def _two_meetings(**extra):
-    """A Spencer meeting in 2h, a Dana meeting in 6h, a second Spencer meeting in 20h."""
+    """A Rowan meeting in 2h, a Dana meeting in 6h, a second Rowan meeting in 20h."""
     base = {"google": {"userEmail": "me@myco.com", "events": [
-        _event("Coffee with Spencer", _soon(2), [
-            {"email": "spencer@commenda.io", "displayName": "Spencer Kim"}]),
+        _event("Coffee with Rowan", _soon(2), [
+            {"email": "rowan@larkspur.example", "displayName": "Rowan Pike"}]),
         _event("Dana sync", _soon(6), [{"email": "dana@acme.com", "displayName": "Dana Roe"}]),
-        _event("Spencer dinner", _soon(20), [
-            {"email": "spencer@commenda.io", "displayName": "Spencer Kim"}])]}}
+        _event("Rowan dinner", _soon(20), [
+            {"email": "rowan@larkspur.example", "displayName": "Rowan Pike"}])]}}
     base.update(extra)
     return base
 
 
 def test_focus_by_name_selects_that_persons_soonest_meeting(monkeypatch):
     monkeypatch.setattr(mp, "_active_loops", lambda: [])
-    ctx, meetings = mp.build_context(_two_meetings(focus="spencer"))
-    assert [m["title"] for m in meetings] == ["Coffee with Spencer"]     # one meeting, the soonest
+    ctx, meetings = mp.build_context(_two_meetings(focus="rowan"))
+    assert [m["title"] for m in meetings] == ["Coffee with Rowan"]     # one meeting, the soonest
     assert "Dana sync" not in ctx
-    assert ctx.startswith("(FOCUS: deep dive on Spencer Kim <spencer@commenda.io> — "
+    assert ctx.startswith("(FOCUS: deep dive on Rowan Pike <rowan@larkspur.example> — "
                           "the user named this person.")
     assert "matches 2 upcoming meetings; this is the soonest" in ctx     # ambiguity is stated
-    assert mp.focus_mode(_two_meetings(focus="spencer"))
+    assert mp.focus_mode(_two_meetings(focus="rowan"))
 
 
 def test_focus_by_email_and_unambiguous_match_says_nothing_extra(monkeypatch):
@@ -499,9 +499,9 @@ def test_focus_ignores_people_outside_the_window(monkeypatch):
     far = (datetime.now(timezone.utc) + timedelta(hours=200)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     inputs = {"google": {"userEmail": "me@myco.com", "events": [
         _event("Dana sync", _soon(6), [{"email": "dana@acme.com", "displayName": "Dana Roe"}]),
-        _event("Spencer next week", far, [
-            {"email": "spencer@commenda.io", "displayName": "Spencer Kim"}])]},
-        "focus": "spencer"}
+        _event("Rowan next week", far, [
+            {"email": "rowan@larkspur.example", "displayName": "Rowan Pike"}])]},
+        "focus": "rowan"}
     ctx, meetings = mp.build_context(inputs)
     assert not mp.focus_mode(inputs)                                     # beyond 72h → not focusable
     assert [m["title"] for m in meetings] == ["Dana sync"] and "(FOCUS:" not in ctx
@@ -509,18 +509,16 @@ def test_focus_ignores_people_outside_the_window(monkeypatch):
 
 def test_company_deep_renders_only_the_fields_that_exist(monkeypatch):
     monkeypatch.setattr(mp, "_active_loops", lambda: [])
-    inputs = _two_meetings(focus="spencer", attendee_research=[
-        {"email": "spencer@commenda.io", "title": "CEO", "company": "Commenda",
-         "relevance": [], "summary": "Founder of Commenda.",
-         "company_deep": {"company": "Commenda",
+    inputs = _two_meetings(focus="rowan", attendee_research=[
+        {"email": "rowan@larkspur.example", "title": "CEO", "company": "Larkspur",
+         "relevance": [], "summary": "Founder of Larkspur.",
+         "company_deep": {"company": "Larkspur",
                           "builds": ["Global tax filing tied to each payment",
                                      "A compliance dashboard for misclassification"],
-                          "traction": ["Series A led by Ridgeline, June 2026 (https://tc.com/a)"],
                           "market": "Displaces the EOR incumbents after the 2025 reporting change."}}])
     ctx, _ = mp.build_context(inputs)
     assert "    builds: Global tax filing tied to each payment" in ctx
     assert "    builds: A compliance dashboard for misclassification" in ctx
-    assert "    traction: Series A led by Ridgeline, June 2026 (https://tc.com/a)" in ctx
     assert "    market: Displaces the EOR incumbents after the 2025 reporting change." in ctx
     assert "founder:" not in ctx                                         # absent field → no line
 
@@ -540,7 +538,7 @@ def test_compose_picks_the_focused_prompt_variant_only_in_focus_mode(monkeypatch
         seen["prompt"] = prompt
         return json.dumps({"prep_markdown": "x", "meetings": []})
 
-    mp.compose(_two_meetings(focus="spencer"), llm=fake_llm)
+    mp.compose(_two_meetings(focus="rowan"), llm=fake_llm)
     focused = seen["prompt"]
     assert "## Output — FOCUSED PREP (one person, one meeting)" in focused
     assert "Return JSON with exactly these keys" not in focused          # sweep spec replaced
@@ -565,12 +563,10 @@ with open(os.path.join(ROOT, "meeting-prep", "references", "meeting-prep-prompt.
     FOCUSED = _f2.read().split("<!-- FOCUSED PREP — the --focus variant -->", 1)[1]
 
 
-def test_focused_prompt_leads_with_decision_evidence_unknowns_and_questions():
-    assert "**Your thread** — ALWAYS FIRST, ALWAYS PRESENT" in FOCUSED
+def test_focused_prompt_leads_with_evidence_and_questions():
+    assert "**Your thread**" in FOCUSED and "**Unknowns**" not in FOCUSED
     assert "name the decision or unresolved issue first" in FOCUSED
-    assert FOCUSED.index("**Your thread**") < FOCUSED.index("**What <company> builds**")
-    assert (FOCUSED.index("**Your thread**") < FOCUSED.index("**Unknowns**")
-            < FOCUSED.index("**Angles**") < FOCUSED.index("**What <company> builds**"))
+    assert (FOCUSED.index("**Your thread**") < FOCUSED.index("**Angles**") < FOCUSED.index("**What <company> builds**"))
     # The private half never contains web research — that is why it leads.
     assert "no web research belongs in it" in FOCUSED
     assert "Build private history only from" in FOCUSED
@@ -603,12 +599,12 @@ def test_focused_prompt_keeps_the_identity_guards_and_the_focus_line():
 def test_focused_example_is_fictional_and_obeys_the_voice_rules():
     example = FOCUSED.split("### Example — focused prep", 1)[1]
     assert "fictional people and company" in example
-    assert "Larkfield" in example and "Priya Raman" in example
     body = example.split("```")[1]
-    for section in ("**Your thread**", "**What Larkfield builds**", "**The founder**",
-                    "**Traction & signals**", "**The space & why now**", "**Angles**"):
+    for section in ("**Your thread**", "**Angles**"):
         assert section in body
     assert body.index("**Your thread**") < body.index("**Angles**")
+    thread = body.split("**Your thread**", 1)[1].split("**Angles**", 1)[0]
+    assert "https://" in body and "https://" not in thread
     from brief_validate import BANNED_PHRASES        # the ONE list — never a local copy
     for banned in BANNED_PHRASES:
         assert banned not in body.lower()
@@ -631,12 +627,12 @@ def test_prompt_documents_private_context_as_dated_evidence():
     assert "exact identity, direction and recorded date" in PROMPT
 
 
-def test_prompt_requires_your_thread_and_recently_when_present():
+def test_sweep_uses_substantive_threads_and_dated_activity():
     assert "`Your thread:`" in PROMPT
-    assert "REQUIRED when the attendee has any `thread:`/`text:`/`loop:` line" in PROMPT
-    assert "FORBIDDEN when they don't" in PROMPT            # no fabricated stand-ins
+    assert "adds something beyond scheduling logistics" in PROMPT
+    assert "Omit them when the corresponding source lines are absent" in PROMPT            # no fabricated stand-ins
     assert "`Recently:`" in PROMPT
-    assert "REQUIRED when the attendee has a `recent:` line" in PROMPT
+    assert "use a relevant `recent:` line" in PROMPT
     assert "citing its date" in PROMPT
 
 
@@ -676,7 +672,7 @@ def test_filler_talking_points_stripped_and_empty_list_respected(tmp_path):
     try:
         inputs = {"google": {"userEmail": "me@myco.com",
                              "events": [_event("Lunch", _soon(), [
-                                 {"email": "nelson@cobalt-research.com", "displayName": "Nelson"}])]}}
+                                 {"email": "nelson@cobalt-research.example", "displayName": "Nelson"}])]}}
         out = mp.compose(inputs)
         assert out["meetings"][0]["talking_points"] == ["Ask about her Devcon talk on eval harnesses"]
         assert out["meetings"][1]["talking_points"] == []       # empty stays empty
@@ -693,20 +689,19 @@ def _real_research_envelope(monkeypatch):
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     monkeypatch.delenv("SOTTO_LLM_STUB", raising=False)
     monkeypatch.setattr(research, "_research_batch", lambda batch, key: [
-        {"email": a["email"], "title": "CEO", "company": "Commenda",
+        {"email": a["email"], "title": "CEO", "company": "Larkspur",
          "relevance": ["Raising a Series A"],
-         "summary": "Founder and CEO of Commenda, a global tax-filing company."} for a in batch])
+         "summary": "Founder and CEO of Larkspur, a global tax-filing company."} for a in batch])
     monkeypatch.setattr(research, "_deep_batch", lambda *a, **k: [])
     monkeypatch.setattr(research, "_focus_batch",
                         lambda attendee, key: [
         {"email": attendee["email"],
-         "company_deep": {"company": "Commenda",
+         "company_deep": {"company": "Larkspur",
                           "builds": ["Global tax filing tied to each payment"],
                           "founder_story": "Built it after a misfiled quarter.",
-                          "traction": ["Series A led by Ridgeline, June 2026 (https://tc.com/a)"],
                           "market": "Displaces the EOR incumbents."}}])
-    env = research.research([{"name": "Spencer Kim", "email": "spencer@commenda.io"}],
-                         "ctx", focus="spencer")
+    env = research.research([{"name": "Rowan Pike", "email": "rowan@larkspur.example"}],
+                         "ctx", focus="rowan")
     assert isinstance(env, dict) and "attendees" in env      # the envelope, not a bare list
     return env
 
@@ -717,19 +712,19 @@ def test_research_envelope_renders_into_the_prep_context(monkeypatch):
     and company_deep line silently vanished and a 'deep' prep read thin."""
     monkeypatch.setattr(mp, "_active_loops", lambda: [])
     envelope = _real_research_envelope(monkeypatch)
-    inputs = _two_meetings(focus="spencer", attendee_research=envelope)
+    inputs = _two_meetings(focus="rowan", attendee_research=envelope)
     ctx, meetings = mp.build_context(inputs)
-    assert "CEO at Commenda" in ctx
-    assert "research: Founder and CEO of Commenda" in ctx
+    assert "CEO at Larkspur" in ctx
+    assert "research: Founder and CEO of Larkspur" in ctx
     assert "· Raising a Series A" in ctx
     assert "builds: Global tax filing tied to each payment" in ctx
     assert "founder: Built it after a misfiled quarter." in ctx
     assert "market: Displaces the EOR incumbents." in ctx
     assert meetings[0]["attendees"][0]["role"] == "CEO"
-    bare, _ = mp.build_context(_two_meetings(focus="spencer",
+    bare, _ = mp.build_context(_two_meetings(focus="rowan",
                                              attendee_research=envelope["attendees"]))
     assert bare == ctx
-    junk, _ = mp.build_context(_two_meetings(focus="spencer", attendee_research={"junk": 1}))
+    junk, _ = mp.build_context(_two_meetings(focus="rowan", attendee_research={"junk": 1}))
     assert "no public profile or prior knowledge found" in junk
 
 
@@ -739,8 +734,8 @@ def test_cli_reads_the_envelope_file_the_skill_actually_passes(tmp_path, monkeyp
     envelope = _real_research_envelope(monkeypatch)
     cal = tmp_path / "cal.json"
     cal.write_text(json.dumps({"userEmail": "me@myco.com", "events": [
-        _event("Coffee with Spencer", _soon(2),
-               [{"email": "spencer@commenda.io", "displayName": "Spencer Kim"}])]}))
+        _event("Coffee with Rowan", _soon(2),
+               [{"email": "rowan@larkspur.example", "displayName": "Rowan Pike"}])]}))
     research = tmp_path / "research.json"
     research.write_text(json.dumps(envelope))          # the --out file, byte for byte
 
@@ -753,10 +748,10 @@ def test_cli_reads_the_envelope_file_the_skill_actually_passes(tmp_path, monkeyp
     monkeypatch.setattr(mp, "call_gemini", fake_llm)
     monkeypatch.setattr(sys, "argv", [
         "compose_meeting_prep.py", "--calendar", str(cal), "--user-email", "me@myco.com",
-        "--attendee-research", str(research), "--focus", "Spencer Kim"])
+        "--attendee-research", str(research), "--focus", "Rowan Pike"])
     mp.main()
     assert json.loads(capsys.readouterr().out)["prep_markdown"] == "ok"
-    assert "Founder and CEO of Commenda" in seen["prompt"]
+    assert "Founder and CEO of Larkspur" in seen["prompt"]
     assert "builds: Global tax filing tied to each payment" in seen["prompt"]
 
 
@@ -773,15 +768,15 @@ def test_focused_prep_never_appends_the_other_meetings(monkeypatch):
         seen["prompt"] = prompt
         return json.dumps({"prep_markdown": "x", "meetings": []})
 
-    out = mp.compose(_two_meetings(focus="spencer"), llm=fake_llm)
-    assert "Dana sync" not in seen["prompt"] and "Spencer dinner" not in seen["prompt"]
-    assert [m["title"] for m in out["meetings"]] == ["Coffee with Spencer"]
+    out = mp.compose(_two_meetings(focus="rowan"), llm=fake_llm)
+    assert "Dana sync" not in seen["prompt"] and "Rowan dinner" not in seen["prompt"]
+    assert [m["title"] for m in out["meetings"]] == ["Coffee with Rowan"]
     # …and the unfocused sweep still covers the whole calendar ahead.
     out = mp.compose(_two_meetings(), llm=fake_llm)
-    for title in ("Coffee with Spencer", "Dana sync", "Spencer dinner"):
+    for title in ("Coffee with Rowan", "Dana sync", "Rowan dinner"):
         assert title in seen["prompt"]
     assert [m["title"] for m in out["meetings"]] == [
-        "Coffee with Spencer", "Dana sync", "Spencer dinner"]
+        "Coffee with Rowan", "Dana sync", "Rowan dinner"]
 
 
 # ── The trigger contract: depth is the default when ONE meeting is in play ─────────────────────
@@ -866,7 +861,6 @@ def test_exact_prompt_supplies_occurrence_and_focused_schema_to_model(tmp_path, 
         assert 'Copy `event_id` and `start` verbatim' in prompt
         assert 'calendar description (stated meeting purpose, if present): '+event['description'] in prompt
         assert 'Use that attributed context for prep and questions' in prompt
-        assert "I don't have private conversation context available for this prep." in prompt
         assert 'Missing or partial context does not establish first contact or no prior exchange.' in prompt
         return json.dumps({'prep_markdown': 'Discuss the revised September enterprise pricing.',
             'meetings': [{**occurrence, 'event_id': 'different' if wrong else occurrence['event_id'],
@@ -930,13 +924,13 @@ def test_focused_prep_keeps_direct_request_beyond_preview_and_email_cap(monkeypa
     request = 'Background. ' * 60 + 'Please try my profile and send product feedback at https://example.test/project.'
     inputs = _taylor_inputs(focus='Taylor Reed',
         prior_knowledge={'contact_index': [{'display_name': 'Taylor Reed',
-            'identifiers': ['taylor@startup.com', '+14155551234']}]},
+            'identifiers': ['taylor@startup.com', '+14155550107']}]},
         attendee_comms={'taylor@startup.com': [{'subject': f'Calendar invitation {i}'} for i in range(3)]},
         local={'imessage': [
-            {'handle': '+14155551234', 'timestamp': (now-timedelta(hours=2)).isoformat(), 'text': request},
-            {'handle': '+14155551234', 'timestamp': (now-timedelta(hours=1)).isoformat(), 'text': 'Tomorrow works', 'is_from_me': True},
-            {'handle': '+14155551234', 'timestamp': now.isoformat(), 'text': 'See you then'},
-            {'handle': '+14155551234', 'timestamp': now.isoformat(), 'text': 'GROUP SECRET', 'chat_guid': 'group'},
+            {'handle': '+14155550107', 'timestamp': (now-timedelta(hours=2)).isoformat(), 'text': request},
+            {'handle': '+14155550107', 'timestamp': (now-timedelta(hours=1)).isoformat(), 'text': 'Tomorrow works', 'is_from_me': True},
+            {'handle': '+14155550107', 'timestamp': now.isoformat(), 'text': 'See you then'},
+            {'handle': '+14155550107', 'timestamp': now.isoformat(), 'text': 'GROUP SECRET', 'chat_guid': 'group'},
             {'handle': '+19998887777', 'timestamp': now.isoformat(), 'text': 'OTHER PERSON'}]})
     context, _ = mp.build_context(inputs)
     assert request in context and '(you→them): Tomorrow works' in context
@@ -949,9 +943,9 @@ def test_focused_prep_keeps_direct_request_beyond_preview_and_email_cap(monkeypa
 def test_direct_prep_context_requires_exact_link_not_a_unique_display_name(monkeypatch):
     import source_context
     monkeypatch.setattr(source_context, 'allowed', lambda _: True)
-    rows = [{'display_name': 'Taylor Reed', 'identifiers': ['+14155551234']}]
+    rows = [{'display_name': 'Taylor Reed', 'identifiers': ['+14155550107']}]
     inputs = {'prior_knowledge': {'contact_index': rows}, 'local': {'imessage': [
-        {'handle': '+14155551234', 'timestamp': datetime.now(timezone.utc).isoformat(),
+        {'handle': '+14155550107', 'timestamp': datetime.now(timezone.utc).isoformat(),
          'text': 'UNLINKED PRIVATE THREAD'}]}}
     # A same-named contact whose identifiers never include this attendee is another person.
     assert mp.attendee_text_context(inputs, 'taylor@unrelated.example', 'Taylor Reed') == ''
@@ -963,9 +957,9 @@ def test_direct_prep_context_requires_exact_link_not_a_unique_display_name(monke
 def test_direct_prep_context_is_bounded_and_ambiguous_names_do_not_join(monkeypatch):
     import source_context
     monkeypatch.setattr(source_context, 'allowed', lambda _: True)
-    rows = [{'display_name': 'Taylor Reed', 'identifiers': [phone]} for phone in ['+14155551234', '+14155554321']]
+    rows = [{'display_name': 'Taylor Reed', 'identifiers': [phone]} for phone in ['+14155550107', '+14155550113']]
     inputs = {'prior_knowledge': {'contact_index': rows}, 'local': {'imessage': [
-        {'handle': '+14155551234', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'start ' + 'x'*20000 + ' final request'}]}}
+        {'handle': '+14155550107', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'start ' + 'x'*20000 + ' final request'}]}}
     assert mp.attendee_text_context(inputs, 'unlinked@example.test', 'Taylor Reed') == ''
     rows[0]['identifiers'].append('linked@example.test')
     text = mp.attendee_text_context(inputs, 'linked@example.test', 'Taylor Reed')
@@ -1045,18 +1039,21 @@ def test_prep_passes_private_source_limitations_to_writer():
     context, _ = mp.build_context(inputs)
     assert 'Data Source Availability' in context
     assert 'iMessage' in context and 'Gmail' in context
-    assert 'partial' in context.lower()
+    assert 'Partial coverage: Gmail' in context and 'disclose the gap' not in context
+    for focus in (True, False):
+        prompt, _ = mp.build_prompt(mp._load_prompt(focus=focus), inputs)
+        assert 'only when it changes what the user should ask, bring or do' in prompt
 
 
 @pytest.mark.parametrize('focus', [None, 'Taylor Reed'])
-@pytest.mark.parametrize('wrong_identifier', ['other@unrelated.example', '+14155551234', '', 'name-only'])
+@pytest.mark.parametrize('wrong_identifier', ['other@unrelated.example', '+14155550107', '', 'name-only'])
 def test_production_prep_context_never_joins_same_name_with_contradictory_identity(
         tmp_path, monkeypatch, focus, wrong_identifier):
     import source_context
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.setattr(source_context, 'allowed', lambda _: True)
     wrong = {'canonical_id': 'c_wrong', 'display_name': 'Taylor Reed',
-             'identifiers': ['other@unrelated.example', '+14155551234']}
+             'identifiers': ['other@unrelated.example', '+14155550107']}
     monkeypatch.setattr(mp, '_active_loops', lambda: [{
         'contact_identifier': '' if wrong_identifier == 'name-only' else wrong_identifier,
         'canonical_id': '' if wrong_identifier == 'name-only' else 'c_wrong', 'contact_name': 'Taylor Reed',
@@ -1064,7 +1061,7 @@ def test_production_prep_context_never_joins_same_name_with_contradictory_identi
     inputs = _taylor_inputs(prior_knowledge={
         'person_knowledge': {'c_wrong': 'Taylor Reed (c_wrong) | CTO | other@unrelated.example\nOTHER_PERSON_KNOWLEDGE'},
         'contact_index': [wrong]}, local={'imessage': [{
-            'handle': '+14155551234', 'timestamp': datetime.now(timezone.utc).isoformat(),
+            'handle': '+14155550107', 'timestamp': datetime.now(timezone.utc).isoformat(),
             'text': 'OTHER_PERSON_PRIVATE_TEXT'}]})
     if focus:
         inputs['focus'] = focus
@@ -1075,7 +1072,7 @@ def test_production_prep_context_never_joins_same_name_with_contradictory_identi
 
 
 @pytest.mark.parametrize('focus', [None, 'Taylor Reed'])
-@pytest.mark.parametrize('loop_identifier', ['taylor@startup.com', '+14155554321', ''])
+@pytest.mark.parametrize('loop_identifier', ['taylor@startup.com', '+14155550113', ''])
 def test_production_prep_preserves_exact_linked_texts_canonical_knowledge_and_obligations(
         tmp_path, monkeypatch, focus, loop_identifier):
     import source_context
@@ -1092,12 +1089,12 @@ def test_production_prep_preserves_exact_linked_texts_canonical_knowledge_and_ob
             'c_right': 'Taylor Reed (c_right) | CEO\nLINKED_PERSON_KNOWLEDGE'},
         'contact_index': [
             {'canonical_id': 'c_wrong', 'display_name': 'Taylor Reed',
-             'identifiers': ['other@unrelated.example', '+14155551234']},
+             'identifiers': ['other@unrelated.example', '+14155550107']},
             {'canonical_id': 'c_right', 'display_name': 'Taylor Reed',
-             'identifiers': ['taylor@startup.com', '+14155554321']}]},
+             'identifiers': ['taylor@startup.com', '+14155550113']}]},
         local={'imessage': [
-            {'handle': '+14155551234', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'OTHER_PERSON_PRIVATE_TEXT'},
-            {'handle': '+14155554321', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'LINKED_PERSON_PRIVATE_TEXT'}]})
+            {'handle': '+14155550107', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'OTHER_PERSON_PRIVATE_TEXT'},
+            {'handle': '+14155550113', 'timestamp': datetime.now(timezone.utc).isoformat(), 'text': 'LINKED_PERSON_PRIVATE_TEXT'}]})
     if focus:
         inputs['focus'] = focus
     context, meetings = mp.build_context(inputs)
@@ -1180,11 +1177,14 @@ def test_research_source_qualification_reaches_both_prep_modes(monkeypatch):
 def test_qualified_membership_and_literal_source_survive_local_context(monkeypatch):
     monkeypatch.setattr(mp.ledger_io, 'load_entries', lambda: [])
     url = 'https://directory.example.test/contributing-members/sample/?ref=public#member'
-    claim = 'Sample is listed as a contributing member; certification is not established. ' + url
+    sentence = 'Sample (sample.test) is listed as a contributing member; certification is not established.'
     inputs = {'google': {'userEmail': 'owner@example.com', 'events': [
         _event('Sample discussion', _soon(), [{'email': 'dana@sample.test', 'displayName': 'Dana Reed'}])]},
-        'attendee_research': {'attendees': [{'email': 'dana@sample.test', 'summary': claim,
-            'company_deep': {'builds': [claim], 'traction': [claim]}}]}}
+        'attendee_research': {'attendees': [{'email': 'dana@sample.test', 'summary': 'Sample got certified.',
+            'traction_sources': {url: [sentence]}, 'company_summary': 'Sample is certified.',
+            'company_deep': {'company': 'Sample', 'builds': ['Certified for scheduling.'], 'traction': [
+                f'{sentence} ({url})', f'Sample (sample.test) is certified. ({url})']}}]}}
     prompt, meetings = mp.build_prompt(mp._load_prompt(focus=True), inputs)
     assert len(meetings) == 1
-    assert prompt.count(claim) == 3
+    assert f'Source reports "{sentence}" ({url})' in prompt
+    assert all(term not in prompt for term in ('got certified', 'is certified', 'Certified for scheduling'))

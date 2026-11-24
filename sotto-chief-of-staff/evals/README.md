@@ -373,6 +373,13 @@ each event's time. Later outbound replies become context only for later events. 
 inbound timestamps fail the replay instead of guessing an order. The run signature records
 this replay policy; baselines from the previous ordering require reviewed replacement.
 
+Replay cutoff, event ordering and local quiet-hours checks use the same source clock as the live
+funnel: explicit native instants take precedence over display time, and legacy native wall times
+use the configured corpus zone, with UTC as fallback. The `source-instant-before-day-end-compose-v2`
+signature keeps earlier clock-policy baselines separate. Quiet hours use the corpus zone on the
+synthetic replay date. Rebasing across a daylight-saving offset change can shift the local hour
+of an explicit instant. Compare historical quiet-hours behavior on dates with matching offsets.
+
 ## Historical source correction inspection
 
 The synthetic automatic-admission/worker inspection was retired with that dormant runtime.
@@ -406,3 +413,67 @@ commitment inventory, and a usable existing prep offer. The existing `--live` mo
 fixtures and uses its configured native model path; it does not by itself qualify the approved
 proxy configuration, an owner request, provider delivery or a device's presentation. No model
 was called to author or validate this fixture.
+
+### Fictional plan-comments selection replay
+
+`cross_source_plan.py` reuses the Golden Corpus source projection and the production brief
+composer. It starts with a fresh store and supplies cutoff-filtered fictional provider records
+in the composer input format. It captures the actual model input, validated brief and actions,
+source coverage and any typed offer metadata. The cold-runner regression exercises the file
+handoff with a synthetic Bridge payload and stubbed Gmail gather. Neither check contacts
+real Gmail or WhatsApp.
+
+Managed runs seed only the fixture's Gmail, Contacts and WhatsApp grants in the temporary
+store. The revoked arm withholds the WhatsApp grant. No live source permissions or data are
+copied, and the configured model transport remains unchanged.
+
+From `sotto-agent/`, run the primary comparison in distinct, new output files. Leave out
+`--live` for the offline wiring check. Run the held-out `greenhouse` case only after the primary
+comparison. Keep every result, including failures. A failed run records its case, arm, cutoff,
+mode and exception type, then exits with the original error. Error contents are not copied
+into the result. Existing output files are never overwritten or reused for another model call.
+
+```sh
+.venv/bin/python sotto-chief-of-staff/evals/cross_source_plan.py \
+  --case footbridge --arm email-only --live --output /private/path/footbridge-email.json
+.venv/bin/python sotto-chief-of-staff/evals/cross_source_plan.py \
+  --case footbridge --arm combined --live --output /private/path/footbridge-combined.json
+```
+
+The paid run uses the existing native brief configuration and preflight. Direct mode needs
+`GOOGLE_AI_API_KEY`. If the configured route requires a proxy, supply
+`SOTTO_MODEL_PROXY_URL` and `SOTTO_MODEL_PROXY_TOKEN` and keep the configured deployment and
+model settings. Clear `SOTTO_LLM_STUB`. Run only with the operator's approved credentials and
+billing policy. The conversation runner separately requires its existing `--model-config`
+with `modelProxy.origin`, `modelProxy.bearer`, `modelProxy.chatModelId`,
+`modelProxy.nativeMediaModelId` and `instructions`.
+
+Review the primary and held-out briefs as complete outputs:
+
+| Arm | Review label |
+| --- | --- |
+| Email-only and combined | Useful action is one offer to prepare comments on the exact open plan. Missing it counts as a miss even when source coverage failed. A second offer for the irrelevant thread or namesake is noise. |
+| Namesake-only | Keep the message as separate source context and omit any cross-source hint connecting it to the email. |
+| Completed and quiet | Useful silence means no offer for the already answered plan or quiet inbox. |
+| Unavailable and revoked | Inspect coverage separately. Unavailable WhatsApp must be visible as a limitation. Revoked text must stay absent. Neither arm can support a claim about unseen corrections. |
+
+The two comparison arms share one cutoff. Each contact card links an exact email and phone.
+A second card with the same name has different identifiers, and the first contact also has an
+unrelated exchange. The namesake-only control reproduces the original false name join with
+the actual composer. The exact-identity fix keeps both raw sources visible and suppresses
+the false link in the brief's prompt hints. The later linked correction and completed reply are excluded at the
+comparison cutoff. The completed arm moves only the exact sent reply before the cutoff.
+
+These labels require semantic review. Scripted runs supply selections and therefore cannot score
+them. The Golden Corpus's existing nudge and Needs Attention scores do not measure offer quality.
+A typed record is also distinct from ordinary rendered “I can draft a reply” copy. This probe
+ends at composition. It does not generate or send a draft, stage an accepted offer, run a chat
+continuation, or prove the material advantage of the WhatsApp evidence in a draft.
+
+For the follow-on decision, first verify that the actual brief independently selects the work
+in both comparison arms. Then qualify the existing inline offer and Ask path on its actual
+delivered result. Check whether an owner “yes” yields one private draft, whether combined evidence
+materially changes its recommendation, and whether the WhatsApp correction is kept out of
+third-party wording. The later update supplies a fresh-read challenge before drafting.
+Retain failed selections, ambiguous replies, stale drafts and missing coverage. Only an observed
+continuation failure should select which accepted-offer or source reread boundary to extend.

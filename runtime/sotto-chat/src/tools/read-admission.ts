@@ -18,7 +18,6 @@ const matches = (key: MatchRule, text: string) => expressions[key].test(text.nor
 export const readCancelled = (text: string) => matches('denied',
   text.normalize('NFC').replace(courtesy, ''));
 export const ownerReadRequest=(text:string)=>!readCancelled(text)&&!matches('reported',text)&&!matches('personalRecall',text)&&matches('request',text);
-export const contextualReadRequest=(text:string)=>ownerReadRequest(text);
 export const explicitReadReference=(text:string)=>matches('reference',text);
 export function subjectMention(text:string,subject:string): boolean {
   const escaped=subject.normalize('NFC').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
@@ -37,4 +36,4 @@ export function researchTargetAnswer(text:string,subject:string,mode:'company'|'
  return mode==='company' && !!match && match[1]!.toLowerCase()===subject.toLowerCase();
 }
 
-export const prepResearchRequest=(text:string)=>contextualReadRequest(text)&&explicitReadReference(text)&&!matches('prepSavedOnly',text);
+export const prepResearchRequest=(text:string)=>ownerReadRequest(text)&&explicitReadReference(text)&&!matches('prepSavedOnly',text);

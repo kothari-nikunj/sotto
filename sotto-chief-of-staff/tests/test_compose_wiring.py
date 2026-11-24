@@ -443,7 +443,7 @@ def test_group_unnamed_builds_participant_label():
     threads = render_local._group_messages_into_threads([
         {"handle": "+14150000001", "is_from_me": False, "timestamp": "2026-06-24 09:00:00",
          "text": "hey", "is_group_chat": True, "chat_guid": "grp-2",
-         "group_participants": ["+14150000001", "+14150000002", "+14159990000"]},
+         "group_participants": ["+14150000001", "+14150000002", "+14155550151"]},
     ], "imessage", lookup)
     # 2 resolved names + 1 unresolved phone → "Alice Ng, Bob Ray & 1 other"
     assert threads[0]["name"] == "Alice Ng, Bob Ray & 1 other"
@@ -453,32 +453,32 @@ def test_group_backward_compat_no_new_fields():
     # A group message with NONE of the new Bridge fields still renders as a group without crashing and
     # gets the sender-derived (phone) name, never a topical invention.
     threads = render_local._group_messages_into_threads([
-        {"handle": "+14155558888", "is_from_me": False, "timestamp": "2026-06-24 09:00:00",
+        {"handle": "+14155550115", "is_from_me": False, "timestamp": "2026-06-24 09:00:00",
          "text": "anyone free to review the deck?", "is_group_chat": True},
     ], "imessage")
     t = threads[0]
     assert t["is_group_chat"] is True
     assert t["chat_guid"] is None
-    assert t["name"] == "+1 (415) 555-8888"
-    assert t["display_label"] == "+1 (415) 555-8888"
+    assert t["name"] == "+1 (415) 555-0115"
+    assert t["display_label"] == "+1 (415) 555-0115"
 
 
 def test_whatsapp_named_group_uses_subject_verbatim():
     # A WhatsApp group's chat_guid == its group JID; the Bridge's group_name (ZPARTNERNAME subject) is
     # used VERBATIM as the header — SAME path as iMessage. All senders collapse into ONE thread.
     lookup = render_local.build_contact_lookup([
-        {"name": "Nadia Ops", "phones": ["+18005551000"]},
-        {"name": "Yuki Tanaka", "phones": ["+818012345678"]},
+        {"name": "Nadia Ops", "phones": ["+18005550100"]},
+        {"name": "Yuki Tanaka", "phones": ["+818015550147"]},
     ])
     threads = render_local._group_messages_into_threads([
         {"contact_jid": "120363111@g.us", "partner_name": "Weekend Hikers", "is_from_me": False,
          "timestamp": "2026-06-24 09:00:00", "text": "trailhead at 7?", "is_group_chat": True,
          "chat_guid": "120363111@g.us", "group_name": "Weekend Hikers",
-         "group_participants": ["18005551000@s.whatsapp.net", "818012345678@s.whatsapp.net"]},
+         "group_participants": ["18005550100@s.whatsapp.net", "818015550147@s.whatsapp.net"]},
         {"contact_jid": "120363111@g.us", "partner_name": "Weekend Hikers", "is_from_me": False,
          "timestamp": "2026-06-24 09:05:00", "text": "works for me", "is_group_chat": True,
          "chat_guid": "120363111@g.us", "group_name": "Weekend Hikers",
-         "group_participants": ["18005551000@s.whatsapp.net"]},
+         "group_participants": ["18005550100@s.whatsapp.net"]},
     ], "whatsapp", lookup)
     assert len(threads) == 1
     t = threads[0]
@@ -493,14 +493,14 @@ def test_whatsapp_unnamed_group_builds_participant_label_from_member_jids():
     # No subject → participant label built from member JIDs resolved to contact names via
     # resolve_whatsapp_name (phone_from_jid → lookup). Never the raw group JID, never a topic.
     lookup = render_local.build_contact_lookup([
-        {"name": "Nadia Ops", "phones": ["+18005551000"]},
-        {"name": "Yuki Tanaka", "phones": ["+818012345678"]},
+        {"name": "Nadia Ops", "phones": ["+18005550100"]},
+        {"name": "Yuki Tanaka", "phones": ["+818015550147"]},
     ])
     threads = render_local._group_messages_into_threads([
         {"contact_jid": "120363222@g.us", "partner_name": "", "is_from_me": False,
          "timestamp": "2026-06-24 09:00:00", "text": "who's bringing snacks?", "is_group_chat": True,
          "chat_guid": "120363222@g.us", "group_name": None,
-         "group_participants": ["18005551000@s.whatsapp.net", "818012345678@s.whatsapp.net"]},
+         "group_participants": ["18005550100@s.whatsapp.net", "818015550147@s.whatsapp.net"]},
     ], "whatsapp", lookup)
     t = threads[0]
     assert t["name"] == "Nadia Ops & Yuki Tanaka"
@@ -512,11 +512,11 @@ def test_whatsapp_unnamed_group_builds_participant_label_from_member_jids():
 def test_escalation_detection_cross_channel():
     from datetime import datetime, timezone
     now = datetime(2026, 6, 25, 12, 0, 0, tzinfo=timezone.utc)
-    local = {"imessage": [{"handle": "+1", "resolved_name": "Sarah Chen", "is_from_me": False,
-                           "is_group_chat": False, "timestamp": "2026-06-24 09:00:00"}],
-             "whatsapp": [{"contact_jid": "x", "resolved_name": "Sarah Chen", "is_from_me": False,
-                           "is_group_chat": False, "timestamp": "2026-06-24 15:00:00"}],
-             "missed_calls": []}
+    phone, email, name = "+12025550140", "sarah@acme.com", "Sarah Chen"
+    contact = {"name": name, "phones": [phone], "emails": [email]}
+    identity = {"resolved_name": name, "timestamp": "2026-06-24 09:00:00"}
+    local = {"contacts": [contact], "imessage": [{**identity, "handle": phone}],
+             "whatsapp": [{**identity, "contact_jid": "12025550140@s.whatsapp.net"}]}
     emails = [{"from": "Sarah Chen <sarah@acme.com>", "date": "2026-06-25 08:00:00"}]
     r = cb._detect_escalation(local, emails, now)
     assert r and r[0]["name"] == "Sarah Chen"   # display-cased, not the lowercased dedup key
@@ -638,10 +638,10 @@ def test_partial_outgoing_attachment_cannot_prove_an_ask_was_answered():
     text = render_local._format_thread_as_text({'name': 'Alex', 'messages': messages}, 'imessage')
     assert 'do not infer them or treat this as proof an ask was answered' in text
     assert 'signed-contract.pdf' in text and 'file contents were not read' in text
-    text = render_local._format_thread_as_text({'name': 'Alex', 'messages': [
-        {'text': 'Yes', 'reply_to_guid': 'direct-parent', 'thread_originator_guid': 'root'}]}, 'imessage')
-    assert 'reply to GUID: direct-parent' in text and 'thread root GUID: root' in text
-    assert 'may be outside this excerpt' in text
+    text = render_local._format_thread_as_text({'name': 'Alex', 'messages': [{'text': 'K', 'reply_to_guid': 'p1'},
+        {'text': 'Y', 'reply_to_guid': 'p2', 'thread_originator_guid': 'root'}]}, 'imessage')
+    assert 'inline reply to GUID: root' in text and 'GUID: p' not in text
+    assert text.count('this excerpt') == 1
 
 
 def test_attachment_metadata_is_bounded_in_threads_and_deferred_context():
@@ -661,11 +661,11 @@ def test_attachment_metadata_is_bounded_in_threads_and_deferred_context():
 
 def test_call_comparisons_prefer_explicit_instants_and_accept_legacy_timestamps(monkeypatch):
     monkeypatch.setenv('SOTTO_TIMEZONE', 'America/New_York')
-    phone = '+14155552222'
+    phone = '+14155550109'
     early = {'phone': phone, 'timestamp': '2024-11-03 01:30:00', 'is_outgoing': False,
              'is_answered': False, 'call_type': 'phone', 'timestamp_utc': '2024-11-03T05:30:00Z', 'record_id': '1'}
     late = {**early, 'timestamp_utc': '2024-11-03T06:30:00Z', 'record_id': '2',
-            'is_answered': True, 'service_provider': 'FaceTime'}
+            'is_outgoing': True, 'duration_seconds': 42, 'service_provider': 'FaceTime'}
     lookup = render_local.build_contact_lookup([{'name': 'Dana', 'phones': [phone]}])
     connected = render_local._build_connected_dict([late], [])
     assert render_local._process_missed_calls([early], lookup, connected) == []
@@ -675,8 +675,8 @@ def test_call_comparisons_prefer_explicit_instants_and_accept_legacy_timestamps(
     text = render_local._format_recent_calls(recent)
     assert 'FaceTime' in text and '2024-11-03T06:30:00Z' in text
     assert 'record ID is scoped to this Mac store' in text
-    # Legacy WhatsApp wall times can be compared with the new explicit Phone timestamps.
-    assert render_local._process_wa_missed_calls([{'jid': '14155552222@s.whatsapp.net',
+    # Compare legacy WhatsApp wall time with Phone UTC.
+    assert render_local._process_wa_missed_calls([{'jid': '14155550109@s.whatsapp.net',
         'timestamp': '2024-11-03 00:30:00', 'is_outgoing': False, 'is_missed': True}], lookup, connected) == []
     assert render_local._call_time({**late, 'timestamp_utc': 'broken'}) is None
     assert render_local._call_time({**late, 'timestamp_utc': '2024-11-03 01:30:00'}) is None

@@ -44,12 +44,13 @@ def test_rejects_non_loopback_or_ambiguous_endpoints(url):
 
 def test_send_requires_provider_id_and_preserves_dispatch_identity():
     service, opener = make({'acceptance': 'accepted', 'message_ids': ['provider-1', 'provider-2']})
-    ok, _, receipt = service.send_receipt('private content', 'photon:owner', 'dispatch-1')
+    ok, _, receipt = service.send_receipt('private content', 'photon:owner', 'dispatch-1', valid_until_ms=123456)
     assert ok and receipt['message_id'] == 'provider-1'
     assert receipt['message_ids'] == ['provider-1', 'provider-2']
     request, _ = opener.requests[0]
     assert request.full_url == 'http://127.0.0.1:8789/v1/send'
     assert json.loads(request.data)['dispatch_id'] == 'dispatch-1'
+    assert json.loads(request.data)['valid_until_ms'] == 123456
     assert request.get_header('Authorization') == f'Bearer {TOKEN}'
     assert TOKEN not in repr(service)
 
@@ -58,11 +59,12 @@ def test_gallery_byte_transport_uses_ordered_exact_bytes_without_paths():
     service, opener = make({'acceptance': 'accepted', 'message_ids': ['group-1']})
     png = b'\x89PNG\r\n\x1a\nfixture'
     images = [{'name': f'{index:02d}.png', 'bytes': png} for index in range(1, 5)]
-    ok, _, receipt = service.send_gallery_bytes(images, 'Résumé 📨 / 東京', 'owner', 'gallery-1')
+    ok, _, receipt = service.send_gallery_bytes(images, 'Résumé 📨 / 東京', 'owner', 'gallery-1', valid_until_ms=123456)
     assert ok and receipt['message_id'] == 'group-1'
     request = opener.requests[0][0]
     assert request.full_url == 'http://127.0.0.1:8789/v1/send-gallery-bytes'
     body = json.loads(request.data)
+    assert body['valid_until_ms'] == 123456
     assert body['dispatch_id'] == 'gallery-1' and body['summary'] == 'Résumé 📨 / 東京'
     assert [item['name'] for item in body['images']] == [f'{index:02d}.png' for index in range(1, 5)]
     assert all(item['base64'] == 'iVBORw0KGgpmaXh0dXJl' for item in body['images'])
@@ -100,6 +102,11 @@ def test_receipt_lookup_cannot_resend():
     assert [r.full_url for r, _ in opener.requests] == ['http://127.0.0.1:8789/v1/receipt']
 
 
+def test_receipt_lookup_reports_an_unknown_dispatch_apart_from_a_failed_lookup():
+    assert make({'found': False})[0].receipt('d') == {'acceptance': 'not_found'}
+    assert make(TimeoutError())[0].receipt('d') is None
+
+
 def test_run_constructs_unattended_context_without_arbitrary_environment():
     service, opener = make({'text': 'done', 'usage': {'input_tokens': 10}})
     assert service.run('prompt', 'run-1', skill='morning-brief')['text'] == 'done'
@@ -132,13 +139,16 @@ def test_session_rotation_uses_only_explicit_maintenance_route():
     request = opener.requests[0][0]
     assert request.full_url.endswith('/v1/sessions')
     assert json.loads(request.data) == {'action': 'rotate'}
+    cutoff = '2026-01-01T00:00:00Z'
+    assert service.sessions('rotate', before=cutoff)['count'] == 2
+    assert json.loads(opener.requests[1][0].data) == {'action': 'rotate', 'before': cutoff}
     with pytest.raises(ValueError):
         service.sessions('shell')
     with pytest.raises(ValueError):
         service.sessions('purge_before')
     with pytest.raises(ValueError):
-        service.sessions('rotate', before='2026-01-01T00:00:00Z')
-    assert len(opener.requests) == 1
+        service.sessions('list', before='2026-01-01T00:00:00Z')
+    assert len(opener.requests) == 2
 
 
 def test_activation_operations_use_fixed_post_routes_and_bounded_ack_identity():

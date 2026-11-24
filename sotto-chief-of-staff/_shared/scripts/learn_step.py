@@ -23,6 +23,7 @@ Usage:
 Steps, in order (a step whose input file is absent is recorded `skipped`, never `failed`):
   knowledge    knowledge_update.py <knowledge-out>        the brief's extracted_knowledge
   continuity   continuity_resolve.py --merge-only <cont>  the brief's actions[] → the ledger
+  loopcheck    loop_check.py <cont> [--granola <granola>] automatic closes + possibly-handled notes
   style        style_extract.py <local> --gmail <gmail>   what you actually sent
   drafts       draft_outcomes.py                          drafts matched to sends → outcomes + voice confirms
   commitments  capture_commitments.py --granola <granola> new/changed notes → canonical obligations
@@ -68,6 +69,10 @@ STEPS = (
      lambda a: [a.knowledge_out] if a.knowledge_out else None),
     ("continuity", ("morning-brief", "scripts", "continuity_resolve.py"),
      lambda a: ["--merge-only", a.continuity] if a.continuity else None),
+    # After the merge, so notes key on the revisions the ledger now holds. It closes only the three
+    # owner-approved signals (intro sent, meeting booked, call connected), through the one writer.
+    ("loopcheck", ("morning-brief", "scripts", "loop_check.py"),
+     lambda a: ([a.continuity] + (["--granola", a.granola] if a.granola else [])) if a.continuity else None),
     # --gmail is OPTIONAL to style: a missing sent-mail file (a Gmail-less day, a failed gather)
     # must not skip the whole voice writer — style_extract itself tolerates the absent file.
     ("style", ("_shared", "scripts", "style_extract.py"),

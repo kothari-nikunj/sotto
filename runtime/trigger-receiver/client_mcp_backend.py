@@ -8,9 +8,17 @@ import json
 import re
 import secrets
 import sys
+from datetime import datetime, timezone
+
+import client_mcp_audit
+import client_mcp_contacts as contacts
+from client_mcp_catalog import BROWSER_SERVICE_DOMAINS, MAC_WRAPPERS, ReadUnavailableError
+from shared_lib import load_shared_lib
 
 
+TZCHAIN = load_shared_lib('tzchain', anchor=__file__)
 PAGE_BYTES = 32 * 1024
+BRIDGE_TIMED_OUT = -32001  # relay.Relay's JSON-RPC code when the Bridge does not answer in time
 NOTE_PAGE_CHARS = 3000
 NOTE_MAX_CHARS = 100_000
 PAGE_CURSOR = re.compile(r'([a-f0-9]{64}):([0-9]{1,9})\Z')
@@ -73,11 +81,35 @@ def _local_page(payload, arguments):
     return result
 
 
+def _browser_service_view(payload, service):
+    domains = BROWSER_SERVICE_DOMAINS[service]
+    for field in ('chrome_history', 'safari_history'):
+        if field not in payload:
+            continue
+        rows = payload[field]
+        if type(rows) is not list or any(type(row) is not dict or type(row.get('domain')) is not str for row in rows):
+            raise RuntimeError('Bridge browser history invalid')
+        payload[field] = [row for row in rows if any(
+            row['domain'].lower() == domain or row['domain'].lower().endswith('.' + domain) for domain in domains)]
+    payload.pop('search_queries', None)
+    payload.pop('safari_search_queries', None)
+    payload['service'] = service
+    payload['service_coverage'] = ('Filtered bounded domain summaries. No match does not establish that '
+                                   'the service was never visited. Visits do not prove an action on the service.')
+    return payload
+
+
+def _note_without_body(payload):
+    if payload.get('status') in ('disabled', 'not_found', 'locked', 'unavailable', 'degraded') and 'client_page' not in payload:
+        return {'status': payload['status']}
+    raise RuntimeError('Bridge note page invalid')
+
+
 def _note_page(payload, arguments):
     if type(payload) is not dict:
         raise RuntimeError('Bridge result invalid')
     if 'body' not in payload:
-        return payload
+        return _note_without_body(payload)
     body = payload['body']
     if type(body) is not str or type(payload.get('id')) is not int or payload['id'] != arguments['id']:
         raise RuntimeError('Bridge note invalid')
@@ -101,11 +133,9 @@ def _native_note_page(payload, arguments):
     result = {key: value for key, value in payload.items() if key != 'note_page_version'}
     page = result.get('client_page')
     if result.get('status') == 'changed' and 'body' not in result and page == _changed()['client_page']:
-        return result
+        return _changed()
     if 'body' not in result:
-        if result.get('status') in ('disabled', 'not_found', 'locked', 'unavailable', 'degraded') and 'client_page' not in result:
-            return result
-        raise RuntimeError('Bridge note page invalid')
+        return _note_without_body(result)
     body = result['body']
     if (result.get('status') not in ('ok', 'degraded')
             or any(key in result and type(result[key]) is not str for key in ('title', 'format', 'coverage'))
@@ -167,16 +197,119 @@ def _local_context(receiver, payload, sources):
     return result
 
 
+CLIENT_READERS = {'read_history': 'sotto_message_history', 'gmail_search': 'sotto_email_search',
+                  'gather_granola': 'sotto_granola_history'}
+
+
+def _person_view(result):
+    """Say history-learning detail once (sotto_source_status) and name readers a client can call."""
+    coverage = result.get('coverage') if type(result) is dict else None
+    if type(coverage) is not dict:
+        return result
+    coverage = {key: value for key, value in coverage.items() if key != 'learning_scope'}
+    identity = coverage.get('identity_resolution')
+    if type(identity) is dict:  # the chat-only saved-identity reader; clients get `candidates`
+        coverage['identity_resolution'] = {k: v for k, v in identity.items() if k != 'saved_identity_discovery'}
+    rows = []
+    for row in coverage.get('historical_sources') or []:
+        row = dict(row)
+        row['reader'] = CLIENT_READERS.get(row.get('reader'), row.get('reader'))
+        learning = row.pop('learning', None)
+        if type(learning) is dict:
+            row['learning'] = {'latest_attempt': (learning.get('latest_attempt') or {}).get('status'),
+                               'review_scope': learning.get('review_scope'),
+                               'detail': 'sotto_source_status.history_learning'}
+        rows.append(row)
+    if 'historical_sources' in coverage:
+        coverage['historical_sources'] = rows
+    return {**result, 'coverage': coverage}
+
+
 def read(receiver, name, arguments):
+    if name == 'sotto_contacts':
+        return _contacts(receiver, arguments['query'])
+    return _read(receiver, name, arguments)
+
+
+def _contacts(receiver, query):
+    """Mac and Google Contacts through their own readers; an unpermitted side says unavailable."""
+    authority = receiver._runtime_source_authority(report_probe_failure=True)
+    if authority.get('complete') is not True or not authority.get('revision'):
+        raise RuntimeError('source authority unavailable')
+    mac = 'contacts' in authority.get('bridge_sources', [])
+    google = 'google_contacts' in authority.get('google_sources', [])
+    if not (mac or google):
+        raise _mac_unavailable(receiver, authority)
+    def side(permitted, name, arguments):
+        if not permitted:
+            return {'status': 'unavailable'}
+        try:  # one address book failing (a sleeping Mac, a Google error) keeps the other
+            return _read(receiver, name, arguments)
+        except Exception:  # noqa: BLE001 - reported as unavailable, never as empty
+            return {'status': 'unavailable'}
+    result = {'mac_contacts': side(mac, 'sotto_mac_context', {'sources': ['contacts'], 'query': query}),
+              'google_contacts': side(google, 'sotto_contacts_search', {'query': query})}
+    after = receiver._runtime_source_authority()
+    if (after.get('complete') is not True or after.get('revision') != authority['revision']
+            or mac and result['mac_contacts'] != {'status': 'unavailable'} and 'contacts' not in after.get('bridge_sources', [])
+            or google and result['google_contacts'] != {'status': 'unavailable'}
+            and 'google_contacts' not in after.get('google_sources', [])):
+        raise RuntimeError('source authority changed during read')
+    if all(value == {'status': 'unavailable'} for value in result.values()):
+        raise RuntimeError('Contacts read unavailable')
+    return result
+
+
+def _mac_unavailable(receiver, authority):
+    """Distinguish failed Bridge health from a current authority that withheld this source."""
+    reason = authority.get('bridge_probe') or (
+        'source_not_permitted' if receiver.RELAY.bridge_connected() else 'bridge_offline')
+    return ReadUnavailableError(reason, 'source unavailable')
+
+
+def _bridge_failure(response):
+    error = response.get('error') if isinstance(response, dict) else None
+    result = response.get('result') if isinstance(response, dict) else None
+    structured = result.get('structuredContent') if isinstance(result, dict) else None
+    if isinstance(error, dict) and error.get('code') == BRIDGE_TIMED_OUT:
+        return ReadUnavailableError('timeout', 'Bridge read unavailable')
+    if isinstance(structured, dict) and structured.get('error_code') == 'bridge_offline':
+        return ReadUnavailableError('bridge_offline', 'Bridge read unavailable')
+    return RuntimeError('Bridge read unavailable')
+
+
+def _read(receiver, name, arguments):
     status_options = {'include_search_policy': True} if name == 'sotto_source_status' else {}
-    before = receiver._runtime_source_authority(**status_options)
+    # A Mac read reuses a recent health probe; the after-read check below verifies consent only.
+    # The Bridge itself withholds a result whose source policy changed while it ran.
+    mac_read = name in MAC_WRAPPERS or name in ('sotto_search_local', 'sotto_message_history',
+                                                 'sotto_mac_context', 'sotto_note_get')
+    before = receiver._runtime_source_authority(**status_options, **({'bridge_probe': 'cached', 'report_probe_failure': True} if mac_read else {}))
     if before.get('complete') is not True or not before.get('revision'):
         raise RuntimeError('source authority unavailable')
+    not_permitted = None
+    service = arguments.get('service') if name == 'sotto_browser_history' else None
+    if service is not None and service not in BROWSER_SERVICE_DOMAINS:
+        raise ValueError('unknown browser service')
+    if name in MAC_WRAPPERS:  # one reader: a wrapper is sotto_mac_context over its fixed sources
+        permitted = before.get('bridge_sources', [])
+        not_permitted = [source for source in MAC_WRAPPERS[name] if source not in permitted]
+        sources = [source for source in MAC_WRAPPERS[name] if source in permitted]
+        if not sources:
+            raise _mac_unavailable(receiver, before)
+        name, arguments = 'sotto_mac_context', {**arguments, 'sources': sources}
     if name == 'sotto_source_status':
         permitted = sorted(set(before.get('bridge_sources', [])
             + before.get('google_sources', []) + before.get('connector_sources', [])))
-        online = receiver.RELAY.bridge_connected()
-        result = {'bridge_online': online,
+        zone = TZCHAIN.configured_tz_name(receiver.DATA)
+        try:
+            owner_timezone = zone if TZCHAIN.resolve(zone) else None
+        except ValueError:  # out-of-range fixed offset in settings
+            owner_timezone = None
+        result = {'bridge_online': receiver.RELAY.bridge_connected(),
+                  'bridge_last_seen_at': getattr(receiver.RELAY, 'bridge_last_seen_at', None),
+                  'owner_timezone': owner_timezone,
+                  'now': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                   'local_search': dict(before.get('local_search', {'status': 'unknown'})),
                   'available_sources': permitted,
                   'history_learning': receiver._load_shared_lib('history_coverage').learning_coverage(receiver.DATA, permitted),
@@ -196,21 +329,31 @@ def read(receiver, name, arguments):
             if 'meeting_id' in arguments:
                 argv += ['--meeting-id', arguments['meeting_id']]
         elif arguments.get('topic'):
+            if set(arguments) != {'topic'}:
+                raise ReadUnavailableError('invalid_arguments', 'Topic reads do not use list options')
             argv = ['--topic', arguments['topic']]
         else:
-            operation, section, script, argv = 'loops_query', 'scripts', 'loops_query.py', []
+            cursor = arguments.get('cursor', 'first')
+            if cursor != 'first' and not PAGE_CURSOR.fullmatch(cursor):
+                return _changed()
+            operation, section, script = 'loops_query', 'scripts', 'loops_query.py'
+            argv = ['--client-page', str(arguments.get('limit', 20)), cursor, arguments.get('direction', 'both'),
+                    str(arguments.get('include_handled_days', 7))]
+        client_mcp_audit.touch('granola' if operation == 'granola_history' else 'saved_knowledge')
         # The canonical reader owns the before/after fence for this operation.
         # Reuse our current snapshot and return only after its fresh final check.
-        return receiver.RUNTIME_KNOWLEDGE_READ.perform(
+        result = receiver.RUNTIME_KNOWLEDGE_READ.perform(
             {'operation': operation, 'arguments': {'argv': argv}, 'source_revision': before['revision']},
             script=receiver._find_sotto_script('_shared', section, script), executable=sys.executable,
             env=receiver._spawn_env(''), authority=receiver._runtime_source_authority,
             initial_authority=before)
+        return _person_view(result) if name == 'sotto_person' else result
     elif name in ('sotto_search_local', 'sotto_message_history', 'sotto_mac_context', 'sotto_note_get'):
         if name == 'sotto_mac_context':
             wanted = arguments['sources']
-            bridge_tool, bridge_args = 'read_local', {'since_hours': arguments.get('since_hours', 24),
-                                                     'sources': wanted}
+            # A Contacts lookup reads the whole address book, not the day's subset.
+            bridge_tool, bridge_args = 'read_local', {'since_hours': contacts.BOOK_HOURS if 'query' in arguments
+                                                     else arguments.get('since_hours', 24), 'sources': wanted}
         elif name == 'sotto_note_get':
             wanted = ['apple_notes']
             bridge_tool, bridge_args = 'get_note', {'id': arguments['id']}
@@ -219,16 +362,17 @@ def read(receiver, name, arguments):
             bridge_tool = 'search_local' if name == 'sotto_search_local' else 'read_history'
             bridge_args = {'limit': 10 if name == 'sotto_search_local' else 100, **arguments}
         if not set(wanted) <= set(before.get('bridge_sources', [])):
-            raise RuntimeError('source unavailable')
+            raise _mac_unavailable(receiver, before)
         request = {'jsonrpc': '2.0', 'id': 'client-read-' + secrets.token_hex(12), 'method': 'tools/call',
                    'params': {'name': bridge_tool, 'arguments': bridge_args}}
         if name == 'sotto_note_get':
             request['params']['_meta'] = {'sotto/accepts': ['note_page_v1'],
                                          'sotto/note_cursor': arguments.get('cursor', 'first')}
+        client_mcp_audit.touch(*wanted)
         response = receiver.RELAY.mcp_call(request, timeout=20)
         if (not isinstance(response, dict) or response.get('error') or type(response.get('result')) is not dict
                 or response['result'].get('isError') is True):
-            raise RuntimeError('Bridge read unavailable')
+            raise _bridge_failure(response)
         result = receiver._source_context().unwrap_tool_result(response['result'])
         if name == 'sotto_search_local' and type(result) is dict and type(result.get('coverage')) is dict:
             search_hints = receiver._load_shared_lib('source_catalog').SEARCH_HINTS
@@ -237,8 +381,17 @@ def read(receiver, name, arguments):
             if hints:
                 result = {**result, 'source_hints': hints}
         if name == 'sotto_mac_context':
-            result = _local_page(_local_context(receiver, result, wanted), arguments)
-        elif name == 'sotto_note_get':
+            def normalize(value):
+                return receiver._load_shared_lib('textutil')._normalize_identifier(value)
+            result = contacts.shape(_local_context(receiver, result, wanted), arguments.get('query'), normalize)
+            if service is not None:
+                result = _browser_service_view(result, service)
+            result = _local_page(contacts.name_rows(receiver, before, result), arguments)
+            if not_permitted is not None:
+                result['not_permitted'] = not_permitted
+        elif name != 'sotto_note_get':
+            result = contacts.name_rows(receiver, before, result)
+        if name == 'sotto_note_get':
             result = (_native_note_page(result, arguments) if type(result) is dict
                       and ('note_page_version' in result or 'client_page' in result) else _note_page(result, arguments))
     else:
@@ -252,21 +405,18 @@ def read(receiver, name, arguments):
         # Source authority already checks the configured credential home and consent.
         # Repeating its environment lookup here would couple clients to one lifecycle.
         if source not in before.get('google_sources', []):
-            raise RuntimeError('Google read unavailable')
+            raise ReadUnavailableError('source_not_permitted', 'Google read unavailable')
         # Reuse the receiver's immutable adapter cache rather than recreating module state
         # (including the shared metadata pacer) for every client request.
         api = receiver._sotto_adapter('google_api')
+        client_mcp_audit.touch(source)
         result = api.read_owner(operation, {'max': 10, **arguments}
                                 if operation in ('gmail_search', 'contacts_search') else arguments)
         if result.get('source') != source:
             raise RuntimeError('Google result invalid')
-    after = receiver._runtime_source_authority(**status_options)
+    after = receiver._runtime_source_authority(**(status_options or {'bridge_probe': 'none'}))
     if after.get('complete') is not True or after.get('revision') != before['revision']:
         raise RuntimeError('source authority changed during read')
-    # A Mac sleep must not discard an independent Gmail/Calendar result. Consent revisions
-    # still fence every read; live availability is specific to the source that was read.
-    if name in ('sotto_search_local', 'sotto_message_history', 'sotto_mac_context', 'sotto_note_get') and not set(wanted) <= set(after.get('bridge_sources', [])):
-        raise RuntimeError('Mac source unavailable after read')
     if name in ('sotto_email_search', 'sotto_email_get', 'sotto_email_thread', 'sotto_calendar', 'sotto_contacts_search', 'sotto_contacts_get') and source not in after.get('google_sources', []):
         raise RuntimeError('Google source unavailable after read')
     if name == 'sotto_source_status' and after != before:

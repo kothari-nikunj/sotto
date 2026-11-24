@@ -1,5 +1,13 @@
 # Immutable Railway runtime release
 
+> GitHub Actions is off (Nov 2026), so maintainers run qualification locally. `qualify` uses
+> `DOCKER_HOST` when set; for a local Colima profile use `unix://$HOME/.colima/default/docker.sock`.
+> See the monorepo's `docs/solutions/mac-release-checks.md` for the release checks and proof limits.
+> On the verified Colima/Rosetta host, amd64 `pidfd_open` returns `ENOSYS`; a successful image
+> build does not establish lifecycle qualification. Use native amd64 for this release lane.
+> The native arm64 Docker group and repaired Photon fixture passed separately; neither emits
+> an amd64 qualification receipt. Keep the existing lifecycle guards intact.
+
 The manual `release-railway-runtime.yml` workflow creates an image and descriptor for a separately
 reviewed signed Bridge build. It does not update Railway, a pilot, the public source repository,
 existing deployments or a Bridge release. Adding this lane does not publish an image.
@@ -50,6 +58,6 @@ onboarding session. Fixture overlays add test instrumentation and are never publ
 
 This does not establish live Railway provisioning, a real Telegram pairing/delivery, real Google
 model access, Mac Keychain/TCC acceptance, or first-user content quality. Those remain separate
-release acceptance checks. The new lane and tests were authored without publishing an image; on the
-development Mac Docker was unavailable, so the Linux build/lifecycle execution still needs an actual
-workflow run before any descriptor can be used for promotion.
+release acceptance checks. The local amd64 qualifier remains incomplete on the verified Rosetta
+host and produced no qualification receipt or descriptor. Complete this lane on native amd64
+before using an immutable runtime descriptor for promotion.

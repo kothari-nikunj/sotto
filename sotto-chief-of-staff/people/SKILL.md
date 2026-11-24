@@ -8,15 +8,15 @@ metadata:
 
 # Sotto — People
 
-The People tab, as a conversation. PORT SOURCE: people analytics + attention queue (people.rs / pipeline).
+Look up a person, explain what needs their attention, or manage a Google contact.
 
 > **How this runs on Sotto:** `run_sotto_script X …` means one `run_sotto_script` call with id `X`
 > and the rest as its argv array — no shell, no file paths. Other backticked names are native tools.
 
 ## Capabilities
-- **"What do I know about X?"** → follow the `sotto-ask` person lookup, including `run_sotto_script knowledge-query --person "<name|id>" --person-coverage` and its consent-aware historical checks when `person_knowledge` is empty. A graph miss does not establish that there was no previous conversation.
-- **"Who do I owe / who's slipping?"** → two real sources, both deterministic:
-  - open loops: `run_sotto_script loops-query` (the continuity ledger, split `you_owe` / `waiting_on_them`);
+- **"What do I know about X?"** → follow the `sotto-ask` person lookup, Use the saved view for questions about what Sotto knows or has learned. Check consented history only when the question requires evidence beyond that view.
+- **"Who do I owe / who’s slipping?"** → use the source that answers the question:
+  - open loops: use the Loops skill’s `owner_task_list` for a list the owner can act on, or `run_sotto_script loops-query` for a targeted obligation question;
   - relationship drift: `run_sotto_script relationship-attention` (the weekly pulse's saved `attention_queue`: `waiting_on_you` / `losing_touch` / `lapsed`). Its freshness is unknown — reasons describe saved observations, not verified current contact. If it's missing or stale, offer to run `sotto-relationship-pulse` — don't recompute cadence by hand.
 - **Birthdays / check-ins** → from contacts (Bridge `get_contacts`) + the graph.
 - **"Research X for me"** → not a graph read; it's the ad-hoc research lane in `sotto-ask`
@@ -24,12 +24,12 @@ The People tab, as a conversation. PORT SOURCE: people analytics + attention que
   time instead of only in this chat.
 
 ## Output format
-- Person profile: one identity line (**Name** — title, company, if known), then ≤5 fact bullets and any talking points, each traceable to the graph/ledger output. Offer a draft at the end when a reply is owed.
-- Attention answers: lead with counts ("3 you owe, 2 going quiet"), then name + one-line *why* per person (e.g. "no reply in 8 days to her question about the contract"), with the source signal.
+- Person profile: one identity line (**Name** — title, company, if known), then ≤5 fact bullets traceable to the evidence. Add talking points only when asked and offer a draft for a verified open reply only when relevant.
+- Attention answers: explain what is open now and describe saved relationship suggestions with their observed dates when available. Use separate counts if both were requested. An empty saved list leaves current relationship needs unknown.
 
 ## Rules
 - **Grounded only:** state only facts found in the knowledge graph, the continuity ledger, or live Bridge/Google results. If it isn't there, say "I don't have that on X" — never guess a role, company, or reason.
-- **No data:** for an attention summary with an empty graph and ledger, give one honest line about the current graph and ledger. For a specific person or past conversation, check the connected historical sources from `sotto-ask` first and disclose coverage limits.
+- **No data:** for an attention summary with an empty graph and ledger, give one honest line about the current graph and ledger. For a question about a specific past exchange, follow the bounded historical checks in `sotto-ask` and disclose material coverage limits.
 - Surface *why* someone needs attention, then offer to draft (hand to `sotto-draft-reply`, under the approval tiers).
 
 ## Targeted recipient lookup

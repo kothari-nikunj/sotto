@@ -104,7 +104,7 @@ def test_delayed_gather_text_then_exact_closure_suppression_and_restart_explanat
 @pytest.mark.parametrize('change', [
     {'timestamp': '2026-10-18T08:59:59Z'},  # before original promise
     {'timestamp': '2026-10-20T09:00:00.001Z'},  # future at replay time
-    {'handle': '+14155550999'}, {'is_group_chat': True},
+    {'handle': '+14155550105'}, {'is_group_chat': True},
     {'is_from_me': 'true'}, {'text': 'x' * (lc.MAX_BODY_CHARS + 1)},
 ])
 def test_targeted_read_never_supplies_wrong_identity_or_chronology(tmp_path, monkeypatch, change):
@@ -295,7 +295,7 @@ def test_whatsapp_jid_or_display_phone_never_becomes_raw_imessage_target(tmp_pat
     for primary in ('14155550193@s.whatsapp.net', '+1 (415) 555-0193'):
         plan = lc._imessage_plan([{**row, 'contact_identifier': primary}], now=CHECK_AT,
             allowed=lambda _: True, aliases=lambda *_: [PHONE])
-        assert plan[0][1] == PHONE
+        assert plan[0][1][1] == PHONE
         assert lc._imessage_plan([{**row, 'contact_identifier': primary}], now=CHECK_AT,
             allowed=lambda _: True, aliases=lambda *_: ()) == []
 

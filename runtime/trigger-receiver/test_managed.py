@@ -48,7 +48,8 @@ def test_tool_result_consent_comes_from_pending_server_request(tmp_path, monkeyp
     assert managed.validate_tool_request(tmp_path, call('read_local', {}))
     assert not managed.validate_tool_request(tmp_path, call('read_local', {'sources': ['whatsapp', 'imessage']}))
     assert not managed.validate_tool_request(tmp_path, call('send_message', {'channel': 'imessage'}))
-    assert not managed.validate_tool_request(tmp_path, call('get_messages', {'source': 'whatsapp'}))
+    assert [managed.validate_tool_request(tmp_path, call('get_messages', arguments))
+            for arguments in ({'source': 'whatsapp'}, {}, {'source': 'sms'})] == [True, False, False]
     assert not managed.validate_tool_request(tmp_path, call('get_contacts', {}))
     assert managed.validate_tool_request(tmp_path, call('health', {}))
 
@@ -70,6 +71,19 @@ def test_tool_result_consent_comes_from_pending_server_request(tmp_path, monkeyp
         tmp_path, call('future_content_tool', {}), wrap({'private': 'content'}))
     assert not managed.validate_tool_response(
         tmp_path, call('read_local', {'sources': [None]}), wrap({}))
+
+
+def test_history_reaction_coverage_is_a_true_flag_for_imessage_only(tmp_path, monkeypatch):
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'test')
+    state(tmp_path, 'managed-capabilities.json', sources={
+        'imessage': {'consented': True, 'connected': True},
+        'whatsapp': {'consented': True, 'connected': True}})
+    for source, flag, allowed in (('imessage', True, True), ('imessage', 1, False),
+                                  ('imessage', False, False), ('whatsapp', True, False)):
+        request = {'method': 'tools/call', 'params': {'name': 'read_history', 'arguments': {'source': source}}}
+        payload = {'source': source, 'rows': [], 'complete': True, 'reactions_partial': flag}
+        assert managed.validate_tool_response(tmp_path, request, {'structuredContent': payload}) is allowed
 
 
 def test_google_consent_opens_only_granted_sources_and_preserves_bridge(tmp_path, monkeypatch):

@@ -9,39 +9,40 @@ import os
 from pathlib import Path
 import re
 
+import pack_path
+
+# graph_display_name reads knowledge/ and conversation_filter reads scripts/; a fresh composer
+# process must find both, or a graph-name mute silently stops matching.
+pack_path.ensure()
+
 FEEDBACK_DAYS = 42
 FEEDBACK_LIMIT = 8
 FEEDBACK_EXCERPT_CHARS = 320
 
 
-def archived_output(reference, *, permitted=None, snapshot=False):
-    """Return an output only while its authorized archive still exists."""
+def accepted_outputs(*, permitted=None):
+    """Resolve the newest verifiable accepted edition while its sources remain authorized."""
+    from accepted_briefs import bindings, permitted_sources
+    from message_targets import delivery_body
+    from source_context import allowed
+
     root = Path(os.environ.get('SOTTO_DATA', '/data'))
-    if str(reference).startswith('draft:'):
-        # Offered-draft rows predate source provenance. Do not reuse their prose in future prompts
-        # until the archive can prove which current source permission governs it.
-        return None
-    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2})_(morning|evening|welcome)', str(reference or ''))
-    if not match or not (root / 'briefs' / f'{match[1]}.{match[2]}.delivered').exists():
-        return None
-    try:
-        value = json.loads((root / 'briefs' / f'{match[1]}_{match[2]}.json').read_text())
-        sources = value.get('_source_permissions')
-        if not isinstance(sources, list):
-            return None
-        from source_context import allowed
-        if any(not isinstance(source, str) or not allowed(source)
-               or permitted is not None and not permitted(source) for source in sources):
-            return None
-        text = str(value.get('brief_text') or value.get('brief_markdown') or '') or None
-        if not text or not snapshot:
-            return text
-        marker = (root / 'briefs' / f'{match[1]}.{match[2]}.delivered').read_bytes()
-        version = hashlib.sha256(json.dumps([text, sources, marker.hex()], ensure_ascii=False,
-            sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-        return {'text': text, 'archive_version': version}
-    except (OSError, ValueError, TypeError, AttributeError):
-        return None
+    selected = {}
+    for reference, artifact, run, _, contacted in bindings(root, delivery_body=delivery_body, exact=True):
+        order = (contacted, run)
+        if reference not in selected or order > selected[reference][0]:
+            selected[reference] = order, artifact
+    outputs = {}
+    for reference, (order, artifact) in selected.items():
+        if not permitted_sources(artifact, lambda source: allowed(source)
+                                 and (permitted is None or permitted(source))):
+            continue
+        text = delivery_body(artifact['brief_text'])
+        version = hashlib.sha256(json.dumps(
+            [reference, order[1], text, artifact['_source_permissions']],
+            ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+        outputs[reference] = {'text': text, 'archive_version': version}
+    return outputs
 
 
 def item_locator(text, excerpt):
@@ -60,8 +61,7 @@ def item_locator(text, excerpt):
     return f'excerpt:{start}:{len(excerpt)}:{digest}'
 
 
-def resolve_item(reference, locator, *, permitted=None):
-    text = archived_output(reference, permitted=permitted)
+def _resolve_item(text, locator):
     if not text or not str(locator).startswith('excerpt:'):
         return None
     try:
@@ -92,43 +92,88 @@ def rows(path, limit=2000):
     return result
 
 
-def feedback(now=None, *, permitted=None):
-    now = now or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    recent = {}
-    for row in rows(Path(os.environ.get('SOTTO_DATA', '/data')) / 'outcomes.jsonl'):
-        if row.get('source') != 'user_feedback' or row.get('outcome') not in ('useful', 'not_useful'):
+def _recent_ratings(root, now):
+    for row in rows(root / 'outcomes.jsonl'):
+        if (row.get('source') not in ('user_feedback', 'notification_feedback')
+                or row.get('outcome') not in ('useful', 'not_useful')
+                or not isinstance(row.get('reference'), str) or not isinstance(row.get('archive_version'), str)):
             continue
         try:
             stamp = datetime.fromisoformat(str(row['ts']).replace('Z', '+00:00'))
-            if stamp.tzinfo is None:
-                stamp = stamp.replace(tzinfo=timezone.utc)
-            if not now - timedelta(days=FEEDBACK_DAYS) <= stamp <= now:
-                continue
         except (KeyError, ValueError, TypeError):
             continue
-        locator = row.get('item_locator') or 'output'
-        key = (row.get('reference'), locator)
-        recent.pop(key, None)
-        if locator == 'output' and archived_output(row.get('reference'), permitted=permitted) is None:
-            continue
-        item = None if locator == 'output' else resolve_item(row.get('reference'), locator, permitted=permitted)
-        if locator != 'output' and item is None:
-            continue
-        recent[key] = {k: str(row.get(k) or '')[:200] for k in ('outcome', 'reference')}
-        recent[key]['item_locator'] = locator
-        if item is not None:
-            recent[key]['item'] = item
-    return list(recent.values())[-FEEDBACK_LIMIT:]
+        if now - timedelta(days=FEEDBACK_DAYS) <= (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)) <= now:
+            yield row
 
 
-def render_feedback(now=None, *, permitted=None):
-    examples = feedback(now, permitted=permitted)
+def _notification_originals(root, ratings, gmail_ids, permitted):
+    rated = [row for row in ratings if row['source'] == 'notification_feedback' and isinstance(row.get('source_ref'), str)]
+    if not rated or not gmail_ids:
+        return {}
+    from source_context import allowed
+    if not allowed('gmail') or (permitted is not None and not permitted('gmail')):
+        return {}
+    ids = {hashlib.sha256(f'gmail:{ident}'.encode()).hexdigest(): ident for ident in gmail_ids if isinstance(ident, str) and ident}
+    references = {row['reference'] for row in rated if row['source_ref'] in ids}
+    if not references:
+        return {}
+    try:
+        scope = json.loads(os.environ.get('SOTTO_BRIEF_FEEDBACK_PROOF', 'null'))
+    except ValueError:
+        return {}
+    if not isinstance(scope, dict) or not scope:
+        return {}
+    from protected_brief_detail import notification_bindings
+    return {ref: (binding, ids[binding['source_ref']]) for ref, binding in notification_bindings(root, scope, references).items()
+            if binding and binding['source_ref'] in ids}
+
+
+def _brief_example(row, outputs):
+    output = outputs.get(row['reference'])
+    locator = row.get('item_locator')
+    if not output or output['archive_version'] != row['archive_version'] or not isinstance(locator, str):
+        return None
+    example = {'outcome': row['outcome'], 'reference': row['reference'][:200], 'item_locator': locator}
+    if locator != 'output':
+        item = _resolve_item(output['text'], locator)
+        if item is None:
+            return None
+        example['item'] = item
+    return example
+
+
+def feedback(now=None, *, permitted=None, gmail_ids=()):
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    root = Path(os.environ.get('SOTTO_DATA', '/data'))
+    ratings = list(_recent_ratings(root, now))
+    outputs = accepted_outputs(permitted=permitted) if any(r['source'] == 'user_feedback' for r in ratings) else {}
+    notifications = _notification_originals(root, ratings, gmail_ids, permitted)
+    examples = {}
+    for row in ratings:
+        if row['source'] == 'notification_feedback':
+            binding, ident = notifications.get(row['reference'], ({}, None))
+            if not binding or any(binding[key] != row.get(key) for key in ('archive_version', 'source_ref', 'decision_id')):
+                continue
+            example = {'outcome': row['outcome'], 'previous_notification_about_gmail_message_id': ident}
+        else:
+            example = _brief_example(row, outputs)
+            if example is None:
+                continue
+        key = row['reference'], row['archive_version'], example.get('item_locator')
+        examples.pop(key, None)
+        examples[key] = example
+    return list(examples.values())[-FEEDBACK_LIMIT:]
+
+
+def render_feedback(now=None, *, permitted=None, gmail_ids=()):
+    examples = feedback(now, permitted=permitted, gmail_ids=gmail_ids)
     if not examples:
         return ''
     return ('\nUSER FEEDBACK ON SPECIFIC PAST OUTPUTS\n'
             'Use these explicit ratings only as narrow evidence about the referenced output. '
+            'A previous notification rating applies to the nudge about that exact Gmail message. '
             'An item rating is not a sender mute, a permanent rule, or permission to act. '
             'Do not infer dislike from missing feedback or from an unanswered message. '
             'User-stated rules and corrections take precedence over inferred patterns. '
@@ -267,6 +312,29 @@ def conversation_key(event):
     return source + ':event:' + str(stable)
 
 
+def commitment_calendar(calendar, item):
+    """Only a uniquely linked invitation can confirm the scheduling outcome."""
+    thread = item.get('thread_id')
+    if item.get('channel') not in ('email', 'gmail') or not thread or not calendar:
+        return None
+    events = [event for event in calendar.get('events') or [] if isinstance(event, dict)
+              and (event.get('threadId') or event.get('thread_id')) == thread
+              and event.get('start') and event.get('status') != 'cancelled' and event.get('my_response') != 'declined']
+    return {'events': events} if len(events) == 1 else None
+
+
+def direct_conversation_event(source, identifier, snapshot, include):
+    """Locate one exact direct chat; never choose among several chats or use display names."""
+    field = {'imessage': 'handle', 'whatsapp': 'contact_jid'}.get(source)
+    peer = normalized_identifier(identifier)
+    if not field or not peer:
+        return {}
+    matches = {conversation_key(event): event for event, _, _ in snapshot
+               if event_source(event) == source and not (event.get('is_group_chat') or event.get('group_id'))
+               and normalized_identifier(event.get(field)) == peer and include(event)}
+    return next(iter(matches.values())) if len(matches) == 1 else {}
+
+
 def _conversation_text(event):
     return '\n'.join(str(event.get(k) or '') for k in ('subject', 'text', 'body', 'snippet')
                      if event.get(k))
@@ -274,8 +342,8 @@ def _conversation_text(event):
 
 def conversation_message(event, *, timestamp='', prior_class='', text_limit=CONVERSATION_TEXT_CHARS,
                          preserve_ending=False):
-    from timeutil import parse_observed_time
-    observed = parse_observed_time(event.get('timestamp') or event.get('date')) or parse_observed_time(timestamp)
+    from timeutil import parse_observed_time, source_observed_time
+    observed = source_observed_time(event) or parse_observed_time(timestamp)
     text = _conversation_text(event)
     original_length = len(text)
     clipped = original_length > text_limit
@@ -316,7 +384,7 @@ def conversation_snapshot(events=None, *, include=None):
             and (include is None or include(row[0]))]
 
 
-def current_conversation(event, now=None, candidates=None):
+def current_conversation(event, now=None, candidates=None, *, days=CONVERSATION_DAYS, limit=CONVERSATION_MESSAGES):
     """Bounded observed thread context, including replies; no model calls or guessed joins."""
     from source_context import allowed
     from timeutil import _parse_ts
@@ -339,7 +407,7 @@ def current_conversation(event, now=None, candidates=None):
                 continue
             parsed = now
         parsed = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
-        if not now - timedelta(days=CONVERSATION_DAYS) <= parsed <= now:
+        if not now - timedelta(days=days) <= parsed <= now:
             continue
         # Deduplicate using the full observed text: two distinct endings must not collapse merely
         # because their bounded display excerpts happen to match.
@@ -347,7 +415,7 @@ def current_conversation(event, now=None, candidates=None):
             _conversation_text(candidate).encode()).digest())
         selected[key] = (parsed, message)
     ordered = sorted(selected.values(), key=lambda pair: pair[0])
-    messages = [m for _, m in ordered[-CONVERSATION_MESSAGES:]]
+    messages = [m for _, m in ordered[-limit:]]
     while sum(len(m['text']) for m in messages) > CONVERSATION_TOTAL_CHARS and len(messages) > 1:
         messages.pop(0)
     if messages and len(ordered) > len(messages):
@@ -439,8 +507,6 @@ def topic_for_identifiers(topics, identifiers):
 
 if __name__ == '__main__':
     import argparse
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'knowledge'))
     parser = argparse.ArgumentParser(description='Relevant prior context and explicit output feedback')
     parser.add_argument('--participant', action='append', default=None,
                         help='exact canonical ID, email or phone; repeat for a task cohort')

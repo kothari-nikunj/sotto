@@ -221,3 +221,26 @@ test('actual unattended Mastra reads owner loops without invented owner input, a
   await assert.rejects(loops.execute!({include_parked:false},{requestContext:{get:()=>undefined}} as never),/unavailable/);
  }finally{await runtime.close();rmSync(folder,{recursive:true,force:true});}
 });
+
+test('a possibly-handled note on an open task reaches the chat intact', async () => {
+  const noted = { ...row, check: { basis: 'you_messaged', at: '2026-11-05T17:05:38-08:00', source: 'imessage' } };
+  const body = { ...result, you_owe: [noted] };
+  assert.deepEqual(await readOwnerLoops({ bridgeUrl: url, readBearer: 'read-only', fetch: async () => response(body) },
+    { include_parked: false }), body);
+  for (const [basis, source] of [['call', 'calls'], ['call', 'whatsapp_calls'], ['sent_to_them', 'gmail'], ['met', 'granola']]) {
+    const hinted = { ...result, you_owe: [{ ...row, check: { basis, at: '2026-11-05', source } }] };
+    assert.deepEqual(await readOwnerLoops({ bridgeUrl: url, readBearer: 'read-only', fetch: async () => response(hinted) },
+      { include_parked: false }), hinted);
+  }
+  for (const check of [{ basis: 'you_messaged', at: '2026-11-10T17:05:00+00:00', source: 'imessage', replied_since: '2026-11-10T20:00:00+00:00', replied_source: 'gmail' },
+    { basis: 'dates_passed', at: '2026-11-11', source: 'calendar' },
+    { basis: 'read_no_reply', at: '2026-11-11T18:00:00Z', source: 'imessage' },
+    { basis: 'reacted', at: '2026-11-11T18:00:00Z', source: 'imessage', kind: 'like' }]) {
+    const hinted = { ...result, you_owe: [{ ...row, check }] };
+    assert.deepEqual(await readOwnerLoops({ bridgeUrl: url, readBearer: 'read-only', fetch: async () => response(hinted) },
+      { include_parked: false }), hinted);
+  }
+  const bad = { ...result, you_owe: [{ ...row, check: { basis: 'closed', at: '', source: 'imessage' } }] };
+  await assert.rejects(readOwnerLoops({ bridgeUrl: url, readBearer: 'read-only', fetch: async () => response(bad) },
+    { include_parked: false }));
+});

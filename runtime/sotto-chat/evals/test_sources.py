@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from urllib.request import Request, urlopen
+
+import pytest
 
 
 def test_caught_external_read_still_has_failure_evidence(tmp_path):
@@ -225,3 +228,170 @@ for url in ('https://gmail.googleapis.com/gmail/v1/users/me/messages/unknown',
     assert any(row['query'].get('q') == ['newer_than:1d'] for row in reads)
     assert any(row['query'].get('q') == ['in:sent newer_than:1d'] for row in reads)
     assert len([row for row in records if row['source'] == 'denied']) == 3
+
+
+def assert_live_whatsapp_fixture(call, read, jid):
+    tools = call('tools/list', {})['result']['tools']
+    assert [tool['name'] for tool in tools] == ['get_contacts', 'read_history']
+    assert [row['source_id'] for row in read('get_messages', identifier=jid)['result']['structuredContent']['messages']] == [12, 10]
+    absent_jid = '12025550149@s.whatsapp.net'
+    assert read('get_messages', identifier=absent_jid)['result']['structuredContent'] == {
+        'source': 'whatsapp', 'identifier': absent_jid, 'messages': [],
+    }
+    assert read('get_messages', identifier='Mira Calder')['result']['isError']
+    history = {'since': 1792663200, 'until': 1792670400}
+    first = read('read_history', **history, limit=1)['result']['structuredContent']
+    second = read('read_history', **history, before=first['next_cursor'])['result']['structuredContent']
+    assert [row['source_id'] for row in first['rows'] + second['rows']] == [11, 10]
+    assert [row['source_id'] for row in read('read_history', **(history | {'until': 1792677600}))['result']['structuredContent']['rows']] == [12, 11, 10]
+    assert read('read_history', **history, identifier=jid)['result']['isError']
+    assert read('read_history', **history, before=99)['result']['isError']
+    assert 'error' in read('read_history', **history, source='imessage')
+    return history
+
+
+@pytest.mark.parametrize('contacts_error', [False, True])
+def test_frozen_whatsapp_reads_through_managed_eval_relay(tmp_path, contacts_error):
+
+    here = Path(__file__).resolve().parent
+    data = tmp_path / 'data'
+    data.mkdir()
+    world = tmp_path / 'world.json'
+    jid, other = '12025550140@s.whatsapp.net', '12025550142@s.whatsapp.net'
+    caps = {'tenant_id': 'eval-tenant', 'sources': {
+        source: {'consented': True, 'connected': True} for source in ('whatsapp', 'contacts', 'gmail')}}
+    world.write_text(json.dumps({
+        'savedSourceGrants': ['whatsapp', 'contacts', 'gmail'],
+        'gmailMessages': {},
+        'contacts_error': contacts_error,
+        'contacts': [{'name': 'Mira Calder', 'phones': ['+12025550140'], 'emails': ['mira@example.test']}],
+        'files': {'config/managed-capabilities.json': json.dumps(caps)},
+        'whatsappMessages': [
+            {'source_id': 10, 'contact_jid': jid, 'timestamp': '2026-10-22T10:00:00+00:00', 'text': 'Original'},
+            {'source_id': 11, 'contact_jid': other, 'timestamp': '2026-10-22T10:30:00+00:00', 'text': 'Namesake'},
+            {'source_id': 12, 'contact_jid': jid, 'timestamp': '2026-10-22T13:00:00+00:00', 'text': 'Changed'},
+        ],
+    }))
+    env = {'PATH': os.environ['PATH'], 'HOME': str(tmp_path), 'SOTTO_HOME': str(tmp_path / 'sotto'),
+           'SOTTO_RUNTIME_PROFILE': 'managed-photon-fixed-five-v1', 'SOTTO_DEPLOYMENT_MODE': 'managed',
+           'SOTTO_CRON_DELIVER': 'photon', 'SOTTO_TENANT_ID': 'eval-tenant', 'SOTTO_ACCOUNT_ID': 'eval-account',
+           'SOTTO_LINE_KEY': 'eval-line', 'SOTTO_MCP_TOKEN': 'a' * 64,
+           'PHOTON_HOME_CHANNEL': '+12025550101', 'PHOTON_ALLOWED_USERS': '+12025550101',
+           'SOTTO_IMESSAGE_NUMBER': '+12025550102', 'PHOTON_PROJECT_ID': 'fixture',
+           'PHOTON_PROJECT_SECRET': 'fixture', 'PHOTON_ALLOW_ALL_USERS': 'false'}
+    with subprocess.Popen([sys.executable, str(here / 'receiver.py'), str(world), str(data)],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env) as peer:
+        try:
+            ready = json.loads(peer.stdout.readline())
+
+            def call(method, params):
+                request = Request(f"http://127.0.0.1:{ready['port']}/mcp",
+                                  data=json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method,
+                                                   'params': params}).encode(),
+                                  headers={'Authorization': f"Bearer {ready['readBearer']}",
+                                           'Content-Type': 'application/json'})
+                with urlopen(request, timeout=5) as reply:
+                    return json.load(reply)
+
+            def read(name, **arguments):
+                return call('tools/call', {'name': name, 'arguments': {'source': 'whatsapp', **arguments}})
+
+            def source_state():
+                return json.loads((data / 'config/source-state.json').read_text())['sources']
+
+            def capabilities():
+                request = Request(f"http://127.0.0.1:{ready['port']}/runtime/google-read",
+                                  data=json.dumps({'operation': 'capabilities', 'arguments': {},
+                                                   'source_revision': 'a' * 64}).encode(),
+                                  headers={'Authorization': f"Bearer {ready['readBearer']}",
+                                           'Content-Type': 'application/json'})
+                with urlopen(request, timeout=5) as reply:
+                    return json.load(reply)['item']
+
+            initial_sources = source_state()
+            whatsapp_read = initial_sources['whatsapp']['read']
+            assert whatsapp_read['payload_valid'] is True and whatsapp_read['has_data'] is False
+            contacts_read = initial_sources['contacts']['read']
+            assert contacts_read['status'] == ('degraded' if contacts_error else 'ok')
+            assert contacts_read['field_counts']['contacts'] == int(not contacts_error)
+            grants = capabilities()
+            assert grants['connected'] is grants['gmail_read'] is True
+            assert not grants['calendar_read'] and not grants['gmail_draft']
+
+            history = assert_live_whatsapp_fixture(call, read, jid)
+            for source in ('whatsapp', 'gmail'):
+                caps['sources'][source]['consented'] = False
+            (data / 'config/managed-capabilities.json').write_text(json.dumps(caps))
+            assert 'error' in read('read_history', **history)
+            revoked = call('tools/call', {'name': 'read_local', 'arguments': {
+                'since_hours': 24, 'sources': ['whatsapp']}})
+            assert 'error' in revoked
+            assert source_state() == initial_sources
+            revoked_google = capabilities()
+            assert revoked_google['connected'] is revoked_google['gmail_read'] is False
+        finally:
+            peer.stdin.write('{"op":"stop"}\n')
+            peer.stdin.flush()
+            peer.wait(timeout=10)
+    receipts = [json.loads(line) for line in (tmp_path / 'source-reads.jsonl').read_text().splitlines()]
+    assert [row for row in receipts if row['source'] == 'bridge_snapshot'] == [
+        {'source': 'bridge_snapshot', 'sources': ['contacts', 'whatsapp']}]
+    assert [row['message_ids'] for row in receipts if row['source'] == 'whatsapp'] == [[12, 10], [], [11], [10], [12, 11, 10]]
+    assert len([row for row in receipts if row['source'] == 'denied']) == 3
+
+
+def test_continuation_builder_preserves_exact_brief_and_cutoff(tmp_path):
+    here = Path(__file__).resolve().parent
+    report = tmp_path / 'report.json'
+    brief = '*Should Handle Today*\n- Mira Calder: Footbridge comments. I can draft a reply.\n'
+    report.write_text(json.dumps({'brief': brief, 'cutoff': '2026-10-22T12:00:00+00:00',
+                                  'arm': 'combined', 'prompt': 'SenderEmail: mira@example.test'}))
+
+    def build(name, *extra):
+        output = tmp_path / name
+        subprocess.run([sys.executable, str(here / 'plan_continuation.py'), '--case', 'footbridge',
+                        '--brief-report', str(report), '--output', str(output), *extra], check=True)
+        return json.loads(output.read_text())
+
+    original = build('original.json')
+    changed = build('changed.json', '--read-cutoff', '2026-10-22T13:00:00+00:00')
+    assert original['turns'][0]['backgroundBefore'] == changed['turns'][0]['backgroundBefore'] == brief
+    for scenario in (original, changed):
+        assert [turn['text'] for turn in scenario['turns']] == ['yes', 'Shorter please.']
+        assert all(turn['canonicalUnchanged'] and turn['bridgeSends'] == turn['publicReads'] == 0
+                   for turn in scenario['turns'])
+    for turn in original['turns']:
+        assert "should we hold off on Saturday's 40-person preview?" in turn['excludes']
+    assert set(original['world']['files']) == {'config/managed-capabilities.json'}
+    original_rows = original['world']['whatsappMessages']
+    changed_rows = changed['world']['whatsappMessages']
+    assert changed_rows[:-1] == original_rows
+    assert changed_rows[-1]['source_id'] == 4
+    assert changed_rows[-1]['timestamp'] == '2026-10-22T13:00:00+00:00'
+
+
+def test_continuation_refuses_wrong_report_case(tmp_path):
+    report = {'brief': 'A real brief.', 'cutoff': '2026-10-22T12:00:00+00:00',
+              'arm': 'combined', 'prompt': 'SenderEmail: nolan@example.test'}
+    build = run_continuation_builder(tmp_path, report)
+    assert build.returncode != 0
+    assert 'does not match the requested case' in build.stderr
+    assert not (tmp_path / 'scenario.json').exists()
+
+
+def test_continuation_refuses_cutoff_before_later_message(tmp_path):
+    report = {'brief': 'A real brief.', 'cutoff': '2026-10-22T12:00:00+00:00',
+              'arm': 'combined', 'prompt': 'SenderEmail: mira@example.test'}
+    build = run_continuation_builder(tmp_path, report, '--read-cutoff', '2026-10-22T12:30:00+00:00')
+    assert build.returncode != 0
+    assert 'at least one hour after the brief cutoff' in build.stderr
+    assert not (tmp_path / 'scenario.json').exists()
+
+
+def run_continuation_builder(tmp_path, report, *extra):
+    here = Path(__file__).resolve().parent
+    report_path = tmp_path / 'report.json'
+    report_path.write_text(json.dumps(report))
+    return subprocess.run([sys.executable, str(here / 'plan_continuation.py'), '--case', 'footbridge',
+                           '--brief-report', str(report_path), '--output', str(tmp_path / 'scenario.json'),
+                           *extra], capture_output=True, text=True)

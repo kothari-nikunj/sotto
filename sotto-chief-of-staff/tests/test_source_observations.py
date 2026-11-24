@@ -369,19 +369,19 @@ def test_revocation_hides_previous_activity_counts_and_does_not_get_undone(tmp_p
 CONTEXT = [
     ('imessage', {'imessage': [{'handle': '+15550001001', 'text': 'Message fixture: please review the proposal before our meeting next week.',
                                'is_from_me': False, 'is_read': False, 'date': stamp(), 'timestamp': stamp()}],
-                  'contacts': [{'name': 'Alex Fixture', 'phones': ['+15550001001'], 'emails': []}]}, ['Message fixture:']),
+                  'contacts': [{'name': 'Alex Fixture', 'phones': ['+15550001001']}]}, ['Message fixture:']),
     ('whatsapp', {'whatsapp': [{'contact_jid': '15550001001@s.whatsapp.net', 'partner_name': 'Alex Fixture',
                                'text': 'WhatsApp fixture: please review the proposal before our meeting next week.',
                                'is_from_me': False, 'is_read': False, 'timestamp': stamp()}],
-                  'contacts': [{'name': 'Alex Fixture', 'phones': ['+15550001001'], 'emails': []}]}, ['WhatsApp fixture:']),
+                  'contacts': [{'name': 'Alex Fixture', 'phones': ['+15550001001']}]}, ['WhatsApp fixture:']),
     ('calls', {'calls': [{'phone': '+15550001001', 'timestamp': stamp(), 'is_outgoing': False,
                          'is_answered': False, 'call_type': 'phone'}],
-               'contacts': [{'name': 'Missed Call Fixture', 'phones': ['+15550001001'], 'emails': []}]}, ['Missed Call Fixture']),
+               'contacts': [{'name': 'Missed Call Fixture', 'phones': ['+15550001001']}]}, ['Missed Call Fixture']),
     ('whatsapp_calls', {'whatsapp_calls': [{'jid': '15550001001@s.whatsapp.net', 'timestamp': stamp(),
                                            'is_outgoing': False, 'is_missed': True}],
-                        'contacts': [{'name': 'WhatsApp Call Fixture', 'phones': ['+15550001001'], 'emails': []}]}, ['WhatsApp Call Fixture']),
-    ('contacts', {'contacts': [{'name': 'Contact Fixture', 'phones': [], 'emails': [],
-                               'notes': 'Contact fixture context from our introduction.'}], 'contacts_total': 1},
+                        'contacts': [{'name': 'WhatsApp Call Fixture', 'phones': ['+15550001001']}]}, ['WhatsApp Call Fixture']),
+    ('contacts', {'contacts': [{'name': 'Contact Fixture', 'phones': ['+15550001001'], 'notes':
+                  'Contact fixture context'}], 'contacts_total': 1, 'calls': [{'phone': '+15550001001'}]},
      ['Contact fixture context']),
     ('chrome', {'chrome_history': [{'domain': 'chrome-fixture.example', 'visit_count': 3,
                                    'top_titles': ['Chrome fixture title']}],
@@ -426,8 +426,8 @@ def test_bridge_read_reaches_real_brief_prompt_and_revocation_removes_it(
         monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
         monkeypatch.setenv('SOTTO_TENANT_ID', 'synthetic')
         caps = {'tenant_id': 'synthetic', 'sources': {source: {'consented': True, 'connected': True}}}
-        if 'contacts' in payload:
-            caps['sources']['contacts'] = {'consented': True, 'connected': True}
+        for extra in {'contacts', 'calls'} & {*payload}:
+            caps['sources'][extra] = {'consented': True, 'connected': True}
         path = tmp_path / 'config/managed-capabilities.json'
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps(caps))

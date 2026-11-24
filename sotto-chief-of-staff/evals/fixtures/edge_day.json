@@ -34,12 +34,12 @@
     {
       "filename": "loop-active.md",
       "frontmatter": {
-        "anchor_key": "imessage:follow_up:id:8005551000",
+        "anchor_key": "imessage:follow_up:id:8005550100",
         "status": "open",
         "action_type": "reply",
         "channel": "imessage",
         "contact_name": "Nadia Ops",
-        "contact_identifier": "+18005551000",
+        "contact_identifier": "+18005550100",
         "created_at": "{{TS-6h}}",
         "times_surfaced": 1,
         "summary": "Nadia asked for PO approval"
@@ -48,7 +48,7 @@
     {
       "filename": "loop-malformed.md",
       "malformed": true,
-      "raw": "---\nanchor_key: broken\nstatus: open\ncontact_name: \"Unclosed [list, {mapping: oops\n  - dangling: : :\nthis file: has no closing fence and invalid yaml\ncontact_identifier: +12125550000\n"
+      "raw": "---\nanchor_key: broken\nstatus: open\ncontact_name: \"Unclosed [list, {mapping: oops\n  - dangling: : :\nthis file: has no closing fence and invalid yaml\ncontact_identifier: +12125550100\n"
     }
   ],
   "stub_response": {
@@ -59,14 +59,14 @@
         "type": "reply",
         "channel": "imessage",
         "contactName": "Nadia Ops",
-        "contactIdentifier": "+18005551000"
+        "contactIdentifier": "+18005550100"
       },
       {
         "id": "e2",
         "type": "reply",
         "channel": "whatsapp",
         "contactName": "Yuki Tanaka",
-        "contactIdentifier": "818012345678@s.whatsapp.net"
+        "contactIdentifier": "818015550147@s.whatsapp.net"
       },
       {
         "id": "e3",
@@ -86,7 +86,7 @@
     "first_run": false,
     "window_hours": 24,
     "google": {
-      "userEmail": "you@sotto.com",
+      "userEmail": "you@sotto.test",
       "userTimezone": "+00:00",
       "events": [],
       "emails": []
@@ -106,21 +106,21 @@
           "name": "Bob Vance",
           "emails": [],
           "phones": [
-            "+17185550009"
+            "+17185550100"
           ]
         },
         {
           "name": "Nadia Ops",
           "emails": [],
           "phones": [
-            "+18005551000"
+            "+18005550100"
           ]
         },
         {
           "name": "Yuki Tanaka",
           "emails": [],
           "phones": [
-            "+818012345678"
+            "+818015550147"
           ]
         }
       ],
@@ -140,21 +140,21 @@
       ],
       "imessage": [
         {
-          "handle": "+17185550009",
+          "handle": "+17185550100",
           "is_from_me": false,
           "is_group_chat": false,
           "timestamp": "{{TS-3h}}",
           "text": "🔥 we shipped it!! 🎉🎉 ¿todo bien? 你好 — call me?"
         },
         {
-          "handle": "+18005551000",
+          "handle": "+18005550100",
           "is_from_me": false,
           "is_group_chat": false,
           "timestamp": "{{TS-2h}}",
           "text": "Can you approve the PO? 🙏 need it before EOD"
         },
         {
-          "handle": "+818012345678",
+          "handle": "+818015550147",
           "is_from_me": false,
           "is_group_chat": false,
           "timestamp": "{{TS-4h}}",
@@ -167,20 +167,20 @@
           "chat_guid": "grp-ops",
           "group_name": "Ops War Room",
           "group_participants": [
-            "+18005551000",
+            "+18005550100",
             "+15551230000"
           ],
           "timestamp": "{{TS-5h}}",
           "text": "Deploy window still 3pm?"
         },
         {
-          "handle": "+18005551000",
+          "handle": "+18005550100",
           "is_from_me": false,
           "is_group_chat": true,
           "chat_guid": "grp-ops",
           "group_name": "Ops War Room",
           "group_participants": [
-            "+18005551000"
+            "+18005550100"
           ],
           "timestamp": "{{TS-4h}}",
           "text": "confirmed on my end, need a go/no-go from you"
@@ -191,20 +191,20 @@
           "is_group_chat": true,
           "chat_guid": "grp-trip",
           "group_participants": [
-            "+18005551000",
-            "+818012345678",
+            "+18005550100",
+            "+818015550147",
             "+15559990000"
           ],
           "timestamp": "{{TS-6h}}",
           "text": "Who's booking the cabin?"
         },
         {
-          "handle": "+818012345678",
+          "handle": "+818015550147",
           "is_from_me": false,
           "is_group_chat": true,
           "chat_guid": "grp-trip",
           "group_participants": [
-            "+818012345678"
+            "+818015550147"
           ],
           "timestamp": "{{TS-5h}}",
           "text": "I can if someone sends the dates"
@@ -219,7 +219,7 @@
       ],
       "whatsapp": [
         {
-          "contact_jid": "818012345678@s.whatsapp.net",
+          "contact_jid": "818015550147@s.whatsapp.net",
           "partner_name": "Yuki Tanaka",
           "is_from_me": false,
           "is_group_chat": false,
@@ -234,8 +234,8 @@
           "chat_guid": "120363111@g.us",
           "group_name": "Weekend Hikers",
           "group_participants": [
-            "18005551000@s.whatsapp.net",
-            "818012345678@s.whatsapp.net"
+            "18005550100@s.whatsapp.net",
+            "818015550147@s.whatsapp.net"
           ],
           "timestamp": "{{TS-80m}}",
           "text": "trailhead at 7am?"
@@ -247,8 +247,8 @@
           "is_group_chat": true,
           "chat_guid": "120363222@g.us",
           "group_participants": [
-            "18005551000@s.whatsapp.net",
-            "818012345678@s.whatsapp.net"
+            "18005550100@s.whatsapp.net",
+            "818015550147@s.whatsapp.net"
           ],
           "timestamp": "{{TS-70m}}",
           "text": "who's bringing snacks?"

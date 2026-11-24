@@ -1,5 +1,6 @@
 """Canonical subset publication retains selection order and existing apply proofs."""
 import copy
+from datetime import timedelta
 from pathlib import Path
 import pytest
 
@@ -130,3 +131,25 @@ def test_subset_refuses_duplicate_anchor_instead_of_renumbering_remaining_tasks(
     result = call(request(proposal['args'], event='b'*64, operation='preview', text='Show those three tasks'), context)
     assert result['status'] == 'rejected' and result['code'] == 'target_unavailable'
     assert {path: path.read_bytes() for path in context[0].rglob('*.md')} == before
+
+
+def test_a_looks_done_task_from_fridays_review_closes_only_through_the_numbered_confirm(context):
+    import loop_checks
+    import retune_scan
+    from delivery_effects import loop_version
+    from test_runtime_owner_loop_close import WHEN
+    context[1]['_source_authority']=lambda:{'complete':True,'revision':'a'*64,'google_sources':[]}
+    for index,name in enumerate(['amber','birch'],1):
+        call(request({'operation':'add','text':name},event=str(index)*64,text='Add '+name),context)
+    amber=next(row for row in rows() if row['summary']=='amber')
+    loop_checks.add(loop_version(amber),{'basis':'you_messaged','at':(WHEN-timedelta(days=4)).isoformat(),'source':'imessage'})
+    looks=[row['anchor_key'] for row in retune_scan.scan(now=WHEN)['looks_done']]
+    assert looks==[amber['anchor_key']] and all(row['status']=='open' for row in rows())
+    original={'operation':'propose_cleanup','scope':'open','source_revision':'a'*64,'anchor_keys':looks}
+    proposal=request(original,event='a'*64,operation='preview',text='Which of these look done?')
+    preview=call(proposal,context)
+    assert [row['what'] for row in preview['review']['rows']]==['amber']
+    assert call(completion(proposal,preview),context)['outcome']=='complete'
+    after={row['summary']:row for row in rows()}
+    assert after['amber']['status']=='resolved' and after['amber']['resolution']=='user_resolved'
+    assert after['birch']['status']=='open'

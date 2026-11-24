@@ -11,6 +11,10 @@ class UnavailableError(RuntimeError):
     pass
 
 
+class TimedOutError(UnavailableError):
+    """The read hit its time bound; the result is unknown, not empty."""
+
+
 def validate(body):
     if (type(body) is not dict or set(body) != {'operation', 'arguments', 'source_revision'}
             or body['operation'] not in ('knowledge_query', 'master_file', 'loops_query', 'granola_history', 'relationship_importance', 'relationship_attention', 'triage_queue', 'style_apply', 'retune_scan')
@@ -91,7 +95,12 @@ def validate(body):
             raise ValueError('triage arguments invalid')
         return argv
     if body['operation'] == 'loops_query':
-        if argv not in ([], ['--parked']):
+        client_page = (len(argv) == 5 and argv[0] == '--client-page'
+                       and re.fullmatch(r'[1-9]|1[0-9]|20', argv[1])
+                       and re.fullmatch(r'first|[a-f0-9]{64}:[0-9]{1,9}', argv[2])
+                       and argv[3] in ('you_owe', 'they_owe', 'both')
+                       and re.fullmatch(r'[0-9]|[12][0-9]|30', argv[4]))
+        if argv not in ([], ['--parked']) and not client_page:
             raise ValueError('loops arguments invalid')
         return argv
     if body['operation'] == 'master_file':
@@ -175,8 +184,10 @@ def perform(body, *, script, executable, env, authority, disconnected=None, init
                 "s=importlib.util.spec_from_file_location('sotto_loops_read',sys.argv[1]); "
                 "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
                 "print(json.dumps(m.query_permitted_rows(os.environ['SOTTO_DATA'],json.loads(sys.argv[2]),"
-                "include_parked=sys.argv[3]=='1',include_ask=True)))")
-        command = [executable, '-I', '-B', '-c', code, script, json.dumps(permitted), '1' if argv else '0']
+                "include_parked=sys.argv[3:]==['--parked'],include_ask=True,"
+                "client_page=(int(sys.argv[4]),sys.argv[5],sys.argv[6],int(sys.argv[7])) "
+                "if sys.argv[3:4]==['--client-page'] else None)))")
+        command = [executable, '-I', '-B', '-c', code, script, json.dumps(permitted), *argv]
     if body['operation'] == 'retune_scan':
         permitted = before.get('bridge_sources', []) + before.get('google_sources', []) + before.get('connector_sources', [])
         code = ("import importlib.util,json,os,sys; "
@@ -228,7 +239,10 @@ def perform(body, *, script, executable, env, authority, disconnected=None, init
                     process.kill()
                 process.wait()
     else:
-        result = subprocess.run(command, env=child_env, capture_output=True, timeout=10)
+        try:
+            result = subprocess.run(command, env=child_env, capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:  # its text names the command and the person asked about
+            raise TimedOutError('knowledge query timed out') from None
     if result.returncode or len(result.stdout) > 64 * 1024:
         raise UnavailableError('knowledge query unavailable')
     def reject_constant(value):

@@ -33,8 +33,14 @@ export function meetingPrepSelectors(inbound: Inbound): OwnerMeetingPrepArgs | n
   // question after an intervening Node reply. Never infer that authority here.
   return parsed.success ? parsed.data : null;
 }
-export const ownerMeetingPrepRejectionSchema = z.enum(['event_conflict', 'already_requested',
+export const ownerMeetingPrepRejectionSchema = z.enum(['event_conflict', 'already_requested', 'prep_window_closed',
   'no_matching_offer', 'ambiguous_offer', 'unsupported_offer', 'needs_context', 'pending_delivery', 'unavailable']);
+export const prepWindowClosedReply = 'There isn’t enough time to deliver prep before this meeting.';
+export function prepAdmissionReply(queued: boolean, reason: string | null): string {
+  if (queued) return 'Your meeting prep is queued.';
+  return reason === 'prep_window_closed' ? prepWindowClosedReply
+    : 'I could not identify an available meeting-prep offer from that reply. Please reply directly to a current meeting-prep offer.';
+}
 export const ownerMeetingPrepReceiptSchema = z.object({
   version: z.literal(1), status: z.literal('committed'), action_id: hex, event_id: hex,
   payload_hash: hex, args_hash: hex,

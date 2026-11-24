@@ -9,6 +9,8 @@ from the loop below and pin it per-file again.
 import os
 import sys
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -24,3 +26,13 @@ _insert("_shared", "knowledge")
 for _entry in sorted(os.listdir(ROOT)):
     if not _entry.startswith((".", "_")):
         _insert(_entry, "scripts")
+
+
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    """A test that writes os.environ directly must not change what the next test sees."""
+    saved = dict(os.environ)
+    yield
+    if dict(os.environ) != saved:
+        os.environ.clear()
+        os.environ.update(saved)

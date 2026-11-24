@@ -11,19 +11,22 @@ A periodic "tune-up" surfaces three things, all deterministic from the volume:
   - mute_suggestions: empty until explicit feedback can be distinguished from inferred draft
                      non-use. Existing deprioritization_hints are not evidence to mute a person.
   - current        : the settings a retune might change (timezone + the explicit mutes/tone in effect).
+  - looks_done     : open tasks you owe whose "maybe done" note (`loop_checks`) is LOOKS_DONE_DAYS old
+                     or more with no later message from them (`replied_since`), or whose date passed
+                     (`dates_passed`). Only the owner closes them, through the numbered confirm.
 
 Read-only. `retune_apply.py` performs the chosen dismiss/snooze/keep; `preferences.py` performs mutes.
 
-Usage: retune_scan.py        → {stale_loops, mute_suggestions, current, counts}
+Usage: retune_scan.py        → {stale_loops, looks_done, mute_suggestions, current, counts}
 Env: SOTTO_DATA, SOTTO_TIMEZONE. Named constants, not knobs (defaults matter — see CLAUDE.md):
-STALE_AGE_DAYS, STALE_SURFACED.
+STALE_AGE_DAYS, STALE_SURFACED, LOOKS_DONE_DAYS.
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
@@ -38,6 +41,7 @@ from ledger_provenance import project_entries  # noqa: E402
 # is what THEY owe you; `follow_up_stale` is a nudge YOU owe them, so it sits in you_owe.
 STALE_AGE_DAYS = 4    # a loop this many days old is stale — long enough that it isn't just "today"
 STALE_SURFACED = 3    # …or surfaced this many times without moving, which says the same thing
+LOOKS_DONE_DAYS = 3   # a "maybe done" note this old, with no reply from them since, looks done
 REMINDER_HANDOFF = "reminded you twice — draft a follow-up or drop"
 LEGACY_CHASE_HANDOFF = "chased twice — nudge again or drop"
 
@@ -45,7 +49,30 @@ LEGACY_CHASE_HANDOFF = "chased twice — nudge again or drop"
 def scan(now=None, *, rows=None) -> dict:
     """Return every stale active obligation, using an injectable clock for brief rendering/tests."""
     today = now or _now_local(configured_tz() or "+00:00")
-    return _scan_rows(ledger_io.load_active(now=today) if rows is None else rows, today)
+    rows = ledger_io.load_active(now=today) if rows is None else rows
+    out = _scan_rows(rows, today)
+    out["looks_done"] = looks_done(rows, today)
+    out["counts"]["looks_done"] = len(out["looks_done"])
+    return out
+
+
+def looks_done(rows: list[dict], today: datetime) -> list[dict]:
+    """Open tasks you owe that look done from their saved note alone. Read-only; no model."""
+    import loop_checks
+    from delivery_effects import loop_version
+    checks, found = loop_checks.read(), []
+    instant = today.astimezone(timezone.utc)
+    for it in rows:
+        note = checks.get(loop_version(it)) or {}
+        age = ledger_io.age_days(note.get("at"), instant)
+        if (it.get("status", "open") not in ledger_io.ACTIVE or ledger_io.is_waiting_on(it.get("action_type"))
+                or note.get("basis") in loop_checks.INTERACTION_BASES | {None, "meeting_cancelled"} or note.get("replied_since")
+                or (note["basis"] != "dates_passed" and (age is None or age < LOOKS_DONE_DAYS))):
+            continue
+        found.append({"anchor_key": _s(it.get("anchor_key")), "name": ledger_io.contact_label(it),
+                      "what": ledger_io.task_label(it)[:200], "basis": note["basis"],
+                      "note": loop_checks.note_for(it, checks), "note_age_days": age})
+    return found
 
 
 

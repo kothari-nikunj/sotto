@@ -7,10 +7,6 @@ The retention sweep: THE one table of what Sotto's volume keeps, and for how lon
 module is the half a person never has to ask for: a daily sweep, fired from the receiver's own cron
 thread, that ages out the exhaust nobody would otherwise remember to delete.
 
-It is MACHINERY, deliberately. Retention written as a skill instruction is retention that stops
-happening the first time a model has a better idea — four prompt-adherence failures in Aug
-2026 settled that. Nothing here asks anyone to remember anything.
-
 WHAT IT SWEEPS: exhaust — receipts, staged intermediates, dated markers, diagnostics.
 WHAT IT NEVER SWEEPS: the graph (`knowledge/`), the continuity ledger, the golden corpus, your
 settings, your credentials, and the decks you asked Sotto to read. `NEVER` below enforces that per
@@ -127,21 +123,19 @@ DELIVERY_RECEIPT_DAYS = 90
 SEND_RECEIPT_DAYS = 180
 # Triage verdicts — the "why didn't I get nudged?" substrate; a quarter answers every real ask.
 TRIAGE_VERDICT_DAYS = 90
-# One line per dashboard write, on the same clock as the delivery receipts.
 DASHBOARD_AUDIT_DAYS = 90
+MCP_AUDIT_DAYS = 30
 # A draft's WORDS. draft_outcomes matches within 24 hours and the learning loop re-runs each brief,
 # so a month is generous; past that it is old text about a conversation that already happened.
 DRAFT_LEDGER_DAYS = 30
-# Delivered briefs and their per-day markers, on the same clock as `knowledge/snapshots/` (which
-# compose_brief.py already prunes at 60 days) — the brief and the payload it was built from age out
-# together or the archive tells half a story.
+# Delivered briefs and per-day markers share `knowledge/snapshots/`' 60 days (compose_brief.py
+# prunes those), so a brief and its payload age out together.
 BRIEF_ARCHIVE_DAYS = 60
-# Staged intermediates: a payload or an effects file is read by the run it was staged for and is
-# dead weight the next morning. A week is the crash margin, the same one the receiver's event
-# bundles already get.
+# Staged intermediates are dead weight the next morning; a week is the crash margin (as for
+# event bundles) and time to inspect a set-aside file.
 STAGED_DAYS = 7
 NOTES_CACHE_DAYS = 1  # raw meeting notes are a short-lived input, not the canonical graph
-# The once-per-day nudge dedup stamps. Only today's is ever read; a month is pure forensics.
+# Once-per-day nudge dedup stamps. Only today's is read; a month is forensics.
 PROACTIVE_STAMP_DAYS = 30
 # The brief log's ceiling — defence in depth above sotto_log.bounded_append's own 4 MB rotation,
 # which every writer now routes through. Above the writer's threshold on purpose: in normal
@@ -190,6 +184,9 @@ class Exempt:
 
 
 SWEEP = (
+    Rule("logs/mcp-access-????-??-??.jsonl", DELETE_OLDER, MCP_AUDIT_DAYS, "assistant read metadata"),
+    Rule("*.corrupt.*", DELETE_OLDER, STAGED_DAYS, "a set-aside state file"),
+    Rule("*/*.corrupt.*", DELETE_OLDER, STAGED_DAYS, "the same, in a data folder"),
     Rule("events/owner-meeting-prep-offers.json", DELETE_OLDER, STAGED_DAYS,
          "detached chat prep questions expire in three hours; idle proposal state ages out with staged artifacts"),
     Rule("events/triage-artifacts/*.json", DELETE_OLDER, STAGED_DAYS,
@@ -264,6 +261,7 @@ EXEMPT = (
            "empty persistent gate; deleting it could split revocation and writer lock owners"),
     Exempt("events/triage-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
     Exempt("events/model-work.sqlite3*", "model_work prunes opaque attempt records after 90 days on use"),
+    Exempt("events/loop-checks.json", "loop_check rewrites it each Learn pass; no source text"),
     Exempt("events/notification-artifacts/lock-*", "at most 256 content-free artifact lock shards"),
     Exempt("events/research-artifacts/lock-*", "at most 256 content-free lock shards per lock kind (five kinds plus the DocSend lock, 1,281 in all)"),
     Exempt(".sotto-volume.json", "prepare_fresh writes the tenant/volume identity receipt"),
@@ -300,6 +298,8 @@ EXEMPT = (
     Exempt("cache/calendar_changes.json",
            "one bounded calendar-window baseline, atomically overwritten by calcache"),
     Exempt("cache/update_check.json", "one file, overwritten by the daily update check"),
+    Exempt("cache/session_rotation.json", "one date stamp, overwritten by the nightly session rotation"),
+    Exempt("cache/brief-window.json", "per-source read stamps"),
     Exempt("cache/update_notice.json", "one file, overwritten per version"),
     Exempt("events/seen.json", "a bounded idempotency ring, rewritten in place"),
     Exempt("events/gmail_seen.json", "one cursor file, rewritten in place"),
@@ -432,10 +432,9 @@ def _apply_drop_lines(path: str, days: int, now: float) -> int:
     mtime."""
     cutoff = time.strftime("%Y-%m-%d", time.gmtime(now - days * 86400))
     # Under the `<path>.lock` sidecar flock (external review, Aug 31: read-then-replace without it
-    # swallowed any line appended in between). Every writer of these ledgers takes the same sidecar
-    # flock — the receiver's own appenders, event-triage's budget writes, google_action's
-    # `bounded_append` receipt line, and forget.py --receipts — so none of them can interleave with
-    # this sweep.
+    # swallowed any line appended in between). Every writer of these ledgers takes the same flock
+    # (the receiver's appenders, event-triage's budget writes, google_action's `bounded_append`
+    # receipt line, forget.py --receipts), so none can interleave with this sweep.
     with HOOKS["jsonl_lock"](path):
         with open(path, encoding="utf-8") as f:
             lines = f.readlines()

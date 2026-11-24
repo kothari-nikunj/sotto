@@ -95,7 +95,7 @@ def test_negative_ambiguous_unrelated_or_partial_text_has_no_unreviewed_closure(
 def test_same_display_name_is_not_cross_channel_identity(tmp_path):
     _payload, rows = seed_capture(tmp_path)
     row = rows['Send the pricing document']
-    stranger = {**DELIVERY, 'handle': '+14155550999', 'contact_name': 'Maya Journey'}
+    stranger = {**DELIVERY, 'handle': '+14155550105', 'contact_name': 'Maya Journey'}
     update = reviewed_proposal(row, stranger)
     result = cr.resolve({'today': '2026-10-19', 'local': {'imessage': [stranger]},
                          'loop_updates': [update]}, CLOSE_AT)
@@ -263,7 +263,7 @@ def test_recapture_touch_preserves_valid_source_provenance_without_rewriting_con
 
 
 @pytest.mark.parametrize('field,value', [('summary', 'Different task'),
-    ('contact_identifier', '+14155550999'), ('source_refs', [{'sourceType': 'email', 'sourceId': 'other-mail'}])])
+    ('contact_identifier', '+14155550105'), ('source_refs', [{'sourceType': 'email', 'sourceId': 'other-mail'}])])
 def test_audited_resolution_writer_rejects_changes_to_task_identity_or_original_evidence(tmp_path, field, value):
     row = _stamped_capture(tmp_path)
     update = reviewed_proposal(row)
@@ -335,7 +335,7 @@ def test_reviewed_full_ask_on_verified_channel_does_not_get_still_open_duplicate
 def test_unverified_channel_cannot_claim_a_source_bound_display_review(tmp_path):
     row = _capture_with_precise_asks(tmp_path)['Promised launch checklist delivery']
     out = {'brief_markdown': ('## Should Handle Today\n'
-        '**Maya Journey**<!--id:+14155550999|ch:imessage--> - Send the launch checklist '
+        '**Maya Journey**<!--id:+14155550105|ch:imessage--> - Send the launch checklist '
         f'<!--loop:{row["anchor_key"]}-->.')}
     mentions = compose_brief._task_mention_review(out,
         {'now': CLOSE_AT.isoformat(), 'local': {'imessage': [DELIVERY]}})
@@ -452,7 +452,7 @@ def test_action_recipient_validator_uses_exact_verified_alias_ownership(tmp_path
     import knowledge
     _payload, rows = seed_capture(tmp_path)
     row = rows['Send the launch checklist']
-    claimed = PHONE if kind != 'stranger' else '+14155550999'
+    claimed = PHONE if kind != 'stranger' else '+14155550105'
     if kind == 'ambiguous_alias':
         knowledge.write_person_file(str(tmp_path / 'knowledge/people/c_abc194.md'), knowledge.PersonFile(
             name='Maya Journey', canonical_id='c_abc194', identifiers=[PHONE, 'other@example.test']))

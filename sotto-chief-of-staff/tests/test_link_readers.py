@@ -136,11 +136,11 @@ def test_docsend_gate_flow_posts_the_users_email_and_reads_pages():
         seen["n"], seen["title"] = len(images), title
         return "Page 1: intro\nSUMMARY: Acme builds X."
 
-    out = df.fetch_deck("https://docsend.com/view/abc123", "nikunj@fpv.com", http=http,
+    out = df.fetch_deck("https://docsend.com/view/abc123", "casey@hbr.example", http=http,
                         vision=vision)
     assert out["status"] == "ok" and out["pages"] == 2
     assert "Acme builds X." in out["text"]
-    assert http.posts[0]["link_auth_form[email]"] == "nikunj@fpv.com"
+    assert http.posts[0]["link_auth_form[email]"] == "casey@hbr.example"
     assert http.posts[0]["authenticity_token"] == "form-tok"   # form token preferred over meta
     assert seen["n"] == 2 and "Acme Seed Deck" in out["title"]
 
@@ -345,13 +345,13 @@ def test_docsend_gate_is_posted_as_docsend_wrote_it(monkeypatch):
     along instead of breaking the reader. The feedback form on the same page is not the gate."""
     monkeypatch.setenv("SOTTO_TIMEZONE", "America/Los_Angeles")
     http = RealGateHttp()
-    out = df.fetch_deck("https://docsend.com/view/7h2ygycypj4uw79n", "nikunj@fpv.com", http=http,
+    out = df.fetch_deck("https://docsend.com/view/7h2ygycypj4uw79n", "casey@hbr.example", http=http,
                         vision=lambda images, title: "SUMMARY: Dream builds X.")
     assert out["status"] == "ok", out
     assert http.post_urls == ["https://docsend.com/view/7h2ygycypj4uw79n"]
     (fields,) = http.posts
     assert fields["_method"] == "patch" and fields["authenticity_token"] == "form-tok-2026"
-    assert fields["link_auth_form[email]"] == "nikunj@fpv.com"
+    assert fields["link_auth_form[email]"] == "casey@hbr.example"
     assert fields["link_auth_form[email_sniffing][email_polling_complete]"] == "false"
     assert fields["link_auth_form[timezone_offset]"] in ("420", "480"), "what the gate's JS would send"
     assert not any(k.startswith("feedback") for k in fields)

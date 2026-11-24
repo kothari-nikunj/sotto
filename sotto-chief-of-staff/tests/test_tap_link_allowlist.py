@@ -233,22 +233,26 @@ def test_allowlist_covers_every_source_channel(tmp_path, monkeypatch):
     norm = brief_validate._normalize_identifier
     inputs = {
         "google": {
-            "emails": [{"threadId": "t-board", "from": "Ivy Park <ivy@lumen.vc>",
-                        "to": "you@sotto.com, Leo <leo@acme.com>"}],
+            "emails": [{"threadId": "t-board", "from": "Ivy Park <ivy@lumen.example>",
+                        "to": "you@sotto.test, Leo <leo@acme.com>"}],
             "events": [{"id": "evt-acme", "meetingLink": "https://meet.google.com/rich-acme-abc",
                         "attendees": [{"email": "dana@acme.com"}],
-                        "organizer": {"email": "you@sotto.com"}}],
+                        "organizer": {"email": "you@sotto.test"}}],
         },
         "local": {
-            "contacts": [{"name": "Sarah", "phones": ["+1 (555) 123-4567"], "emails": ["S@Acme.com"]}],
-            "imessage": [{"handle": "+12069994970"}],
+            "contacts": [{"name": "Sarah", "phones": ["+1 (555) 123-4567"], "emails": ["S@Acme.com"]},
+                         {"name": "Tomas", "emails": ["tomas@vendorco.com"]}],
+            "imessage": [{"handle": "+12065550143"}],
             "whatsapp": [{"contact_jid": "15558887777@s.whatsapp.net", "sender_jid": "447700900000@lid",
                           "chat_guid": "120363111@g.us"}],
             "calls": [{"phone": "+14155550123"}],
-            "whatsapp_calls": [{"jid": "13035551188@s.whatsapp.net"}],
+            "whatsapp_calls": [{"jid": "13035550100@s.whatsapp.net"}],
             "contact_index": [{"canonical_id": "c_abc123", "identifiers": ["graph@person.com"]}],
             "action_ledger": [{"status": "open", "contact_identifier": "+19995550000"}],
-            "stale_threads": [{"threadId": "t-stale", "to": "tomas@vendorco.com"}],
+            "stale_threads": [
+                {"threadId": "t-stale", "to": "tomas@vendorco.com", "toEmail": "tomas@vendorco.com"},
+                {"threadId": "t-unknown", "to": "unknown@example.com", "toEmail": "unknown@example.com"},
+            ],
         },
     }
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
@@ -259,13 +263,13 @@ def test_allowlist_covers_every_source_channel(tmp_path, monkeypatch):
     (folder / 'source-task.md').write_text('---\n' + json.dumps(row) + '\n---\n')
     allow = cb.build_tap_target_allowlist(inputs, cb._event_link_map(inputs))
     assert norm('447700900000@lid') == '' and '' not in allow
-    for value in ("15551234567", "s@acme.com", "+12069994970", "15558887777@s.whatsapp.net",
-                  "120363111@g.us", "+14155550123", "13035551188",
+    for value in ("15551234567", "s@acme.com", "+12065550143", "15558887777@s.whatsapp.net",
+                  "120363111@g.us", "+14155550123", "13035550100",
                   "graph@person.com", "+19995550000", "t-stale", "tomas@vendorco.com",
-                  "ivy@lumen.vc", "leo@acme.com", "t-board", "evt-acme", "dana@acme.com",
+                  "ivy@lumen.example", "leo@acme.com", "t-board", "evt-acme", "dana@acme.com",
                   "https://meet.google.com/rich-acme-abc"):
         assert norm(value) in allow, f"source identifier missing from the allowlist: {value}"
-    assert norm("+19999999999") not in allow
+    assert not {norm("+19999999999"), "t-unknown", "unknown@example.com"} & allow
 
 
 def test_a_broken_payload_refuses_links_and_still_composes(tmp_path, monkeypatch):

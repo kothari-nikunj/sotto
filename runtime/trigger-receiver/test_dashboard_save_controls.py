@@ -84,3 +84,50 @@ function toast(message) { messages.push(message); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''
     subprocess.run(['node', '-e', script], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node is not installed')
+def test_now_tasks_failed_read_then_retry_empty():
+    source = (Path(__file__).parent / 'static/app.js').read_text()
+    functions = ''.join(re.search(r'\n  function %s\(.*?\n  \}\n' % name, source, re.S).group(0)
+                        for name in ('viewNow', 'buildLoopsSection', 'errorView', 'emptyState', 'updateLoopCount'))
+    script = functions + r'''
+const assert = require('node:assert/strict');
+let tries = 0, page;
+const state = {renderSeq: 0, entered: {}};
+function el(tag, cls, textContent = '') {
+  return {cls, textContent, children: [], appendChild(node) { this.children.push(node); },
+          querySelector(selector) { return this.children.find(child => child.cls === selector.slice(1)); }};
+}
+const document = {createDocumentFragment: el};
+const main = {appendChild(frag) { page = frag; }};
+function append(parent, node) { if (node) parent.appendChild(node); }
+function api(path) {
+  if (path === '/api/loops' && ++tries === 1) return Promise.reject(new Error('503'));
+  return Promise.resolve(path === '/api/loops' ? {loops: [], parked: []} : {});
+}
+function button(cls, label, click) { return {textContent: label, click, children: []}; }
+function ledgerCap(label, right) { const node = el('h2', '', label); append(node, right); return node; }
+function capCount(text) { return el('span', '', text); }
+function enterOnce(view, node) { return node; }
+function buildDocket() { return el('p', '', 'Calendar still loaded'); }
+function setView() {} function skeletonView() {} function buildParkedSection() {}
+function buildUpdateNote() {} function addLoopControl() { return el('button'); }
+function buildThesis() { return el('p'); } function friendlyDate() { return 'Thursday'; }
+function nodes(node) { return [node, ...node.children.flatMap(nodes)]; }
+(async () => {
+  viewNow();
+  await new Promise(setImmediate);
+  const first = nodes(page);
+  assert(first.some(n => n.textContent === 'Calendar still loaded'));
+  assert(!first.some(n => n.textContent === '0 open' || n.textContent === 'Nothing is waiting on you'));
+  assert(first.some(n => n.textContent === "Tasks couldn't load."));
+  first.find(n => n.textContent === 'Try again').click();
+  await new Promise(setImmediate);
+  const second = nodes(page);
+  assert.equal(tries, 2);
+  assert(second.some(n => n.textContent === 'Nothing is waiting on you'));
+  assert(second.some(n => n.textContent === '0 open'));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+    subprocess.run(['node', '-e', script], check=True, text=True)

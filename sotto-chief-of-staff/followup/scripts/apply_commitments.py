@@ -46,6 +46,8 @@ from datetime import datetime
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "..", "morning-brief", "scripts"))
 import continuity_resolve as cr  # noqa: E402
+from ledger_provenance import source_refs  # noqa: E402
+import capture_shape  # noqa: E402  (on the path continuity_resolve set up)
 
 _USER_ALIASES = {"user", "the user", "me", "you", "i", "myself", "self"}
 
@@ -60,6 +62,18 @@ _GROUNDING_FILLER = {
 # Timing inside the deliverable can distinguish debts (Monday report vs Tuesday report).
 # Only grammatical words may disappear; the separately extracted due date is not identity.
 _DELIVERABLE_IDENTITY_FILLER = _GROUNDING_FILLER | {'him', 'her'}
+_PROMISE_PREFIX = re.compile(
+    r"^([^!?\n:]+?)(?::\s*(?:i'll|i will|i plan to)|"
+    r"\s+(?:will|plans? to|committed to))\s+", re.I)
+_WHEN = (r"(?:\s+(?:today|tomorrow|later|(?:next|this) (?:week|month)|"
+         r"(?:(?:on|next|this) )?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)))?")
+_CLOSE_ASK = {
+    "intro": re.compile(r"(?:intro(?:duce)? (.+?) to|connect (.+?) with) (.+)", re.I),
+    "schedule": re.compile(
+        r"(?:find (?:a )?time|pick a time|(?:book|schedule|set up) (?:a |the )?"
+        r"(?:meeting|call|chat|catch-up))\s+with\s+(.+?)" + _WHEN, re.I),
+    "callback": re.compile(r"(?:call(?:\s+back)?|phone|ring)\s+(.+?)(?:\s+back)?" + _WHEN, re.I),
+}
 
 _s = cr._s   # the shared string coercion (also ISO-stringifies YAML dates), not a private copy
 
@@ -87,25 +101,8 @@ def _owner_is_user(owner: str, user_email: str, user_name: str = "", meeting: di
                 normalized = " ".join(_normalized_what(label).split())
                 if normalized.split()[:1] == [first]:
                     candidates.add(normalized)
-        owner_email = _s(user_email).strip().lower()
-        attendees = meeting.get('attendees', []) or []
-        for attendee in attendees:
-            if not isinstance(attendee, dict):
-                continue
-            email = _s(attendee.get('email')).strip().lower()
-            if email == owner_email:
-                continue
-            name = _normalized_what(attendee.get('name') or attendee.get('display_name'))
-            if name.split()[:1] == [first]:
-                candidates.add(name)
-        for email in meeting.get('attendee_emails', []) or []:
-            if _s(email).strip().lower() == owner_email:
-                continue
-            local = _s(email).split('@', 1)[0]
-            normalized = " ".join(re.split(r"[._+\-]+", local.lower()))
-            if normalized.split()[:1] == [first]:
-                candidates.add('external:' + normalized)
-        return all(candidate in {first, un} for candidate in candidates)
+        return (not (_attendee_matches(first, meeting) - {ue})
+                and all(candidate in {first, un} for candidate in candidates))
     return False
 
 
@@ -126,6 +123,23 @@ def _normalized_what(value: str) -> str:
     # identity evidence, and must not crash the grounding of every other commitment.
     return " ".join("".join(ch.lower() if ch.isalnum() else " "
                            for ch in (value if isinstance(value, str) else "")).split())
+
+
+def _attendee_matches(marker: str, meeting: dict) -> set[str]:
+    def matches(name):
+        return name == marker or (" " not in marker and name.split()[:1] == [marker])
+
+    matched = set()
+    emails = {_s(email).strip().lower() for email in meeting.get("attendee_emails", []) or []}
+    for attendee in meeting.get("attendees", []) or []:
+        if isinstance(attendee, dict) and (email := _s(attendee.get("email")).strip().lower()):
+            emails.add(email)
+            if matches(_normalized_what(attendee.get("name") or attendee.get("display_name"))):
+                matched.add(email)
+    for email in emails - {""}:
+        if matches(_normalized_what(re.split(r"[@+]", email, maxsplit=1)[0])):
+            matched.add(email)
+    return matched
 
 
 def _deliverable_key(value: str) -> str:
@@ -163,26 +177,26 @@ def _snippet_names_owner(snippet: str, owner: str, is_user: bool,
         markers = {name, name.split()[0]} if name else set()
 
     # Transcript form: "Dana: I'll send…". A speaker label only proves ownership when the quoted
-    # speech itself is first-person; "Dana: Nikunj will send…" must not become Dana's obligation.
+    # speech itself is first-person; "Dana: Casey will send…" must not become Dana's obligation.
     first_person = r"(?:i(?:'ll|\s+will(?!\s+not)|\s+can|\s+am\s+going\s+to|\s+plan\s+to|\s+need\s+to)|we(?:'ll|\s+will(?!\s+not)|\s+can))"
     # Notes/summary form: "Dana will/to/needs to send…". Keeping the attribution adjacent avoids
-    # accepting "Dana said Nikunj will send…" merely because both names occur in the excerpt.
+    # accepting "Dana said Casey will send…" merely because both names occur in the excerpt.
     third_person = r"(?:will(?!\s+not)|is\s+going\s+to|plans?\s+to|needs?\s+to|committed\s+to|to)"
     for marker in markers:
         marker = marker.strip()
         if not marker:
             continue
-        full_name = (_s(user_name) if is_user else _s(owner)).strip().lower()
-        if (meeting is not None and len(full_name.split()) > 1
-                and marker == full_name.split()[0]):
-            if is_user and not _owner_is_user(marker, user_email, full_name, meeting):
+        if meeting is not None:
+            key = _normalized_what(marker)
+            identities = _attendee_matches(key, meeting)
+            owner_email = _s(user_email).strip().lower()
+            owner_name = _normalized_what(user_name)
+            if owner_email and (key == owner_name or owner_name.split()[:1] == [key]):
+                identities.add(owner_email)
+            if len(identities) > 1 or (is_user and identities - {owner_email}):
                 continue
-            if not is_user:
-                same_first = {_normalized_what(a.get('name') or a.get('display_name'))
-                              for a in meeting.get('attendees', []) or [] if isinstance(a, dict)}
-                same_first = {name for name in same_first if name.split()[:1] == [marker]}
-                if len(same_first) > 1:
-                    continue
+            if is_user and name and marker == name.split()[0] and not _owner_is_user(marker, user_email, name, meeting):
+                continue
         escaped = re.escape(marker)
         if re.search(rf"(?:^|\n)\s*{escaped}\s*:\s*{first_person}\b", text):
             return True
@@ -196,6 +210,36 @@ def _snippet_supports_what(snippet: str, what: str) -> bool:
     objects = {w for w in _normalized_what(what).split()
                if len(w) > 1 and w not in _GROUNDING_FILLER}
     return bool(objects and objects <= evidence)
+
+
+def _closing_fields(capture: dict, commitment: dict, meeting: dict,
+                    counterpart: str, external: list[str], owner_email: str, owner_name: str) -> dict:
+    """A proposed signal must match the verb and recipient of this owner's quoted promise."""
+    kind, target = capture["fulfillment"], capture["deliver_to"]
+    if kind in (None, "none") or commitment["owner_is_user"] is not True or capture["owed_by"] == "them":
+        return {"fulfillment": "none"} if kind == "none" else {}
+    quote = _fold_excerpt(commitment["source_snippet"]).replace("’", "'")
+    prefix = _PROMISE_PREFIX.match(quote)
+    ask = _fold_excerpt(commitment["what"])
+    if (not prefix or not _owner_is_user(prefix[1], owner_email, owner_name, meeting)
+            or not re.match(re.escape(ask) + r"(?=$|[.!?](?:\s|$))", quote[prefix.end():], re.I)):
+        return {}
+    matched = _CLOSE_ASK[kind].fullmatch(ask)
+    if not matched:
+        return {}
+    def identifies(recipient: str, email: str) -> bool:
+        recipient = recipient.strip().lower()
+        return recipient == email or _attendee_matches(_normalized_what(recipient), meeting) == {email}
+
+    recipient = matched[1]
+    if kind == "intro":
+        recipient = recipient or matched[2]
+        if not target or target == counterpart or not identifies(matched[3], target):
+            return {}
+    elif target not in (None, counterpart):
+        return {}
+    proven = external == [counterpart] if recipient.strip().lower() == "you" else identifies(recipient, counterpart)
+    return {"fulfillment": kind, **({"deliver_to": target} if kind == "intro" else {})} if proven else {}
 
 
 def ground_commitments(payload, source_meetings: list, user_email: str = "",
@@ -259,27 +303,17 @@ def ground_commitments(payload, source_meetings: list, user_email: str = "",
         if claimed is True and not clean.get('to_email') and len(external) == 1:
             clean['to_email'] = external[0]
         elif claimed is False:
-            owner_key = _normalized_what(owner)
-            matches = []
-            for attendee in meeting.get('attendees', []) or []:
-                if not isinstance(attendee, dict):
-                    continue
-                name = _normalized_what(attendee.get('name') or attendee.get('display_name'))
-                email = _s(attendee.get('email')).strip().lower()
-                if email in external and (name == owner_key or
-                                          (len(owner_key.split()) == 1
-                                           and name.split()[:1] == owner_key.split())):
-                    matches.append(email)
-            for email in external:
-                local_name = _normalized_what(re.split(r'[@+]', email, maxsplit=1)[0]
-                                              .replace('.', ' ').replace('_', ' ').replace('-', ' '))
-                if local_name == owner_key or (len(owner_key.split()) == 1
-                                               and local_name.split()[:1] == owner_key.split()):
-                    matches.append(email)
-            clean['to_email'] = next(iter(set(matches))) if len(set(matches)) == 1 else None
+            matches = _attendee_matches(_normalized_what(owner), meeting) - {owner_email}
+            clean['to_email'] = next(iter(matches)) if len(matches) == 1 else None
         if not clean.get('to_email'):
             reasons['counterpart'] += 1
             continue
+        capture = capture_shape.fields(clean.get)
+        clean.pop("deliverTo", None)
+        clean.pop("deliver_to", None)
+        clean.pop("fulfillment", None)
+        clean.update(_closing_fields(capture, c, meeting, clean["to_email"].strip().lower(), external,
+                                     owner_email, meeting_user_name))
         accepted.append(clean)
 
     out["commitments"] = accepted
@@ -287,7 +321,7 @@ def ground_commitments(payload, source_meetings: list, user_email: str = "",
     return out, stats
 
 
-def _action_for(c: dict, user_email: str, created_at: str, user_name: str = ""):
+def _action_for(c: dict, user_email: str, created_at: str, user_name: str = "", *, grounded=False):
     """Map one source-backed commitment into the continuity ledger's action shape."""
     what = _s(c.get("what")).strip()
     if not what:
@@ -311,6 +345,8 @@ def _action_for(c: dict, user_email: str, created_at: str, user_name: str = ""):
     if due and not deadline:
         summary += f" — due {due}"
 
+    capture = capture_shape.fields(c.get)
+    normalized = _deliverable_key(what)
     action = {
         "action_type": "follow_up" if is_user else "waiting_on",
         "channel": "email" if to_email else "followup",
@@ -323,12 +359,15 @@ def _action_for(c: dict, user_email: str, created_at: str, user_name: str = ""):
         "source_id": meeting_id or None,
         "source_snippet": snippet or None,
         "existing_anchor_key": _s(c.get("existing_anchor_key")).strip() or None,
+        "deliverable": capture["deliverable"] if _deliverable_key(capture["deliverable"]) == normalized else None,
+        "owed_by": capture["owed_by"],
+        "fulfillment": capture["fulfillment"] if grounded else None,
+        "deliver_to": capture["deliver_to"] if grounded else None,
     }
     role = "user" if is_user else "other"
     # Identity is meeting + verified counterpart + direction + a conservative normalized
     # deliverable. Only equivalent delivery verbs fold; action, qualifiers and numbers remain so
     # "review Q2" cannot collapse into "send Q3". The quote is evidence, not row identity.
-    normalized = _deliverable_key(what)
     h = hashlib.sha256(f"{role}|{to_email}|{normalized}".encode()).hexdigest()[:12]
     if meeting_id:
         action["source_thread_id"] = f"granola:{meeting_id}:{h}"
@@ -353,11 +392,11 @@ def _source_ref(raw: dict) -> dict | None:
 def _attach_source(it: dict, ref: dict | None) -> None:
     if not ref:
         return
-    refs = [r for r in (it.get("source_refs") or []) if isinstance(r, dict)]
+    refs = [r for r in source_refs(it) if isinstance(r, dict)]
     matched = ref in refs
     if not matched and ref.get('source_id'):
         for previous in refs:
-            if not all(previous.get(key) == ref.get(key) for key in ('source', 'source_id', 'snippet')):
+            if cr.ref_fields(previous) != cr.ref_fields(ref):
                 continue
             if previous.get('timestamp') and ref.get('timestamp') and previous['timestamp'] != ref['timestamp']:
                 continue  # genuinely conflicting source timestamps remain independent evidence
@@ -407,7 +446,9 @@ def apply(payload, user_email: str = "", now: datetime | None = None, user_name:
                 stamp = _s(meeting.get('end') or meeting.get('start') or meeting.get('date'))
                 captured = (cr._inbound_cutoff(stamp) if len(stamp) <= 10
                             else cr._to_user_zone(observed).isoformat())
-            raw = _action_for(c, user_email, captured, user_name)
+            verified_end = bool(len(_s(meeting.get("end"))) > 10 and observed and
+                                cr._to_user_zone(observed) <= cr._to_user_zone(now))
+            raw = _action_for(c, user_email, captured, user_name, grounded=verified_end)
             if raw is None:
                 continue
             # Preserve the source's own precision separately from the conservative resolution
@@ -462,6 +503,7 @@ def apply(payload, user_email: str = "", now: datetime | None = None, user_name:
                 "source_thread_id": a.get("source_thread_id"),
                 "source": "followup_commitment",
                 "resolution_mode": "source_grounded",
+                **capture_shape.stored(a),
                 **({key: raw[key] for key in ('source_timestamp', 'source_timestamp_kind')}
                    if raw.get('source_timestamp') else {}),
             }

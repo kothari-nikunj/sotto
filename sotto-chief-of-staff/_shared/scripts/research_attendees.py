@@ -29,7 +29,7 @@ TWO PASSES per attendee (both grounded, both batched, run concurrently):
     person; nothing situational ("what to say") is asked for, because it would cost output tokens
     to invent and could never be persisted.
 
-FOCUS PASS (--focus <name-or-email>, ONE person only): when the user names a person ("prep Spencer")
+FOCUS PASS (--focus <name-or-email>, ONE person only): when the user names a person ("prep Rowan")
   the prep is a deep dive, so that ONE attendee gets one additional grounded call covering their
   company and space — what it builds, the founder's background/origin story, traction signals, and
   the market landscape / why now. Returns company_deep{company,builds[],founder_story,traction[],
@@ -50,7 +50,7 @@ Input (argv files or stdin JSON):
                                             with only a NAME is researched too (its own singleton
                                             call — see _join_key), which is what makes the ad-hoc
                                             "research Antim for me" ask land in the graph
-  --focus     "Spencer" | spencer@co.com    ONE attendee gets the extra company/space deep dive
+  --focus     "Rowan" | rowan@co.com    ONE attendee gets the extra company/space deep dive
   --context   /tmp/sotto_cal.json           accepted for existing callers; never sent to a provider
   --comms     /tmp/sotto_attendee_comms.json accepted for existing callers; never sent to a provider
                                             (prompts carry lookup identities only)
@@ -96,7 +96,8 @@ from timeutil import _now_local, _parse_ts, _user_local_date, configured_tz  # n
 from research_contract import (  # noqa: E402
     RESEARCH_HORIZON_HOURS, MAX_ATTENDEES, MAX_RECENT_ACTIVITY, MAX_PERSONAL,
     MAX_BUILDS, MAX_TRACTION, CACHE_KEEP_DAYS, matches_focus,
-    NO_UNSOURCED_NUMBERS, company_domain, prep_research_evidence,
+    NO_UNSOURCED_NUMBERS, TRACTION_SOURCE_RULE, attendee_company_domain, company_domain,
+    company_description, prep_research_evidence, project_traction_sources,
     evidence_json as _evidence_json,
     postfilter_focus as _postfilter_focus, postfilter_company as _postfilter_company,
     postfilter_deep as _postfilter_deep,
@@ -416,9 +417,9 @@ def _build_focus_prompt(a: dict) -> str:
         "  - founder_story: 2-4 sentences — who founded it, where they came from, and the origin "
         "story (the problem they hit that made them build this). Only what a source states.\n"
         f"  - traction: up to {MAX_TRACTION} signals, each ENDING with its source URL in "
-        "parentheses — funding round and date, customer counts, launches, partnerships, press. An "
-        "item without a real URL is discarded.\n"
-        "  - market: up to 3 sentences on the relevant landscape, if useful for this meeting "
+        "parentheses — funding round and date, customer counts, launches, partnerships, press. "
+        + TRACTION_SOURCE_RULE + "\n"
+        + "  - market: up to 3 sentences on the relevant landscape, if useful for this meeting "
         "and supported by sources. Attribute a contested claim to who said it; leave empty "
         "rather than speculating about fundability.\n\n"
         "Rules:\n"
@@ -612,7 +613,16 @@ def _grounded_json_once(prompt: str, key: str, schema: dict, timeout: int, max_t
                   'response_sha256': hashlib.sha256(response.encode()).hexdigest(),
                   'grounding_json': metadata[:3000],
                   'truncated': len(response) > 2000 or len(metadata) > 3000}
-    return _ResearchRows(rows.get(response_key) or [], record)
+    result_rows = rows.get(response_key) or []
+    if tag in {"focus", "company"} and isinstance(result_rows, list):
+        for row in result_rows:
+            if isinstance(row, dict):
+                row.pop("traction_sources", None)
+                if provider == "parallel":
+                    sources = project_traction_sources(row, grounding)
+                    if sources:
+                        row["traction_sources"] = sources
+    return _ResearchRows(result_rows, record)
 
 
 def _research_batch(batch: list, key: str) -> list:
@@ -661,7 +671,7 @@ def research_company(company: str) -> dict:
           "four dated signals, EACH ending with its source URL in parentheses), and market "
           "(3-5 sourced sentences naming competitors and the relevant market shift). "
           "No advice, talking points or marketing filler. Empty beats a guess.\n"
-        + NO_UNSOURCED_NUMBERS
+        + TRACTION_SOURCE_RULE + "\n" + NO_UNSOURCED_NUMBERS
     )
     stub = os.environ.get("SOTTO_LLM_STUB")
     if stub:
@@ -682,7 +692,7 @@ def research_company(company: str) -> dict:
                    if row.get("identity_status") == "ambiguous" else
                    "The requested company could not be identified from grounded research.")
         return {"companies": [], "warnings": [warning]}
-    filtered = _postfilter_company(row)
+    filtered = _postfilter_company(row, domain=domain)
     if not filtered or not _s(filtered["company_deep"].get("company")).strip():
         return {"companies": [], "warnings": ["No grounded company details were found."]}
     return {"companies": [{**filtered, **({"domain": domain} if domain else {})}]}
@@ -873,7 +883,10 @@ def research(attendees: list, context_summary: str, comms=None, focus: str = "")
         if not k:
             continue
         if k not in by_key:
-            row = dict(r)
+            row = {field: value for field, value in r.items()
+                   if field not in {"company_deep", "traction_sources"}}
+            if isinstance(row.get("company_summary"), str):
+                row["company_summary"] = company_description(row["company_summary"])
             if k.startswith("name:"):
                 row["email"] = ""      # nothing was echoed and nothing is invented — the name IS it
             by_key[k] = row
@@ -891,7 +904,7 @@ def research(attendees: list, context_summary: str, comms=None, focus: str = "")
         # the model echoed back — the identity can't drift onto a different attendee.
         k = _join_key(focus_target)
         for _batch, f in focus_rows:
-            clean = _postfilter_focus(f)
+            clean = _postfilter_focus(f, domain=attendee_company_domain(focus_target.get("email")))
             if not clean:
                 continue
             _entry(k).update(clean)

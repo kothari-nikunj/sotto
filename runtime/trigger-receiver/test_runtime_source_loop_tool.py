@@ -191,3 +191,96 @@ def test_committed_inspect_reestablishes_directory_durability_without_mutation(c
     assert attempts==['fsync'] and rows()==before
     monkeypatch.setattr(cr,'_fsync_ledger_directory_tree',original)
     assert call(dict(req,operation='inspect'),context)==done and rows()==before
+
+
+def _auto_closed(context):
+    """A task loop_check closed on a booked meeting (signal_closes row shape)."""
+    from delivery_effects import loop_version, loop_identity
+    cr = ke._load_continuity()
+    row = {'anchor_key': 'auto-loop', 'action_type': 'reply', 'channel': 'email', 'status': 'resolved',
+           'created_at': '2026-10-05 10:00:00', 'summary': 'pick a time', 'ask': 'pick a time',
+           'contact_name': 'Dana', 'contact_identifier': 'dana@example.com', 'source': 'gmail',
+           'source_message_id': 'm1', 'source_thread_id': 'thread1', 'fulfillment': 'schedule',
+           'resolution': 'scheduled_meeting', 'resolved_at': '2026-10-06', 'closed_at': '2026-10-06T09:00:00+00:00',
+           'resolution_source_refs': [{'sourceType': 'calendar', 'sourceId': 'ev-1'}],
+           'resolution_loop_version': 'f' * 64,
+           'resolution_basis': {'basis': 'scheduled_meeting', 'source': 'calendar',
+                                'at': '2026-10-06T09:00:00+00:00', 'recorded_at': '2026-10-06T09:05:00+00:00'}}
+    cr._persist(row)
+    context[1]['_source_authority'] = lambda: {'complete': True, 'revision': 'a' * 64,
+                                               'google_sources': ['gmail', 'calendar']}
+    return {'anchor': row['anchor_key'], 'loop_version': loop_version(row), 'loop_identity': loop_identity(row),
+            'source_revision': 'a' * 64, 'correction': 'the Dana meeting is not booked'}
+
+
+def test_owner_reopens_an_automatic_close_on_the_same_row(context):
+    binding = _auto_closed(context)
+    body = request({**binding, 'operation': 'correct', 'to': 'open'}, event='c' * 64,
+                   text='No, the Dana meeting is not booked')
+    receipt = call(body, context)
+    assert receipt['operation'] == 'correct' and receipt['loop_status'] == 'open'
+    matches = [row for row in rows() if row['anchor_key'] == 'auto-loop']
+    assert len(matches) == 1 and len(rows()) == 1                       # no duplicate row
+    row = matches[0]
+    assert row['status'] == 'open' and 'resolution_basis' not in row and 'resolution' not in row
+    assert row['rejected_signals'] == [{'basis': 'scheduled_meeting', 'source_id': 'ev-1'}]
+    assert call(body, context) == receipt                                 # replay is idempotent
+    import os
+    with open(os.path.join(os.environ['SOTTO_DATA'], 'outcomes.jsonl'), encoding='utf-8') as handle:
+        labels = [json.loads(line) for line in handle if '"loop_label"' in line]
+    assert [(label['decision'], label['hint']) for label in labels] == [
+        ('reopened', {'basis': 'scheduled_meeting', 'source': 'calendar'})]   # one label names the rejected signal
+
+
+def test_reopen_refuses_a_task_the_owner_or_a_review_closed(context):
+    binding = _auto_closed(context)
+    cr = ke._load_continuity()
+    row = cr._load_items()['auto-loop']
+    row.pop('resolution_basis')
+    row['resolution'] = 'replied'
+    cr._persist(row)
+    from delivery_effects import loop_version
+    binding['loop_version'] = loop_version(row)
+    body = request({**binding, 'operation': 'correct', 'to': 'open'}, event='c' * 64,
+                   text='No, the Dana meeting is not booked')
+    assert call(body, context)['code'] == 'target_unavailable'
+    assert cr._load_items()['auto-loop']['status'] == 'resolved'
+
+
+def _reopened(context):
+    from delivery_effects import loop_version, loop_identity
+    binding = _auto_closed(context)
+    call(request({**binding, 'operation': 'correct', 'to': 'open'}, event='c' * 64,
+                 text='No, the Dana meeting is not booked'), context)
+    row = ke._load_continuity()._load_items()['auto-loop']
+    return {**binding, 'loop_version': loop_version(row), 'loop_identity': loop_identity(row)}
+
+
+def test_the_owner_can_close_a_reopened_task_by_hand(context):
+    binding = _reopened(context)
+    out = call(request({**binding, 'operation': 'correct', 'to': 'resolved',
+                        'correction': 'the Dana meeting is done'}, event='d' * 64,
+                       text='Actually the Dana meeting is done'), context)
+    assert out.get('loop_status') == 'resolved', out
+
+
+def test_a_second_wrong_automatic_close_can_be_undone(context):
+    from delivery_effects import loop_version, loop_identity
+    _reopened(context)
+    cr = ke._load_continuity()
+    row = cr._load_items()['auto-loop']
+    row.update(status='resolved', resolution='scheduled_meeting', resolved_at='2026-10-08',
+               closed_at='2026-10-08T09:00:00+00:00',
+               resolution_source_refs=[{'sourceType': 'calendar', 'sourceId': 'ev-2'}],
+               resolution_loop_version='e' * 64,
+               resolution_basis={'basis': 'scheduled_meeting', 'source': 'calendar',
+                                 'at': '2026-10-08T09:00:00+00:00', 'recorded_at': '2026-10-08T09:05:00+00:00'})
+    cr._persist(row, signal_close='close')
+    row = cr._load_items()['auto-loop']
+    binding = {'anchor': 'auto-loop', 'loop_version': loop_version(row), 'loop_identity': loop_identity(row),
+               'source_revision': 'a' * 64, 'correction': 'the Dana meeting is not booked'}
+    out = call(request({**binding, 'operation': 'correct', 'to': 'open'}, event='d' * 64,
+                       text='No, the Dana meeting is not booked'), context)
+    assert out.get('loop_status') == 'open', out
+    assert cr._load_items()['auto-loop']['rejected_signals'] == [
+        {'basis': 'scheduled_meeting', 'source_id': 'ev-1'}, {'basis': 'scheduled_meeting', 'source_id': 'ev-2'}]

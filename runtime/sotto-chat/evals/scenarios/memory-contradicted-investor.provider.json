@@ -1,0 +1,116 @@
+{
+  "instructions": "Synthetic transport contract only. Scripted tool choices and answers are not model-quality evidence. Inspect real returned saved evidence and original source records; no writes or external sends.",
+  "steps": [
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "mira@example.test",
+            "--person-coverage",
+            "--facts-only"
+          ]
+        }
+      }
+    },
+    {
+      "text": "Saved memory calls Mira an investor in Cedar Labs. I have not verified that claim.",
+      "toolResultContains": [
+        "gmail:memory-investor-denial",
+        "source_timestamp"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "mira@example.test",
+            "--person-coverage",
+            "--facts-only"
+          ]
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "gmail_get",
+        "arguments": {
+          "message_id": "memory-builds"
+        }
+      },
+      "toolResultContains": [
+        "gmail:memory-investor-denial",
+        "gmail:memory-builds"
+      ]
+    },
+    {
+      "tool": {
+        "name": "gmail_get",
+        "arguments": {
+          "message_id": "memory-investor-denial"
+        }
+      },
+      "toolResultContains": [
+        "I build accessibility testing tools.",
+        "memory-builds",
+        "Mira Example <mira@example.test>",
+        "Wed, 04 Nov 2026 09:00:00 +0000"
+      ]
+    },
+    {
+      "text": "Mira builds accessibility testing tools. She explicitly says she is not an investor in Cedar Labs and only reviewed their accessibility demo.",
+      "toolResultContains": [
+        "I am not an investor in Cedar Labs. I only reviewed their accessibility demo.",
+        "memory-investor-denial",
+        "Mira Example <mira@example.test>",
+        "Thu, 05 Nov 2026 09:00:00 +0000"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "gmail_get",
+        "arguments": {
+          "message_id": "memory-investor-denial"
+        }
+      }
+    },
+    {
+      "text": "Mira said she only reviewed the accessibility demo; she is not an investor in Cedar Labs.",
+      "toolResultContains": [
+        "I am not an investor in Cedar Labs. I only reviewed their accessibility demo.",
+        "memory-investor-denial",
+        "Mira Example <mira@example.test>",
+        "Thu, 05 Nov 2026 09:00:00 +0000"
+      ]
+    }
+  ]
+}

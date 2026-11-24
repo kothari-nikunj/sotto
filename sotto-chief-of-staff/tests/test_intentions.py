@@ -135,7 +135,7 @@ def test_reminder_on_a_brief_captured_imessage_loop_is_delivered(tmp_path, monke
     cr = _load("cr_intentions_817", "morning-brief", "scripts", "continuity_resolve.py")
     out = cr.resolve({"today": "2026-08-25", "new_actions": [
         {"type": "waiting_on", "channel": "imessage", "contactName": "Jo",
-         "contactIdentifier": "+14155551234", "threadId": "iMessage;-;+14155551234",
+         "contactIdentifier": "+14155550107", "threadId": "iMessage;-;+14155550107",
          "contextSummary": "Jo to send the signed lease",
          "sourceRefs": [{"sourceType": "imessage", "sourceId": "guid-1"}]}]}, datetime(2026, 8, 25, 9))
     anchor = out["active"][0]["anchor_key"]

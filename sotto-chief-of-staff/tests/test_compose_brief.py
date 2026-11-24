@@ -579,7 +579,7 @@ def test_contacts_carry_forward_on_thin_pull(tmp_path):
 
 def test_carry_forward_reaches_the_live_run_not_just_the_file(tmp_path):
     # The symptom is LIVE: the brief being composed right now must see the carried contacts, or a
-    # thin pull still renders "+1 (973) 985-7448" group labels while the snapshot quietly heals —
+    # thin pull still renders "+1 (973) 555-0148" group labels while the snapshot quietly heals —
     # exactly the recurring report. _save_local_snapshot returns the healed copy; callers compose
     # from it.
     os.environ["SOTTO_DATA"] = str(tmp_path)
@@ -1034,7 +1034,7 @@ def test_attendee_research_renders_recency_fields_and_company_fallback():
          "personal": ["Ran the SF Marathon (https://x.com/t/1)"],
          # A stale cache row may still carry a hook; the renderer must not resurrect it.
          "conversation_hooks": ["His agent-memory piece last week fits your roadmap."]},
-        {"email": "nelson@cobalt-research.com", "title": None, "company": "Cobalt Research",
+        {"email": "nelson@cobalt-research.example", "title": None, "company": "Cobalt Research",
          "relevance": [], "summary": "No public profile found.",
          "company_summary": "Cobalt Research does battery-materials analytics."},
     ]})
@@ -1061,18 +1061,18 @@ def test_tap_link_drops_nonroutable_imessage_identifiers():
     assert cb._action_tap_link({"channel": "imessage", "contactIdentifier": "arnav_sahu"}) == ""
     assert cb._action_tap_link({"channel": "sms", "contactIdentifier": "group_jake_ts"}) == ""
     # A real phone still routes.
-    assert cb._action_tap_link({"channel": "imessage", "contactIdentifier": "+1 (206) 999-4970"}) == "sms:+12069994970"
+    assert cb._action_tap_link({"channel": "imessage", "contactIdentifier": "+1 (206) 555-0143"}) == "sms:+12065550143"
 
 
 def test_tap_link_drops_letters_stripped_into_a_fake_phone():
-    # The bug: naive \D-stripping turned "contact_14155551234" into "+14155551234" — a real-looking
+    # The bug: naive \D-stripping turned "contact_14155550107" into "+14155550107" — a real-looking
     # phone number built out of a contact id's digits. message_targets rejects the identifier
     # outright (it contains letters), so no link is ever minted for it.
-    assert cb._action_tap_link({"channel": "imessage", "contactIdentifier": "contact_14155551234"}) == ""
-    assert cb._action_tap_link({"channel": "sms", "contactIdentifier": "contact_14155551234"}) == ""
-    assert cb._action_tap_link({"channel": "whatsapp", "contactIdentifier": "contact_14155551234"}) == ""
+    assert cb._action_tap_link({"channel": "imessage", "contactIdentifier": "contact_14155550107"}) == ""
+    assert cb._action_tap_link({"channel": "sms", "contactIdentifier": "contact_14155550107"}) == ""
+    assert cb._action_tap_link({"channel": "whatsapp", "contactIdentifier": "contact_14155550107"}) == ""
     assert cb._action_tap_link({"channel": "phone", "type": "call_back",
-                                "contactIdentifier": "contact_14155551234"}) == ""
+                                "contactIdentifier": "contact_14155550107"}) == ""
 
 
 def test_tap_link_whatsapp_and_email_unaffected():
@@ -1083,16 +1083,16 @@ def test_tap_link_whatsapp_and_email_unaffected():
 def test_imessage_names_resolve_from_contacts():
     # The bug: _group_messages_into_threads passed an empty lookup, so iMessage handles never resolved
     # to contact names. With the contacts array threaded through, the raw phone becomes the contact name.
-    lookup = cb.build_contact_lookup([{"name": "Jake Rosen", "phones": ["+1 206 999 4970"]}])
+    lookup = cb.build_contact_lookup([{"name": "Quinn Albrecht", "phones": ["+1 206 555 0143"]}])
     threads = cb._group_messages_into_threads(
-        [{"handle": "+12069994970", "text": "coffee?", "is_from_me": False, "timestamp": "2026-06-25"}],
+        [{"handle": "+12065550143", "text": "coffee?", "is_from_me": False, "timestamp": "2026-06-25"}],
         "imessage", lookup)
-    assert threads and threads[0]["name"] == "Jake Rosen"
+    assert threads and threads[0]["name"] == "Quinn Albrecht"
     # Without the lookup it must NOT invent a name — it stays the raw handle.
     bare = cb._group_messages_into_threads(
-        [{"handle": "+12069994970", "text": "coffee?", "is_from_me": False, "timestamp": "2026-06-25"}],
+        [{"handle": "+12065550143", "text": "coffee?", "is_from_me": False, "timestamp": "2026-06-25"}],
         "imessage")
-    assert bare[0]["name"] != "Jake Rosen"
+    assert bare[0]["name"] != "Quinn Albrecht"
 
 
 def test_brief_excludes_proven_assistant_rows_but_keeps_human_invitation():
@@ -1122,7 +1122,7 @@ def test_whatsapp_jid_never_becomes_mailto():
     # The bug: a WhatsApp JID (…@s.whatsapp.net) has an '@', so it was routed to mailto:. Channel is
     # authoritative now, and the JID is stripped to its phone for wa.me.
     assert cb._action_tap_link({"channel": "whatsapp", "type": "reply",
-                                "contactIdentifier": "4525171275@s.whatsapp.net"}) == "https://wa.me/4525171275"
+                                "contactIdentifier": "4555550123@s.whatsapp.net"}) == "https://wa.me/4555550123"
     # A name-only JID has no phone → no link (not a broken mailto).
     assert cb._action_tap_link({"channel": "whatsapp", "type": "reply",
                                 "contactIdentifier": "alberto_taiuti@s.whatsapp.net"}) == ""
@@ -1131,7 +1131,7 @@ def test_whatsapp_jid_never_becomes_mailto():
                                 "contactIdentifier": "sarah@acme.com"}).startswith("mailto:sarah@acme.com")
     # A reply whose id is a JID but channel missing must NOT mailto — infer sms from the phone.
     assert cb._action_tap_link({"type": "reply",
-                                "contactIdentifier": "4525171275@s.whatsapp.net"}) == "sms:+4525171275"
+                                "contactIdentifier": "4555550123@s.whatsapp.net"}) == "sms:+4555550123"
 
 
 def test_birthdays_surfaces_next_7_days_only():
@@ -1140,17 +1140,17 @@ def test_birthdays_surfaces_next_7_days_only():
     soon = today + datetime.timedelta(days=3)
     far = today + datetime.timedelta(days=40)
     local = {"contacts": [
-        {"name": "Jake Rosen", "birthday": today.strftime("%m-%d")},
+        {"name": "Quinn Albrecht", "birthday": today.strftime("%m-%d")},
         {"name": "Mira Patel", "birthday": soon.strftime("%m-%d")},
         {"name": "Old Friend", "birthday": far.strftime("%m-%d")},
         {"name": "No BDay", "birthday": ""},
     ]}
     out = cb._format_birthdays(local)
-    assert "Jake Rosen" in out and "TODAY" in out      # today's birthday flagged
+    assert "Quinn Albrecht" in out and "TODAY" in out      # today's birthday flagged
     assert "Mira Patel" in out and "in 3 days" in out   # within the week
     assert "Old Friend" not in out                      # 40 days out → excluded
     # soonest first
-    assert out.index("Jake Rosen") < out.index("Mira Patel")
+    assert out.index("Quinn Albrecht") < out.index("Mira Patel")
 
 
 def test_gemini_fallback_on_429_when_backup_configured(monkeypatch):
@@ -1310,14 +1310,14 @@ def test_a_muted_persons_thread_never_reaches_the_model(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _write_prefs(tmp_path, {"mute_senders": [], "mute_people": ["Bob Lee"],
                             "mute_sections": [], "tone_notes": []})
-    local = {"contacts": [{"name": "Bob Lee", "phones": ["+14155550001"]},
-                          {"name": "Maria Ruiz", "phones": ["+14155550002"]}],
+    local = {"contacts": [{"name": "Bob Lee", "phones": ["+14155550103"]},
+                          {"name": "Maria Ruiz", "phones": ["+14155550104"]}],
              "imessage": [
-                 {"handle": "+14155550001", "is_from_me": False, "timestamp": "2026-06-24 08:00:00",
+                 {"handle": "+14155550103", "is_from_me": False, "timestamp": "2026-06-24 08:00:00",
                   "text": "can you look at the bob-only thread today?", "is_group_chat": False},
-                 {"handle": "+14155550002", "is_from_me": False, "timestamp": "2026-06-24 08:05:00",
+                 {"handle": "+14155550104", "is_from_me": False, "timestamp": "2026-06-24 08:05:00",
                   "text": "maria here — the venue moved to thursday", "is_group_chat": False},
-                 {"handle": "+14155550001", "is_from_me": False, "timestamp": "2026-06-24 08:10:00",
+                 {"handle": "+14155550103", "is_from_me": False, "timestamp": "2026-06-24 08:10:00",
                   "text": "group note from bob about the offsite", "is_group_chat": True,
                   "chat_guid": "g-offsite", "group_name": "Offsite crew"}]}
     p = cb.build_prompt(cb._load_prompt(), {"type": "morning", "first_run": False,
@@ -1342,7 +1342,7 @@ def test_stale_sent_threads_are_candidates_not_automatic_debts(tmp_path, monkeyp
                           {"name": "Ops", "emails": ["noreply@acme.com"], "phones": []}]}
     inputs = {"type": "morning", "local": local, "google": {"events": [], "staleThreads": [
         _stale(),
-        _stale(tid="t-stranger", to="cold@pitch.io", email="cold@pitch.io"),
+        _stale(tid="t-stranger", to="cold@pitch.test", email="cold@pitch.test"),
         _stale(tid="t-noreply", to="noreply@acme.com", email="noreply@acme.com"),
         _stale(tid="t-intro", to="Dana Roe <dana@acme.com>", email="dana@acme.com",
                subject="Intro: Dana <> Priya"),
@@ -2008,10 +2008,10 @@ def test_a_quiet_pile_is_one_line_with_a_count_not_a_wall(monkeypatch):
 
 
 def test_one_line_per_person_however_many_debts(monkeypatch):
-    """Spencer owed three things across three email threads and got three rows. One person, one
+    """Rowan owed three things across three email threads and got three rows. One person, one
     line — naming him once, carrying all three asks, aged by the OLDEST."""
     monkeypatch.setenv("SOTTO_CRITIC", "off")
-    debts = [{"contact_name": "Spencer Schneier", "status": "open", "action_type": "follow_up",
+    debts = [{"contact_name": "Rowan Shaw", "status": "open", "action_type": "follow_up",
               "channel": "email", "canonical_id": "c_abc123", "chased_count": 1,
               "summary": s, "created_at": _iso_hours_ago(h)}
              for s, h in (("send the deck", 72), ("the Onshore intro", 48), ("coffee next week", 60))]
@@ -2023,9 +2023,9 @@ def test_one_line_per_person_however_many_debts(monkeypatch):
                       llm=fake_llm, critic=True)["brief_markdown"]
     lines = [l for l in body.split("## Still open\n", 1)[1].splitlines() if l.strip()]
     assert len(lines) == 1
-    assert lines[0].startswith("- **Spencer Schneier**: send the deck; the Onshore intro; "
+    assert lines[0].startswith("- **Rowan Shaw**: send the deck; the Onshore intro; "
                                "coffee next week (open since ")
-    assert body.count("Spencer Schneier") == 1
+    assert body.count("Rowan Shaw") == 1
 
 
 def test_a_nameless_row_renders_without_a_placeholder_noun(monkeypatch):
@@ -2045,13 +2045,13 @@ def test_a_nameless_row_renders_without_a_placeholder_noun(monkeypatch):
 
 
 def test_backstop_never_repeats_what_the_brief_already_said(monkeypatch):
-    """Tonight's FPV/Piston row: already in Should Handle Today, repeated verbatim below. A group
+    """Tonight's HBR/Piston row: already in Should Handle Today, repeated verbatim below. A group
     label the brief printed is naming it — for the urgent line AND for the quiet count."""
     monkeypatch.setenv("SOTTO_CRITIC", "off")
-    group = {"contact_name": "FPV / Piston", "status": "waiting", "action_type": "waiting_on",
+    group = {"contact_name": "HBR / Piston", "status": "waiting", "action_type": "waiting_on",
              "channel": "imessage", "chased_count": 1, "created_at": _iso_hours_ago(30),
              "summary": "asked for an intro to Insight Partners"}
-    said = ("## Should Handle Today\n**FPV / Piston** wants the Insight Partners intro.\n\n"
+    said = ("## Should Handle Today\n**HBR / Piston** wants the Insight Partners intro.\n\n"
             "**Priya Raman**<!--id:p@x.com|ch:email--> is waiting on the diligence memo."
             " <!--loop:priyaa-->\n")
 
@@ -2060,7 +2060,7 @@ def test_backstop_never_repeats_what_the_brief_already_said(monkeypatch):
 
     body = cb.compose(_open_ledger_inputs(extra=[group]), llm=fake_llm, critic=True)["brief_markdown"]
     assert "Still open" not in body
-    assert body.count("FPV / Piston") == 1 and body.count("Priya Raman") == 1
+    assert body.count("HBR / Piston") == 1 and body.count("Priya Raman") == 1
 
 
 def test_backstop_stays_silent_when_the_brief_named_the_loop(monkeypatch):
@@ -2634,7 +2634,7 @@ def test_evening_receipts_report_what_moved(monkeypatch, tmp_path):
     body = out["brief_markdown"]
     assert ("## What moved today\n"
             "- Reminded you to chase Maya about the contract (second reminder).\n"
-            "- Closed 2 loops — Ron delivered the deck; the RSVP resolved.\n") in body
+            "- Closed 2 tasks — Ron delivered the deck; the RSVP resolved.\n") in body
     assert out['_activity_receipts'] == {'held_interruptions': 3, 'prepped_people': 4,
                                           'followup_taps': 2}
     # Maya's loop was reminded today: it is reported ONCE, here — never again under Still open
@@ -2685,7 +2685,7 @@ def test_closures_are_named_up_to_three_then_grouped_by_what_happened(monkeypatc
         _ledger_entry(tmp_path, f"c{i}", status="resolved", contact_name=name, summary="a thing",
                       resolution=res, resolved_at=today)
     assert cb._receipt_lines(_evening(), today, "+00:00") == [
-        "Closed 4 loops — 2 they delivered, 1 closed out, 1 you answered."]
+        "Closed 4 tasks — 2 they delivered, 1 closed out, 1 you answered."]
 
 
 def test_grouped_reminders_never_claim_counterpart_contact(monkeypatch, tmp_path):
@@ -2714,7 +2714,7 @@ def test_receipts_follow_an_injected_clock(monkeypatch, tmp_path):
     _ledger_entry(tmp_path, "now", status="resolved", contact_name="Nia", summary="the memo",
                   resolution="delivered", resolved_at=today)
     out = cb.compose(_evening(now="2026-06-22 09:00:00"), llm=_receipt_llm())
-    assert "Closed 1 loop — Ron delivered the deck." in out["brief_markdown"]
+    assert "Closed 1 task — Ron delivered the deck." in out["brief_markdown"]
     assert "Nia" not in out["brief_markdown"]
 
 
@@ -2897,7 +2897,7 @@ def test_the_brief_records_which_loops_it_named(monkeypatch, tmp_path):
     """The chase lane's collision check needs to know what THIS brief said, not merely that a brief
     happened: the printed and narrated loops are written down, the ones behind the count line are
     not (a count is not a telling)."""
-    today = _receipt_env(monkeypatch, tmp_path)
+    _receipt_env(monkeypatch, tmp_path)
     monkeypatch.setenv("SOTTO_CRITIC", "off")
     named = {"anchor_key": "loop:maya", "contact_name": "Maya Chen", "status": "open",
              "action_type": "waiting_on", "channel": "email", "contact_identifier": "maya@x.com",
@@ -2918,11 +2918,11 @@ def test_the_brief_records_which_loops_it_named(monkeypatch, tmp_path):
     def fake_llm(prompt, inputs, system=None, schema=None):
         return json.dumps({"brief_markdown": "## Needs Attention Now\nQuiet.\n", "actions": []})
 
-    body = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": [named, quiet]}},
-                      llm=fake_llm, critic=True)["brief_markdown"]
+    result = cb.compose({"type": "morning", "google": {}, "local": {"action_ledger": [named, quiet]}},
+                      llm=fake_llm, critic=True)
+    body = result["brief_markdown"]
     assert "**Maya Chen**" in body and "- 1 other open loop. Ask me what's still open." in body
-    with open(cb._named_loops_path(today, "morning"), encoding="utf-8") as f:
-        assert json.load(f) == {"anchor_keys": ["loop:maya"]}
+    assert result["_brief_named"]["anchor_keys"] == ["loop:maya"]
 
 
 # --- Apple Notes / Reminders / Granola actually reach the model ----------------------------------
@@ -3010,7 +3010,7 @@ def test_an_undated_reminder_from_an_older_bridge_build_still_renders():
 
 def test_granola_notes_reach_the_model_and_a_broken_gather_says_so():
     meeting = {"title": "Arcadia <> Sotto", "date": "2026-08-09",
-               "attendee_emails": ["brexton@arcadia.vc"],
+               "attendee_emails": ["bram@arcadia.example"],
                "ai_summary": "Action items: Nik sends the memo; Brexton forwards the Helix deck."}
     prompt = cb.build_prompt(cb._load_prompt(), {
         **_sources_inputs({}), "granola": {"meetings": [meeting]}})
@@ -3227,9 +3227,7 @@ def test_gallery_space_names_active_loops_before_delivery_attribution(tmp_path, 
         assert row['summary'] in out['brief_text']
     assert 'Closed Person' not in out['brief_text'] and 'Parked Person' not in out['brief_text']
     assert {r['anchor_key'] for r in out['_represented_loops']} == {r['anchor_key'] for r in rows}
-    named = list((tmp_path / 'briefs').glob('*.named.json'))
-    assert len(named) == 1
-    assert set(json.loads(named[0].read_text())['anchor_keys']) == {r['anchor_key'] for r in rows}
+    assert set(out['_brief_named']['anchor_keys']) == {r['anchor_key'] for r in rows}
     manifest = visual_brief.render(visual_brief.build(out['brief_text']), tmp_path / 'gallery')
     assert len(manifest['images']) == 4
     for row in rows:
@@ -3319,11 +3317,11 @@ def test_loop_projection_removes_only_verified_task_and_keeps_distinct_sibling(t
     from delivery_effects import loop_version
     from render_local import message_evidence_id
     row = {'anchor_key': 'task-one', 'status': 'open', 'action_type': 'reply',
-           'contact_name': 'Robin Green', 'contact_identifier': '+14155552222',
+           'contact_name': 'Robin Green', 'contact_identifier': '+14155550109',
            'channel': 'imessage', 'created_at': '2026-09-20 08:00:00',
            'summary': 'Send the pricing document'}
     sibling = {**row, 'anchor_key': 'task-two', 'summary': 'Review the draft agreement'}
-    msg = {'rowid': 19, 'is_from_me': True, 'handle': '+14155552222',
+    msg = {'rowid': 19, 'is_from_me': True, 'handle': '+14155550109',
            'timestamp': '2026-09-21 09:00:00', 'text': 'The pricing document is sent.'}
     update = {'loopId': row['anchor_key'], 'loopVersion': loop_version(row),
               'status': 'resolved', 'evidence': [{'sourceType': 'imessage',
@@ -3514,10 +3512,10 @@ def test_waiting_projection_rejects_replayed_promise():
     from delivery_effects import loop_version
     from render_local import message_evidence_id
     row = {'anchor_key': 'waiver', 'status': 'waiting', 'action_type': 'waiting_on',
-           'contact_name': 'Robin Green', 'contact_identifier': '+14155552222',
+           'contact_name': 'Robin Green', 'contact_identifier': '+14155550109',
            'channel': 'imessage', 'created_at': '2026-09-20 08:00:00',
            'last_heard_at': '2026-09-21 09:00:00', 'summary': 'Robin owes the signed waiver'}
-    msg = {'rowid': 20, 'is_from_me': False, 'handle': '+14155552222',
+    msg = {'rowid': 20, 'is_from_me': False, 'handle': '+14155550109',
            'timestamp': '2026-09-21 09:00:00', 'text': 'I will send the waiver Friday.'}
     update = {'loopId': 'waiver', 'loopVersion': loop_version(row), 'status': 'waiting',
               'evidence': [{'sourceType': 'imessage',
@@ -3681,8 +3679,7 @@ def test_paraphrased_anchored_task_without_marker_is_not_repeated_and_is_recorde
                      critic=True)
     assert out["brief_markdown"].count("Priya Raman") == 1
     assert cb._visible_open_task_keys(md, [row]) == {"memo"}
-    named = list((tmp_path / "briefs").glob("*.named.json"))
-    assert [json.loads(p.read_text())["anchor_keys"] for p in named] == [["memo"]]
+    assert out["_brief_named"]["anchor_keys"] == ["memo"]
     # A marker for this task elsewhere (here: a handled claim) means only the marked line counts.
     marked = md + "## ✅ Already Handled\n- **Priya Raman**: memo sent. <!--loop:memo-->\n"
     assert cb._visible_open_task_keys(marked, [row]) == set()

@@ -374,13 +374,16 @@ def test_attended_calendar_actual_pipeline_and_shared_outbox(mode,tmp_path,monke
     assert procedure_runner.run({'pack':str(PACK),'kind':'proactive'})=='NO_NUDGES'
     from test_outbox import _load_outbox,_transaction
     box=_load_outbox('attended_calendar_box');sends=[]
+    scope = json.loads(os.environ['SOTTO_SKILL_COMPOSITION_PROOF'])
     box.HOOKS.update(data_root=lambda:str(tmp_path),json_transaction=_transaction,
         local_today=lambda:now.date().isoformat(),valid=lambda payload:delivery_effects.valid(payload['effects'],time.time()),
-        send=lambda *a:(sends.append(a) or (True,'',{'acceptance':'accepted','message_id':'synthetic-accepted'})),
+        retained_proof_current=lambda proof: proof == scope,
+        send=lambda *a, source_revision:(sends.append(source_revision) or (True,'',{'acceptance':'accepted','message_id':'synthetic-accepted'})),
         on_delivered=lambda payload:delivery_effects.finalize(payload['effects'],payload.get('receipt') or {}),
         record=lambda *a,**k:None)
     box._enqueue('a'*32,box.KIND_NUDGE,{'label':'skill:'+'d'*64+':proactive','body':output,
-        'target':'owner','effects':doc['effects']},time.time(),now.date().isoformat())
+        'target':'owner','effects':doc['effects'], 'prep_source_revision':scope['source_revision'],
+        'prep_route_digest':scope['route_digest']},time.time(),now.date().isoformat())
     assert box._attempt('a'*32)
     assert len(sends)==1
     box._attempt('a'*32)
@@ -432,3 +435,117 @@ def test_real_scheduled_location_update_uses_prior_cache_observation(tmp_path, m
     assert update['calendar_observed_at'] == observed
     assert delivery_effects.valid(staged['effects'], now.timestamp())
     assert calls == ['gather_google.py', 'proactive_scan.py']
+
+
+# Every event nudge proves its composing revision for reply context; ratings still need Gmail
+# (protected_brief_detail.notification_candidate), so a probe here grants no rating.
+@pytest.mark.parametrize('source,checks', [('imessage', ['route', 'source', 'route'] * 2),
+                                           ('gmail', ['route', 'source', 'route'] * 2)])
+def test_event_composition_probes_every_source_for_reply_context(rec, monkeypatch, source, checks):
+    probes = []
+    authority = {'complete': True, 'revision': 'a' * 64}
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'photon')
+    monkeypatch.setattr(rec, '_candidate_retained_route_digest', lambda: probes.append('route') or 'b' * 64)
+    monkeypatch.setattr(rec, '_runtime_source_authority', lambda: probes.append('source') or authority)
+    monkeypatch.setattr(rec, '_validate_fixed_work', lambda *_: None)
+    monkeypatch.setattr(rec, '_require_sotto_procedure', lambda *_: None)
+    monkeypatch.setattr(rec, '_event_request', lambda _: {'label': 'event', 'prompt': '',
+        'runner': [sys.executable, '-c', 'print("Disposable event notification.")']})
+    monkeypatch.setattr(rec._shared_effects(), 'valid', lambda *_: True)
+    job_id = rec.WORK_QUEUE.enqueue(rec.DATA, 'event', {'bundle': {'events': [{'event': {'source': source}}]}})
+    job = rec.WORK_QUEUE.claim(rec.DATA, rec._WORK_OWNER)
+    assert job['id'] == job_id
+    result = rec._execute_work(job)
+    assert result['text'].strip() == 'Disposable event notification.'
+    assert probes == checks
+    assert result['source_revision_at_composition'] == (authority['revision'] if checks else None)
+
+
+@pytest.mark.parametrize('label', ['proactive', 'cron:sotto-proactive', 'run-now:sotto-proactive'])
+def test_quiet_proactive_worker_does_not_probe_the_bridge(rec, monkeypatch, label):
+    probes = []
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'photon')
+    monkeypatch.setattr(rec, '_candidate_retained_route_digest', lambda: 'b' * 64)
+    def authority(*, bridge_probe='live'):
+        probes.append(bridge_probe)
+        return {'complete': True, 'revision': 'a' * 64}
+    monkeypatch.setattr(rec, '_runtime_source_authority', authority)
+    monkeypatch.setattr(rec, '_validate_fixed_work', lambda *_: None)
+    monkeypatch.setattr(rec, '_require_sotto_procedure', lambda *_: None)
+    result = rec._execute_work({'id': 'a' * 32, 'kind': 'run', 'payload': {
+        'label': label, 'runner': [sys.executable, '-c', 'print("NO_NUDGES")'], 'prompt': ''}})
+    assert result['text'].strip() == 'NO_NUDGES'
+    assert probes == ['none']
+
+
+@pytest.mark.parametrize('change', ['source', 'route', 'unchanged'])
+def test_scheduled_nudge_context_must_cover_the_scan(rec, monkeypatch, change):
+    import hashlib
+    text = 'Disposable nudge from the original scan.'
+    revision, route = 'a' * 64, 'b' * 64
+    probes = []
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'photon')
+    def authority(*, bridge_probe='live', report_probe_failure=False):
+        probes.append(bridge_probe)
+        return {'complete': True, 'revision': revision}
+    monkeypatch.setattr(rec, '_runtime_source_authority', authority)
+    monkeypatch.setattr(rec, '_candidate_retained_route_digest', lambda: route)
+    def captured(run_id):
+        # The scan read its inputs before composition observed the final authority.
+        nonlocal revision, route
+        if change == 'source':
+            revision = 'c' * 64
+        elif change == 'route':
+            route = 'd' * 64
+        return {'effects': [{'kind': 'task_nudge_context', 'revision': revision,
+                             'body_sha256': hashlib.sha256(text.encode()).hexdigest()}]}
+    monkeypatch.setattr(rec, '_read_delivery_effects', captured)
+    monkeypatch.setattr(rec, '_validate_fixed_work', lambda *_: None)
+    monkeypatch.setattr(rec, '_require_sotto_procedure', lambda *_: None)
+    result = rec._execute_work({'id': 'a' * 32, 'kind': 'run', 'payload': {
+        'label': 'cron:sotto-proactive', 'runner': [sys.executable, '-c', f'print({text!r})'], 'prompt': ''}})
+    expected = (revision, route) if change == 'unchanged' else (None, None)
+    assert (result['source_revision_at_composition'], result['route_digest_at_composition']) == expected
+    assert probes == ['none', 'live']
+
+
+@pytest.mark.parametrize('change', ['disconnect', 'timeout', 'malformed', 'offline', 'stable'])
+def test_scheduled_nudge_rechecks_a_bridge_that_was_available_for_the_scan(rec, tmp_path, monkeypatch, change):
+    import hashlib
+    import managed
+    from test_source_authority import Relay, _google_calendar, _health
+    monkeypatch.setenv('SOTTO_DEPLOYMENT_MODE', 'managed')
+    monkeypatch.setenv('SOTTO_TENANT_ID', 'tenant-a')
+    _google_calendar(tmp_path, monkeypatch)
+    managed.record_bridge_consent(tmp_path, ['imessage'], ['imessage'])
+    relay = Relay(_health())
+    monkeypatch.setattr(rec, 'RELAY', relay)
+    initial = rec._runtime_source_authority()
+    assert initial['bridge_sources'] == ['imessage']
+    revision = initial['revision']
+    if change == 'offline':
+        relay.health = None
+        offline = rec._runtime_source_authority()
+        assert offline['google_sources'] == ['calendar'] and offline['bridge_sources'] == []
+    relay.calls.clear()
+    text = 'Disposable scheduled nudge.'
+    def after_scan(run_id):
+        assert not relay.calls, 'starting a scan must not contact the Mac'
+        if change == 'malformed':
+            relay.health = {'connected': True}
+        if change in ('disconnect', 'timeout'):
+            relay.health = _health((), bridge='locally-revoked')
+            if change == 'disconnect':
+                relay.health = None
+            else:
+                monkeypatch.setattr(relay, 'mcp_call', lambda *a, **k: {'error': {'code': -32001}})
+        return {'effects': [{'kind': 'task_nudge_context', 'revision': revision,
+                             'body_sha256': hashlib.sha256(text.encode()).hexdigest()}]}
+    monkeypatch.setattr(rec, '_read_delivery_effects', after_scan)
+    monkeypatch.setattr(rec, '_deliver_target', lambda: 'photon')
+    monkeypatch.setattr(rec, '_candidate_retained_route_digest', lambda: 'b' * 64)
+    monkeypatch.setattr(rec, '_validate_fixed_work', lambda *_: None)
+    monkeypatch.setattr(rec, '_require_sotto_procedure', lambda *_: None)
+    result = rec._execute_work({'id': 'a' * 32, 'kind': 'run', 'payload': {
+        'label': 'cron:sotto-proactive', 'runner': [sys.executable, '-c', f'print({text!r})'], 'prompt': ''}})
+    assert result['source_revision_at_composition'] == (revision if change in ('offline', 'stable') else None)

@@ -129,9 +129,7 @@ def _gmail_search(service, query, limit, service_factory, *, ids_only=False):
                 else _gmail_metadata(service, item) for item in messages]
     if len(messages) <= 1:
         return [_gmail_metadata(service, item) for item in messages]
-    # Each worker owns its credentials/client/transport: googleapiclient's httplib2
-    # transport cannot be shared across threads. Reuse that client within the worker,
-    # keeping both connection setup and concurrent provider reads bounded.
+    # Each worker owns its client: httplib2 transport cannot be shared across threads.
     workers = min(GMAIL_METADATA_WORKERS, len(messages))
     out, stop = [None] * len(messages), threading.Event()
 
@@ -154,8 +152,7 @@ def _gmail_search(service, query, limit, service_factory, *, ids_only=False):
                 close()
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        # Consume every worker before returning; exceptions never publish a partial
-        # search as complete. The result slots preserve Gmail's original list order.
+        # Consume every worker; an exception never publishes a partial search.
         list(executor.map(read_cohort, range(workers)))
     return out
 
@@ -332,6 +329,7 @@ def execute(args, service_factory=_service):
 _OWNER_MESSAGE_ID = re.compile(r'[A-Za-z0-9_-]{1,128}\Z')
 _OWNER_EVENT_ID = re.compile(r'[A-Za-z0-9_@.-]{1,256}\Z')
 _OWNER_RESPONSE_BYTES = 64 * 1024
+_OWNER_LIST_DESCRIPTION_BYTES = 4 * 1024  # calendar_get keeps 16 KiB
 _OWNER_GMAIL_WIRE_BYTES = 256 * 1024
 _OWNER_READ_DEADLINE_SECONDS = 15
 
@@ -355,7 +353,7 @@ def _owner_text(value, limit):
     return value
 
 
-def _owner_projection(kind, row):
+def _owner_projection(kind, row, *, description_bytes=16 * 1024):
     if not isinstance(row, dict):
         raise ValueError('Google result is invalid')
     if kind == 'gmail':
@@ -376,17 +374,19 @@ def _owner_projection(kind, row):
         raise ValueError('Google result exceeds its bound')
     _shared_library()
     from calendar_context import _self_describes_owner, user_participates  # noqa: PLC0415
+    from google_calendar_read import clip  # noqa: PLC0415
     from timeutil import configured_user_email  # noqa: PLC0415
     owner_email = configured_user_email().strip().lower()
-    return {'owner_participates': user_participates(row, owner_email),
+    clipped = []
+    projected = {'owner_participates': user_participates(row, owner_email),
             **{key: _owner_text(row[key], 128) for key in ('transparency', 'eventType') if key in row},
             **({'calendar_id': _owner_text(row['calendar_id'], 1024)} if row.get('calendar_id') else {}),
             **({'originalStartTime': {key: _owner_text(value, 128) for key, value in row['originalStartTime'].items() if key in ('dateTime', 'date', 'timeZone')}} if isinstance(row.get('originalStartTime'), dict) else {}),
             **({'recurringEventId': _owner_text(row['recurringEventId'], 256)} if row.get('recurringEventId') else {}),
             'id': _owner_text(row.get('id') or '', 256),
-            'summary': _owner_text(row.get('summary') or '', 2048),
-            'description': _owner_text(row.get('description') or '', 16 * 1024),
-            'location': _owner_text(row.get('location') or '', 2048),
+            'summary': clip(row.get('summary') or '', 2048, 'summary', clipped),
+            'description': clip(row.get('description') or '', description_bytes, 'description', clipped),
+            'location': clip(row.get('location') or '', 2048, 'location', clipped),
             'status': _owner_text(row.get('status') or '', 128),
             'start': {key: _owner_text(start[key], 128) for key in ('dateTime', 'date', 'timeZone') if key in start},
             'end': {key: _owner_text(end[key], 128) for key in ('dateTime', 'date', 'timeZone') if key in end},
@@ -395,6 +395,7 @@ def _owner_projection(kind, row):
                            'owner': bool((item.get('self') and _self_describes_owner(row)) or
                                          (owner_email and str(item.get('email') or '').strip().lower() == owner_email))}
                           for item in attendees]}
+    return {**projected, 'clipped': clipped} if clipped else projected
 
 
 def _owner_thread_projection(raw, thread_id):
@@ -430,8 +431,7 @@ def _owner_thread_projection(raw, thread_id):
         item = _owner_projection('gmail', fields)
         item.update(body_truncated=truncated, internal_date=message['internalDate'])
         items.append(item)
-    # Leave space for the observation envelope. Remove oldest whole messages, not
-    # an arbitrary provider-order prefix that could hide the latest reply.
+    # Keep envelope space; drop the oldest whole messages, never the latest reply.
     while len(json.dumps(items).encode('utf-8')) > 48 * 1024:
         items.pop(0)
     if not items:
@@ -446,9 +446,9 @@ def _owner_gmail_session():
     from google.auth.transport.requests import AuthorizedSession, Request  # noqa: PLC0415
     from requests import Session  # noqa: PLC0415
     from requests.adapters import HTTPAdapter  # noqa: PLC0415
-    path = _shared_library().token_path()
+    path = _shared_library().token_path(require_home=True)
     if not path:
-        raise RuntimeError('Google credential root is unavailable')
+        raise FileNotFoundError('Google token')
     auth_transport = Session()
     auth_transport.mount('https://', HTTPAdapter(max_retries=0))
     authorized = AuthorizedSession(Credentials.from_authorized_user_file(path),
@@ -535,9 +535,7 @@ def _owner_fetch(session, url, params, deadline, *, phase=None):
         response = session.get(url, params=params, stream=True, timeout=min(5, remaining),
                                max_allowed_time=remaining,
                                allow_redirects=False)
-        # Gmail's field-projected messages list can return 204 when no messages
-        # or next-page token exist. This is an empty search, not a failed read.
-        # Other operations still require a representation (especially exact gets).
+        # A 204 from the projected messages list is an empty search; other operations need a body.
         if response.status_code == 204 and phase == 'search_list':
             return {}
         if response.status_code != 200:
@@ -617,8 +615,7 @@ def _read_owner_with_session(operation, arguments, session):
               'google_contacts' if operation.startswith('contacts_') else 'calendar')
     deadline = time.monotonic() + _OWNER_READ_DEADLINE_SECONDS
     if operation in ('contacts_search', 'contacts_get'):
-        # Share the original writer's contact projection; never expose unrelated
-        # People profile data or treat a bounded prefix search as a full address book.
+        # The original writer's contact projection; a bounded prefix search is not the full book.
         _shared_library()
         from contact_snapshot import CONTACT_MASK, RESOURCE, snapshot  # noqa: PLC0415
         if operation == 'contacts_search' and set(arguments) == {'query', 'max'}:
@@ -707,7 +704,7 @@ def _read_owner_with_session(operation, arguments, session):
         if not datetime.fromisoformat(start.replace('Z', '+00:00')) < datetime.fromisoformat(end.replace('Z', '+00:00')) <= datetime.fromisoformat(start.replace('Z', '+00:00')) + timedelta(days=31):
             raise ValueError('Google request is invalid')
         _shared_library()
-        from google_calendar_read import read  # noqa: PLC0415 - packaged shared library resolved above
+        from google_calendar_read import fill, read  # noqa: PLC0415 - packaged shared library resolved above
         def inventory(page):
             return _owner_fetch(session, 'https://www.googleapis.com/calendar/v3/users/me/calendarList',
                 {'maxResults': 250, 'minAccessRole': 'reader', 'showHidden': 'false',
@@ -724,8 +721,10 @@ def _read_owner_with_session(operation, arguments, session):
         order = {(row['calendar_id'], row['id']): index for index, row in enumerate(rows)}
         distinct = sorted(meeting_events(rows, configured_user_email()),
                           key=lambda row: order[(row['calendar_id'], row['id'])])
-        result = {'items': [_owner_projection('calendar', row) for row in distinct[:100]], 'calendars': rows.calendars}
-        complete = rows.complete and len(rows) <= 100
+        result = {**fill(distinct, lambda row: _owner_projection('calendar', row, description_bytes=_OWNER_LIST_DESCRIPTION_BYTES),
+                         _OWNER_RESPONSE_BYTES - len(json.dumps(rows.calendars).encode()) - 1024, start, resume_by=rows.resume_by),
+                  'calendars': rows.calendars}
+        complete = rows.complete and len(rows) <= 100 and 'truncated' not in result
         coverage = {'since': start, 'until': end}
     elif operation == 'calendar_get' and set(arguments) in ({'event_id'}, {'event_id', 'calendar_id'}):
         event_id = arguments['event_id']

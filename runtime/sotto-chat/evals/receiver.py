@@ -6,6 +6,8 @@ This is a developer harness, never imported by the installed receiver.
 import json
 import importlib.util
 import hashlib
+from datetime import datetime, timezone
+import re
 import os
 from pathlib import Path
 import sys
@@ -36,19 +38,15 @@ from adapters.sotto import startup_config  # noqa: E402
 
 world = json.loads(Path(sys.argv[1]).read_text())
 if world.get('meetingPrep'):
-    from datetime import datetime, timezone
     tokens = importlib.util.spec_from_file_location('eval_clock_tokens', PACK / 'evals/run_evals.py')
     clock_tokens = importlib.util.module_from_spec(tokens)
     tokens.loader.exec_module(clock_tokens)
     world = clock_tokens.resolve_tokens(world, datetime.now(timezone.utc))
     Path(sys.argv[1]).write_text(json.dumps(world))
-    sys.path.insert(0, str(Path(__file__).parent / 'provider'))
-    from prep_sources import seed_calendar_connection
-    seed_calendar_connection(os.environ['SOTTO_HOME'])
     os.environ.update(SOTTO_USER_EMAIL='owner@inside.test', SOTTO_GEMINI_MODEL='gemini-3.8-flash', SOTTO_FALLBACK_MODEL='')
 
-if 'contacts' in world and world.get('bridgeSend') is True:
-    raise ValueError('Contacts and Bridge-send worlds require a combined transport fixture; do not silently replace either source')
+if ('contacts' in world or 'whatsappMessages' in world) and world.get('bridgeSend') is True:
+    raise ValueError('Mac read and Bridge-send worlds require a combined transport fixture; do not silently replace either source')
 os.environ['SOTTO_EVAL_WORLD'] = str(Path(sys.argv[1]).resolve())
 os.environ['PYTHONPATH'] = str(Path(__file__).parent / 'provider')
 os.environ['SOTTO_MODEL_PROXY_URL'] = 'https://eval-source.invalid'
@@ -84,11 +82,25 @@ saved_grants = world.get('savedSourceGrants', ['gmail'] if 'loopTasks' in world 
 if (type(saved_grants) is not list or any(type(source) is not str or source not in
         {'gmail', 'calendar', 'google_contacts', 'imessage', 'whatsapp', 'contacts', 'granola'} for source in saved_grants)):
     raise ValueError('Invalid synthetic saved-source grants')
+google_scopes = {
+    'gmail': ('gmailMessages', 'https://www.googleapis.com/auth/gmail.readonly'),
+    'calendar': ('calendarEvents', 'https://www.googleapis.com/auth/calendar.readonly'),
+}
+
+
+def google_grants():
+    grants = set(saved_grants) & {'gmail', 'calendar', 'google_contacts'}
+    if 'config/managed-capabilities.json' not in world.get('files', {}):
+        return sorted(grants)
+    return sorted(source for source in grants if source not in google_scopes
+                  or google_scopes[source][0] not in world or receiver._source_context().allowed(source))
+
+
 def authority():
     return {'version': 2, 'complete': True, 'revision': 'a' * 64,
             'bridge_sources': sorted(set(saved_grants) & {'imessage', 'whatsapp', 'contacts'}
                                      | ({'contacts'} if 'contacts' in world else set())),
-            'google_sources': sorted(set(saved_grants) & {'gmail', 'calendar', 'google_contacts'}),
+            'google_sources': google_grants(),
             'connector_sources': sorted(set(saved_grants) & {'granola'})}
 
 receiver._runtime_source_authority = authority
@@ -120,6 +132,15 @@ for relative, content in world.get('files', {}).items():
     target.write_text(content)
     target.chmod(0o600)
 
+scopes = [scope for source, (field, scope) in google_scopes.items()
+          if source in google_grants() and field in world]
+if world.get('meetingPrep'):
+    scopes = [scope for scope in scopes if not scope.endswith('/calendar.readonly')]
+    scopes.append('https://www.googleapis.com/auth/calendar')
+if scopes:
+    from prep_sources import seed_google_connection
+    seed_google_connection(os.environ['SOTTO_HOME'], scopes)
+
 # Canonical task fixtures use the real writer in this isolated receiver volume only.
 if 'loopTasks' in world:
     import runtime_owner_loop
@@ -127,32 +148,131 @@ if 'loopTasks' in world:
     for row in world['loopTasks']:
         fixture_writer._load_continuity()._persist(row)
 
-if 'contacts' in world:
-    # Simulate the Mac boundary only. Do not replace the relay or its policy hooks.
-    # The fixture must also opt in via config/managed-capabilities.json, like the
-    # real receiver; a source-authority fixture alone cannot grant relay access.
-    def contact_bridge():
+def frozen_whatsapp(world):
+    rows = {}
+    for row in world.get('whatsappMessages', []):
+        ident = row['source_id']
+        stamp = datetime.fromisoformat(row['timestamp'])
+        if (type(ident) is not int or ident < 1 or ident in rows or stamp.tzinfo is None
+                or not re.fullmatch(r'[0-9]+@s\.whatsapp\.net', row['contact_jid'])
+                or not isinstance(row.get('text'), str) or not row['text'].strip()):
+            raise ValueError('Invalid frozen WhatsApp message')
+        rows[ident] = row, stamp.timestamp()
+    return dict(sorted(rows.items(), reverse=True))
+
+
+MAX_DIRECT_MESSAGES = 1000
+MAX_HISTORY_PAGE = 500
+LOCAL_SNAPSHOT_HOURS = 24
+
+
+def whatsapp_read(messages, name, args):
+    if args.get('source') != 'whatsapp':
+        raise ValueError('Expected WhatsApp source')
+    if name == 'get_messages':
+        jid, limit = args.get('identifier'), args.get('limit', 20)
+        if (set(args) - {'source', 'identifier', 'limit'} or type(limit) is not int or not 1 <= limit <= MAX_DIRECT_MESSAGES
+                or not isinstance(jid, str) or not re.fullmatch(r'[0-9]+@s\.whatsapp\.net', jid)):
+            raise ValueError('Invalid direct WhatsApp chat request')
+        rows = [row for row, _ in messages.values() if row['contact_jid'] == jid][:limit]
+        return {'source': 'whatsapp', 'identifier': jid, 'messages': rows}, rows
+    since, until, before, limit = (args.get('since'), args.get('until'), args.get('before', 0), args.get('limit', MAX_HISTORY_PAGE))
+    if (set(args) - {'source', 'since', 'until', 'before', 'limit'}
+            or any(type(value) is not int for value in (since, until, before, limit))
+            or not 0 <= since <= until or not 1 <= limit <= MAX_HISTORY_PAGE
+            or before and (before not in messages or not since <= messages[before][1] <= until)):
+        raise ValueError('Invalid WhatsApp history window or cursor')
+    rows = [row for ident, (row, stamp) in messages.items()
+            if since <= stamp <= until and (not before or ident < before)][:limit]
+    return {'source': 'whatsapp', 'status': 'ok', 'rows': rows, 'since': since, 'until': until,
+            'complete': len(rows) < limit, 'next_cursor': rows[-1]['source_id'] if len(rows) == limit else None}, rows
+
+
+def local_snapshot(world, messages, args):
+    sources = args.get('sources')
+    hours = args.get('since_hours')
+    if (set(args) != {'sources', 'since_hours'} or type(hours) is not int or not 1 <= hours <= LOCAL_SNAPSHOT_HOURS
+            or not isinstance(sources, list) or not sources
+            or any(source not in ('contacts', 'whatsapp') for source in sources)):
+        raise ValueError('Invalid local snapshot scope')
+    now = datetime.now(timezone.utc)
+    payload = {'generated_at': now.isoformat(), 'window_hours': hours, 'source_status': {}}
+    if 'contacts' in sources and 'contacts' in world:
+        failed = world.get('contacts_error')
+        rows = [] if failed else world['contacts']
+        payload.update(contacts=rows, contacts_total=len(rows))
+        payload['source_status']['contacts'] = 'degraded' if failed else 'ok'
+    if 'whatsapp' in sources and 'whatsappMessages' in world:
+        upper = now.timestamp()
+        rows = [row for row, stamp in messages.values() if upper - hours * 3600 <= stamp <= upper]
+        payload.update(whatsapp=rows, deferred_unread_whatsapp=[])
+        payload['source_status']['whatsapp'] = 'ok'
+    if set(payload['source_status']) != set(sources):
+        raise ValueError('Local snapshot source is missing from world')
+    return payload
+
+
+def mac_read(request, world, messages):
+    method, params = request.get('method'), request.get('params', {})
+    name, args = params.get('name'), params.get('arguments', {})
+    if method == 'tools/list':
+        tools = []
+        if 'contacts' in world:
+            tools.append({'name': 'get_contacts', 'description': 'Address book contacts.',
+                          'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False}})
+        if 'whatsappMessages' in world:
+            tools.append({'name': 'read_history', 'description': 'Read a bounded historical WhatsApp page.',
+                          'inputSchema': {'type': 'object', 'required': ['source', 'since', 'until'],
+                              'additionalProperties': False, 'properties': {'source': {'type': 'string', 'enum': ['whatsapp']},
+                              **{key: {'type': 'integer'} for key in ('since', 'until', 'before', 'limit')}}}})
+        return {'tools': tools}, None
+    if method == 'tools/call' and name == 'read_local' and isinstance(args, dict):
+        try:
+            payload = local_snapshot(world, messages, args)
+        except ValueError:
+            pass
+        else:
+            return {'structuredContent': payload, 'content': [{'type': 'text', 'text': json.dumps(payload)}]}, {
+                'source': 'bridge_snapshot', 'sources': list(payload['source_status'])}
+    if method == 'tools/call' and name == 'get_contacts' and 'contacts' in world and not args:
+        payload = ({'contacts': [], 'error': 'PRIVATE-SYNTHETIC-READ-ERROR'} if world.get('contacts_error')
+                   else {'contacts': world['contacts']})
+        return {'content': [{'type': 'text', 'text': json.dumps(payload)}]}, {
+            'source': 'contacts', 'rows': len(payload['contacts'])}
+    if (method == 'tools/call' and 'whatsappMessages' in world and isinstance(args, dict)
+            and (name == 'read_history' or name == 'get_messages'
+                 and 'whatsapp_chat_read_v1' in params.get('_meta', {}).get('sotto/accepts', []))):
+        try:
+            payload, rows = whatsapp_read(messages, name, args)
+        except ValueError:
+            pass
+        else:
+            return {'structuredContent': payload, 'content': [{'type': 'text', 'text': json.dumps(payload)}]}, {
+                'source': 'whatsapp', 'operation': name, 'request': args,
+                'message_ids': [row['source_id'] for row in rows],
+                'jids': sorted({row['contact_jid'] for row in rows}), 'rows': len(rows)}
+    return {'isError': True, 'content': [{'type': 'text', 'text': 'Bridge fixture has no such source read.'}]}, {
+        'source': 'denied', 'reason': 'unexpected Bridge fixture call'}
+
+
+if 'contacts' in world or 'whatsappMessages' in world:
+    messages = frozen_whatsapp(world)
+
+    def mac_bridge():
+        # The real relay owns request authorization and rechecks current consent at response time.
         while True:
             request = receiver.RELAY.poll(timeout=1)
             if request is None:
                 continue
-            method, params = request.get('method'), request.get('params', {})
-            if method == 'tools/list':
-                result = {'tools': [{'name': 'get_contacts', 'description': 'Address book contacts.',
-                          'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False}}]}
-            elif method == 'tools/call' and params.get('name') == 'get_contacts':
-                with Path(sys.argv[1]).with_name('source-reads.jsonl').open('a') as log:
-                    log.write(json.dumps({'source': 'contacts', 'rows': len(world['contacts'])}) + '\n')
-                payload = ({'contacts': [], 'error': 'PRIVATE-SYNTHETIC-READ-ERROR'} if world.get('contacts_error')
-                           else {'contacts': world['contacts']})
-                result = {'content': [{'type': 'text', 'text': json.dumps(payload)}]}
-            else:
-                with Path(sys.argv[1]).with_name('source-reads.jsonl').open('a') as log:
-                    log.write(json.dumps({'source': 'denied', 'reason': 'unexpected Bridge fixture call'}) + '\n')
-                result = {'isError': True, 'content': [{'type': 'text', 'text': 'Bridge fixture has no such source.'}]}
-            if not receiver.RELAY.respond({'jsonrpc': '2.0', 'id': request['id'], 'result': result}):
+            result, receipt = mac_read(request, world, messages)
+            accepted = receiver.RELAY.respond({'jsonrpc': '2.0', 'id': request['id'], 'result': result})
+            if not accepted:
                 receiver.RELAY.cancel(request, 'Bridge fixture result was withheld.')
-    threading.Thread(target=contact_bridge, daemon=True).start()
+            if receipt is not None and (accepted or receipt['source'] == 'denied'):
+                with Path(sys.argv[1]).with_name('source-reads.jsonl').open('a') as log:
+                    log.write(json.dumps(receipt) + '\n')
+
+    threading.Thread(target=mac_bridge, daemon=True).start()
 # Explicit synthetic Mac sender; never connects to a real Bridge or Messages.
 if world.get('bridgeSend') is True:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'test'))
@@ -164,6 +284,14 @@ if world.get('meetingPrep'):
     os.environ['SOTTO_TRIGGER_PORT'] = str(server.server_port)
 os.environ['PORT'] = str(server.server_port)
 threading.Thread(target=server.serve_forever, daemon=True).start()
+if 'contacts' in world or 'whatsappMessages' in world:
+    source_context = receiver._source_context()
+    snapshot_sources = [source for source, field in (('contacts', 'contacts'), ('whatsapp', 'whatsappMessages'))
+                        if field in world and source in saved_grants and source_context.allowed(source)]
+    if snapshot_sources:
+        # Publish the fixture worker's first poll before making a startup read.
+        receiver.RELAY.poll(timeout=0)
+        source_context.bridge_call('read_local', {'since_hours': LOCAL_SNAPSHOT_HOURS, 'sources': snapshot_sources}, timeout=5)
 print(json.dumps({'event': 'ready', 'port': server.server_port, 'identity': identity,
                   'bearer': capability, 'readBearer': receiver.MCP_TOKEN}), flush=True)
 staged_offer = None
@@ -183,6 +311,10 @@ for line in sys.stdin:
         expected.write_text(json.dumps(startup_config.receiver_channel_expectation(config)))
         expected.chmod(0o600)
         print(json.dumps({'event': 'configured'}), flush=True)
+    elif request['op'] == 'deliver_gallery':
+        from accepted_gallery import deliver_brief
+        proof = deliver_brief(receiver, data, request['step'], request['text'])
+        print(json.dumps({'event': 'deliver_gallery', **proof}), flush=True)
     elif request['op'] == 'prepare_prep_offer':
         # Synthetic calendar/source grants already pass the ordinary production source gate.
         # Do not seed pending-offer files or activate an unaccepted assistant question.

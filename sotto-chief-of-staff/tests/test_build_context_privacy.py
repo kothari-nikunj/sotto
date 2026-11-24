@@ -34,7 +34,7 @@ CORPUS_GUARD = ['sotto-chief-of-staff/evals/corpus-v2/days/day-01.json',
                 'sotto-chief-of-staff/evals/labels.yaml', 'sotto-chief-of-staff/evals/labels.draft.yaml']
 HYGIENE = {'**/.pytest_cache/', '**/__pycache__/', '*.pyc', 'sotto-bridge/core/target/', '.DS_Store',
            'sotto-bridge/app/Sotto Bridge.app/', 'sotto-bridge/app/Sotto-Bridge-*.dmg',
-           'sotto-bridge/app/.build/', 'sotto-bridge/.last-ship', 'sotto-bridge/.notary-profile',
+           'sotto-bridge/app/.build/', 'sotto-bridge/app/Resources/AppIcon.icns', 'sotto-bridge/.last-ship', 'sotto-bridge/.notary-profile',
            '.venv/'}
 CONTEXTS = [AGENT_ROOT / 'Dockerfile.dockerignore', *sorted(CHAT.glob('Dockerfile.*.dockerignore'))]
 

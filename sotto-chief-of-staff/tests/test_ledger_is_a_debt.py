@@ -78,8 +78,8 @@ EMPTY = [
 # These three shapes are the PROMPT's job — a human sender at a human-looking address, so no
 # deterministic rule can tell them from a real ask without reading what the message means.
 COLD_OUTREACH = [
-    _act("reply", "+33750298517", "Checking if you need help or services before July 21st in Paris",
-         "+33750298517", channel="whatsapp"),
+    _act("reply", "+447700900517", "Checking if you need help or services before July 21st in Paris",
+         "+447700900517", channel="whatsapp"),
     _act("reply", "Milo Brandt", "Partnership outreach from Cratewell", "milo@cratewell.example"),
     _act("reply", "Aerix Dynamics", "Seed round pitch", "hello@aerix.example"),
 ]
@@ -152,7 +152,7 @@ def test_a_row_that_identifies_nobody_never_opens_a_debt(tmp_path, monkeypatch):
     """The nameless half of every pair in the open set. Such a row can never be resolved (every
     cross-channel check needs an identifier) or tapped, and worse: they ALL collapse onto the single
     anchor ending `name:`, so two unrelated asks become one debt."""
-    nameless = _act("reply", "", "Team members in the group chat asked you to call Pegah about the "
+    nameless = _act("reply", "", "Team members in the group chat asked you to call Odile about the "
                                  "allocation", channel="imessage")
     assert "no counterpart" in cr.not_a_debt(cr._normalize_action(nameless))
     assert _active_names(tmp_path, monkeypatch, [nameless]) == []
@@ -243,39 +243,39 @@ OPEN_ROWS = [
     ("reply", "imessage", "Ridge / Anvil Group", "Team members in the Ridge / Anvil group thread "
                                                  "asked if anyone knows contacts at Crescent"),
     # ONE sync → four rows, two of them calendar shadows the old MEETING_TYPES check let through
-    ("meeting", "calendar", "You and Jonas Getty", "Sync with Jonas Getty (Gutter Capital) on "
+    ("meeting", "calendar", "You and Jonah Gale", "Sync with Jonah Gale (Gable Capital) on "
                                                    "Monday morning."),
-    ("calendar", "calendar", "", "Sync with Jonas Getty scheduled for Monday"),
-    ("schedule", "email", "", "Jonas Getty from Gutter Capital requested a sync Monday morning"),
-    ("follow_up", "gmail", "Jonas Getty", "Jonas requested a morning sync ahead of your 2:00 PM "
+    ("calendar", "calendar", "", "Sync with Jonah Gale scheduled for Monday"),
+    ("schedule", "email", "", "Jonah Gale from Gable Capital requested a sync Monday morning"),
+    ("follow_up", "gmail", "Jonah Gale", "Jonah requested a morning sync ahead of your 2:00 PM "
                                           "meeting today"),
     # ONE call request → three rows, across two channels
-    ("reply", "imessage", "", "Team members in the FLASH group chat asked you to call Pegah about "
+    ("reply", "imessage", "", "Team members in the BOLT group chat asked you to call Odile about "
                               "the allocation"),
-    ("call", "whatsapp", "", "Team requested in the FLASH group chat to call Pegah about the "
-                             "Railside investment"),
-    ("call", "whatsapp", "Pegah Ebrahim", "Pegah asked for a call about the Railside SAFE "
+    ("call", "whatsapp", "", "Team requested in the BOLT group chat to call Odile about the "
+                             "Lakeside investment"),
+    ("call", "whatsapp", "Odile Marchetti", "Odile asked for a call about the Lakeside SAFE "
                                           "allocation before Monday"),
     # the named/nameless pairs
-    ("reply", "imessage", "Farid Mirzayev", "Farid asked for the intro to Kimia"),
-    ("reply", "imessage", "", "Asked for the intro to Kimia"),
-    ("reply", "email", "Amy Wooten", "Amy asked where the Forkable renewal landed"),
-    ("reply", "email", "", "Asked where the Forkable renewal landed"),
+    ("reply", "imessage", "Bastian Kroll", "Bastian asked for the intro to Lucia"),
+    ("reply", "imessage", "", "Asked for the intro to Lucia"),
+    ("reply", "email", "Amy Carver", "Amy asked where the Lunchbox renewal landed"),
+    ("reply", "email", "", "Asked where the Lunchbox renewal landed"),
     # …and the seven single genuine debts, each already one row
-    ("reply", "email", "Justin Leigh", "Justin asked for the Fund II list of allocations"),
-    ("follow_up", "email", "Spencer Sneed", "You owe Spencer the intro to the Onshore team"),
-    ("reply", "imessage", "Animesh Bhatt", "Animesh asked whether you can join the Thursday review"),
-    ("reply", "imessage", "Eshanth Rao", "Eshanth asked for a written reference by Friday"),
-    ("waiting_on", "email", "Tanmayi Kolla", "Tanmayi owes you the pre-read for Monday's board"),
-    ("reply", "whatsapp", "Yum Gong", "Yum asked whether the Tuesday dinner is still on"),
-    ("reply", "email", "Gaurav Menon", "Gaurav asked you to review the revised model"),
+    ("reply", "email", "Justin Vale", "Justin asked for the Fund II list of allocations"),
+    ("follow_up", "email", "Silas Brandt", "You owe Silas the intro to the Seaside team"),
+    ("reply", "imessage", "Ansel Bright", "Ansel asked whether you can join the Thursday review"),
+    ("reply", "imessage", "Elian Ross", "Elian asked for a written reference by Friday"),
+    ("waiting_on", "email", "Talia Kovac", "Talia owes you the pre-read for Monday's board"),
+    ("reply", "whatsapp", "Yara Gold", "Yara asked whether the Tuesday dinner is still on"),
+    ("reply", "email", "Gideon Moss", "Gideon asked you to review the revised model"),
 ]
 
 # The eleven distinct debts those 24 rows describe, by the survivor's contact_name (the group ask
 # survives under whichever label the extractor used most recently).
-GENUINE_OPEN = {"Jonas Getty", "Pegah Ebrahim", "Farid Mirzayev", "Amy Wooten", "Justin Leigh",
-                "Spencer Sneed", "Animesh Bhatt", "Eshanth Rao", "Tanmayi Kolla", "Yum Gong",
-                "Gaurav Menon"}
+GENUINE_OPEN = {"Jonah Gale", "Odile Marchetti", "Bastian Kroll", "Amy Carver", "Justin Vale",
+                "Silas Brandt", "Ansel Bright", "Elian Ross", "Talia Kovac", "Yara Gold",
+                "Gideon Moss"}
 
 
 def _seed_open_ledger(tmp_path):
@@ -304,10 +304,10 @@ def test_a_verified_identity_keys_the_debt_without_the_channel():
     run and `whatsapp` the next for the same ask; only the guessed `name:` fallback still carries
     the channel, to keep two same-named strangers apart."""
     ims = cr.compute_anchor_key({"channel": "imessage", "action_type": "reply",
-                                 "contact_identifier": "+14155551234"})
+                                 "contact_identifier": "+14155550107"})
     wa = cr.compute_anchor_key({"channel": "whatsapp", "action_type": "call",
-                                "contact_identifier": "4155551234"})
-    assert ims == wa == "follow_up:id:4155551234"
+                                "contact_identifier": "4155550107"})
+    assert ims == wa == "follow_up:id:4155550107"
     named = cr.compute_anchor_key({"channel": "imessage", "action_type": "reply",
                                    "contact_name": "Ridge / Anvil"})
     assert named == "imessage:follow_up:name:ridge /"
@@ -318,9 +318,9 @@ def test_a_calendar_shadow_never_becomes_a_debt(tmp_path, monkeypatch):
     `calendar` walked straight past the old set — four rows for one sync."""
     _env(tmp_path, monkeypatch)
     out = cr.resolve({"today": TODAY, "new_actions": [
-        _act("meeting", "You and Jonas Getty", "Sync with Jonas Getty on Monday", channel="calendar"),
-        _act("calendar", "Jonas Getty", "Sync with Jonas Getty scheduled for Monday",
-             "jonas@guttercap.example", channel="calendar"),
+        _act("meeting", "You and Jonah Gale", "Sync with Jonah Gale on Monday", channel="calendar"),
+        _act("calendar", "Jonah Gale", "Sync with Jonah Gale scheduled for Monday",
+             "jonas@gablecap.example", channel="calendar"),
         _act("meeting_prep", "Board sync", "Prep the board sync", channel="calendar"),
     ]}, NOW)
     assert out["active"] == []
@@ -342,8 +342,8 @@ def test_the_owners_open_ledger_collapses_to_its_real_debts(tmp_path, monkeypatc
     group = [a for a in active if "Ridge / Anvil" in a["summary"]]
     assert len(group) == 2
     # one sync, one row; one call request, one row
-    assert len([a for a in active if a["contact_name"] == "Jonas Getty"]) == 1
-    assert len([a for a in active if a["contact_name"] == "Pegah Ebrahim"]) == 1
+    assert len([a for a in active if a["contact_name"] == "Jonah Gale"]) == 1
+    assert len([a for a in active if a["contact_name"] == "Odile Marchetti"]) == 1
     # the nameless rows are closed, not silently folded into each other
     closed = [f for f in _all_rows(tmp_path) if f.get("resolution") == "anchorless"]
     assert len(closed) == 7

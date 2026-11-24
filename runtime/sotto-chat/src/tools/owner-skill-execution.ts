@@ -1,7 +1,7 @@
 /** Framework-neutral shared skill admission; model runtimes supply only trusted context. */
 import type {OperationalJournal, ExplicitOwnerLoopAuthority} from '../journal/index.js';
 import {readAuthority, SourceAuthorityChanged, type SourceAuthorityReader} from '../agent/source-authority.js';
-import {ActionHeldError} from './action-gate.js';
+import {ActionHeldError, OneMessageRequiredError} from './action-gate.js';
 import {FollowupAdmissionRequiredError, RelationshipPulseAdmissionRequiredError, ProactiveAdmissionRequiredError, ownerSkillRequestArgsSchema} from './owner-skill-request-client.js';
 import type {OwnerSkillRequestClient} from './owner-skill-request-client.js';
 export interface OwnerSkillExecutionContext {
@@ -32,7 +32,7 @@ export function createOwnerSkillExecution(options: OwnerSkillExecutionOptions) {
   };
   const change = async (input: unknown, context: OwnerSkillExecutionContext) => {
     const {journal, authority, eventId} = trusted(context);
-    if (context.allowOwnerSkill !== true) throw new Error('Owner skill request requires one owner message');
+    if (context.allowOwnerSkill !== true) throw new OneMessageRequiredError();
     await sourceCurrent(context);
     let args = ownerSkillRequestArgsSchema.parse(input);
     if (args.skill === 'ask-research')

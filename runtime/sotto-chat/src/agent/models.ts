@@ -39,6 +39,11 @@ export class ManagedProxyRequestTooLarge extends Error {
   constructor() { super('managed model request too large'); }
 }
 
+export class ChatTurnDeadlineExceeded extends Error {
+  readonly notice = 'I ran out of time before I could finish the reply. If you asked me to take an action, check its status before retrying.';
+  constructor() { super('chat turn deadline exceeded'); }
+}
+
 export class ManagedProxyBudgetExhausted extends Error {
   constructor(readonly period: 'calendar_month' | 'lifetime' | 'unknown' = 'unknown') {
     super('managed model spending allowance exhausted');

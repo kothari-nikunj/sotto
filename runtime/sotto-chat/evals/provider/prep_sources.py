@@ -15,22 +15,22 @@ AGENT = Path(__file__).resolve().parents[4]
 CALENDAR_ID = 'owner@inside.test'
 
 
-def seed_calendar_connection(root):
-    """Synthetic local credential status; the real Google --check stays active.
+def seed_google_connection(root, scopes):
+    """Synthetic local credential status; the real Google readers and capability checks stay active.
 
-    Only the eval transport can consume this unusable token. No live credential,
+    Only the eval transport can consume this synthetic token. No live credential,
     refresh or OAuth authorization is involved.
     """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = root / 'google_token.json'
     with path.open('x') as stream:
-        json.dump({'type': 'authorized_user', 'token': 'synthetic-eval-calendar-token',
+        json.dump({'type': 'authorized_user', 'token': 'synthetic-eval-google-token',
                    'refresh_token': 'synthetic-eval-refresh-token',
                    'client_id': 'synthetic-eval-client', 'client_secret': 'synthetic-eval-secret',
                    'token_uri': 'https://eval-source.invalid/token',
                    'expiry': '2099-01-01T00:00:00Z',
-                   'scopes': ['https://www.googleapis.com/auth/calendar']}, stream)
+                   'scopes': scopes}, stream)
     path.chmod(0o600)
 
 

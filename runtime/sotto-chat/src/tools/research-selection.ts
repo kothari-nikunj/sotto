@@ -1,7 +1,7 @@
 import type {OperationalJournal,ExplicitOwnerLoopAuthority} from '../journal/index.js';
 import type {OwnerSkillRequestArgs} from './owner-skill-request-client.js';
 import {ownerSkillRequestKind} from './owner-skill-request-client.js';
-import {ownerReadRequest,researchTargetAnswer,validResearchSubject,ownerSubjectMention,contextualReadRequest,explicitReadReference,prepResearchRequest} from './read-admission.js';
+import {ownerReadRequest,researchTargetAnswer,validResearchSubject,ownerSubjectMention,explicitReadReference,prepResearchRequest,READ_CONTEXT_WINDOW_MS} from './read-admission.js';
 import {createHash} from 'node:crypto';
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
 type Context={eventId:string;admittedAt:number;dispatchId:string;text:string};
@@ -46,7 +46,7 @@ export function resolveResearchSelection(journal:OperationalJournal,authority:Ex
   }
   if (ownerSubjectMention(admitted.text,selector)) return args;
   for (const context of acceptedReadContexts(eventId, sourceRevision)) {
-    if (!contextualReadRequest(admitted.text) ||
+    if (!ownerReadRequest(admitted.text) ||
         !ownerSubjectMention(context.text,selector)) continue;
     // An elliptical question can continue the immediately preceding request.
     // Without a reference, unrelated older mentions are not a lookup grant.
@@ -71,7 +71,7 @@ function acceptedPrepResearch(journal:OperationalJournal,eventId:string,provider
   if(input.skill!=='ask-research'||input.selection.mode!=='company'||input.selection.operation||!prepResearchRequest(text))return;
   const sessions=journal.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_sessions'").get();
   const session=sessions?journal.db.prepare('SELECT created_at FROM memory_sessions WHERE provider_thread=?').get(providerThreadId):undefined;
-  const background=session?journal.acceptedBackgroundMessage(eventId,Number(session.created_at)):undefined;
+  const background=session?journal.acceptedBackgroundMessage(eventId,Number(session.created_at),READ_CONTEXT_WINDOW_MS):undefined;
   if(!background || journal.db.prepare(`SELECT 1 FROM inbound_events WHERE thread_key=(SELECT thread_key FROM inbound_events WHERE id=?)
     AND rowid<(SELECT rowid FROM inbound_events WHERE id=?) AND received_at>=? LIMIT 1`).get(eventId,eventId,background.acceptedAt))return;
   if(background.sourceRevision===sourceRevision)return {provider_message_id:background.providerMessageId,

@@ -21,6 +21,7 @@ import time
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import client_mcp
+import client_mcp_audit
 
 SCOPE = 'sotto.read'
 PREFIX = '/client-oauth'
@@ -33,6 +34,12 @@ DAY = 86400
 TOKEN_TTL = 3600
 MAX_TOKEN_ROWS = 4096
 CONNECTION_TTL = 30 * DAY
+
+
+
+def plain_tool_summary(name):
+    """The first sentence of a read tool's description: what the consent page shows the owner."""
+    return client_mcp.TOOLS[name]['description'].split('. ')[0].rstrip('.') + '.'
 
 
 def origin():
@@ -279,8 +286,8 @@ def authenticate(root, token, session_lookup):
                 AND c.revoked=0 AND c.resource=?''',
                 (digest(token), time.time(), time.time(), base + client_mcp.PATH)).fetchone()
         if row and session_lookup(row['session']):
-            names = json.loads(row['tools'])
-            if type(names) is list and names and all(isinstance(name, str) and name in client_mcp.TOOLS for name in names):
+            names = client_mcp.resolve_tools(json.loads(row['tools']))
+            if names:
                 return {'client_id': row['id'], 'tools': names, 'expires_at': row['expires']}
     except (OSError, ValueError, sqlite3.Error):
         pass
@@ -374,10 +381,12 @@ def _handle(h, method, root, dashboard, base):
             callback = urlsplit(data['redirect_uri'])
             host = html.escape(data['redirect_uri'])
             form_origin = callback.scheme + '://' + callback.netloc
+            tools = client_mcp.read_tools()
+            tools_markup = ''.join(f'<li>{html.escape(plain_tool_summary(name))}</li>' for name in tools)
             db.commit()
             return reply(h, 200, form_origin=form_origin, headers=[('Set-Cookie',
                 f'{COOKIE}=; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=0')], markup=page('Connect Sotto', f'''<h1>Connect {label} to Sotto?</h1>
-                <p class="oauth-intro">Bring your context into this assistant. You choose what Sotto shares.</p>
+                <p class="oauth-intro">Bring your context into this assistant. Sotto shares only the sources you have turned on in Sotto Settings.</p>
                 <div class="oauth-destination"><span>Return address</span><strong>{host}</strong>
                 <small>The app calls itself “{label}”. Continue only if you recognize the app and this address.</small></div>
                 <section aria-labelledby="read-heading"><h2 id="read-heading">Read-only access</h2>
@@ -386,7 +395,11 @@ def _handle(h, method, root, dashboard, base):
                 <li>Saved people, companies and commitments</li>
                 <li>Mac sources you’ve chosen to share, including messages, calls, contacts,
                 notes, reminders, browsing history, file metadata and Screen Time, while your Mac is online</li></ul></section>
-                <p class="oauth-boundary">It cannot send messages, change tasks or run Sotto’s agent.</p>
+                <details><summary>The {len(tools)} read-only tools this grants today</summary>
+                <ul>{tools_markup}</ul></details>
+                <p class="oauth-boundary">It cannot send messages, change tasks or run Sotto’s agent.
+                This grant (<code>read:all</code>) includes read-only tools Sotto adds later, without
+                reconnecting; anything that could change your data would need your approval again.</p>
                 <form method="post" class="oauth-actions"><input type="hidden" name="request" value="{html.escape(rid)}">
                 <input type="hidden" name="csrf" value="{html.escape(rec['csrf'])}">
                 <button class="oauth-primary" name="decision" value="allow">Allow read-only access</button>
@@ -422,7 +435,7 @@ def _handle(h, method, root, dashboard, base):
                     (int(time.time()) + 365 * DAY, request['client_id']))
                 db.execute('INSERT INTO connections VALUES(?,?,?,?,?,?,0)',
                     (cid, request['client_id'], pending['session'], request['resource'],
-                     int(time.time()) + CONNECTION_TTL, json.dumps(sorted(client_mcp.TOOLS))))
+                     int(time.time()) + CONNECTION_TTL, json.dumps([client_mcp.READ_ALL])))
                 db.execute('INSERT INTO codes VALUES(?,?,?,?,?)',
                     (digest(code), cid, request['redirect_uri'], request['code_challenge'], int(time.time()) + 120))
                 result['code'] = code
@@ -445,6 +458,7 @@ def _handle(h, method, root, dashboard, base):
                     f'<input type="hidden" name="connection" value="{row["id"]}">'
                     f'<input type="hidden" name="csrf" value="{html.escape(rec["csrf"])}">'
                     '<button>Disconnect</button></form>' for row in rows)
+                db.commit()  # Release the OAuth writer lock before reading audit files.
                 return reply(h, 200, headers=[('Set-Cookie',
                     f'{COOKIE}=; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=0')], markup=
                     '<!doctype html><html lang="en"><meta charset="utf-8">'
@@ -462,5 +476,6 @@ def _handle(h, method, root, dashboard, base):
                     'Sotto’s scheduled briefs and workflows continue separately.</p>'
                     '<p>Connections expire within 30 days, or sooner if this Sotto sign-in expires or you sign out.</p>'
                     '<h2>Connected assistants</h2>' + (forms or '<p>No active connections. Nothing is shared until you approve.</p>')
+                    + client_mcp_audit.markup(root, time.time())
                     + '<p><a href="/app">Not now · Back to Sotto</a></p></html>')
         return reply(h, 405, {'error': 'method_not_allowed'})

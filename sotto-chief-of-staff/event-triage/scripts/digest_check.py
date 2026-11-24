@@ -51,13 +51,14 @@ for _path in (_SHARED_LIB, _SHARED_SCRIPTS):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 from textutil import _looks_like_phone_number, _s  # noqa: E402
-from timeutil import _parse_ts  # noqa: E402
+from timeutil import _parse_ts, source_observed_time  # noqa: E402
 import relevance  # noqa: E402
 import preferences  # noqa: E402
 from gemini_transport import ModelBudgetUnavailableError, proxy_budget_exhausted  # noqa: E402
 from work_queue import MODEL_BUDGET_EXIT  # noqa: E402
-from personal_context import conversation_key, conversation_message  # noqa: E402
+from personal_context import conversation_key, conversation_message, notification_sender  # noqa: E402
 from envutil import int_env as _int_env  # noqa: E402
+from triage_event import _is_group  # noqa: E402
 
 REVIEW_CONVERSATION_CAP = 100
 REVIEW_MESSAGES_CAP = 20
@@ -168,6 +169,10 @@ def advance_stamp(now: datetime) -> None:
         pass
 
 
+def _available_at(entry):
+    return _parse_iso(entry.get('valve_withheld_at')) or _parse_iso(entry.get('ts'))
+
+
 def entries_since(stamp) -> list:
     """queue.jsonl entries with ts AFTER `stamp` (all entries when never stamped). One bad line
     never poisons the read."""
@@ -188,7 +193,7 @@ def entries_since(stamp) -> list:
         if not isinstance(entry, dict):
             continue
         if stamp is not None:
-            ts = _parse_iso(entry.get("ts"))
+            ts = _available_at(entry)
             if ts is None or ts <= stamp:
                 continue
         out.append(entry)
@@ -257,30 +262,113 @@ def _item_id(key: str, entries: list[dict]) -> str:
     return hashlib.sha256((key + "\0" + "\0".join(identities)).encode()).hexdigest()[:32]
 
 
-def _message(entry: dict) -> dict:
-    ev = entry.get("event") if isinstance(entry.get("event"), dict) else {}
-    return conversation_message(ev, timestamp=_s(entry.get("ts")),
-                                prior_class=_s(entry.get("verdict_class")))
+def _message(entry: dict, loops) -> dict:
+    from delivery_effects import request_closed, request_reference
+
+    event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+    message = conversation_message(event, timestamp=_s(entry.get("ts")),
+                                   prior_class=_s(entry.get("verdict_class")))
+    if loops and not message['is_from_me'] and request_closed(request_reference(event), loops):
+        message['request_closed'] = True
+    return message
 
 
-def check(entries: list, min_n: int | None = None, *, track_review: bool = False) -> dict:
+def _visible_entry(entry, prefs):
+    from delivery_effects import source_for_event
+    from source_context import allowed
+
+    event = entry.get('event') or {}
+    source = source_for_event(event)
+    return ((not source or allowed(source))
+            and not preferences.proactively_muted(_s(entry.get('sender')), event, prefs))
+
+
+def _saved_task_context(candidates, history, prefs, loops):
+    """Bind communication-backed nudges to exact retained originals, before reading their thread."""
+    import ledger_io
+    from delivery_effects import request_reference, request_references, source_for_event
+
+    tasks = [entry for entry in candidates if (entry.get('event') or {}).get('source') == PROACTIVE_SOURCE
+             and source_for_event(entry['event']) in ('imessage', 'whatsapp', 'gmail')]
+    if not tasks:
+        return {}, set(), {}
+    originals = {}
+    thread_rows = {}
+    for entry in history:
+        if not _visible_entry(entry, prefs):
+            continue
+        reference = request_reference(entry.get('event') or {})
+        if reference:
+            key = _conversation_key(entry)
+            thread_rows.setdefault(key, {})[reference['id']] = entry
+            if (key.startswith(reference['source'] + ':thread:')
+                    or (reference['source'] != 'gmail' and key.startswith(reference['source'] + ':person:'))):
+                originals.setdefault((reference['source'], reference['id']), {})[key] = entry
+    bound = {}
+    for entry in tasks:
+        row = loops.get(entry['event'].get('anchor_key'))
+        if not row or row.get('status', 'open') not in ledger_io.ACTIVE:
+            continue
+        source = source_for_event(entry['event'])
+        matched = {key: original for ref in request_references(row) if ref[0] == source
+                   for key, original in originals.get(ref, {}).items()}
+        if len(matched) == 1:
+            bound[id(entry)] = next(iter(matched.items()))
+    return bound, {id(entry) for entry in tasks}, thread_rows
+
+
+def _bounded_rows(entries, originals):
+    def observed(row):
+        return source_observed_time(row.get('event') or {}) or _parse_iso(row.get('ts')) or datetime.min.replace(tzinfo=timezone.utc)
+
+    ordered = sorted(entries, key=observed)
+    if not originals:
+        return ordered[-REVIEW_MESSAGES_CAP:]
+    # Keep exact originals in view even when a long thread would crowd them out.
+    protected = [row for row in ordered if id(row) in originals][-(REVIEW_MESSAGES_CAP - 1):]
+    recent = [row for row in ordered if id(row) not in originals][-(REVIEW_MESSAGES_CAP - len(protected)):]
+    return sorted([*protected, *recent], key=observed)
+
+
+def _grounded_excerpt(judgment, messages):
+    index = judgment.get('message_index')
+    excerpt = judgment.get('excerpt')
+    if (type(index) is not int or not 0 <= index < len(messages)
+            or not isinstance(excerpt, str) or not excerpt.strip()
+            or excerpt.strip() not in messages[index]['text']):
+        return None
+    status = judgment.get('status')
+    request_index = judgment.get('request_index')
+    if status is None:
+        if request_index is not None:
+            return None
+        request_index = index
+    elif (status != 'waiting' or index != len(messages) - 1 or not messages[index]['is_from_me']
+          or type(request_index) is not int or not 0 <= request_index < index
+          or messages[request_index]['is_from_me']):
+        return None
+    # Preserve the surrounding words, including any negation the selected span omitted.
+    message = messages[index]
+    quote = ' '.join(message['text'].split())
+    if message['text_clipped']:
+        quote += '…'
+    return index, request_index, quote, status
+
+
+def check(entries: list, min_n: int | None = None, *, track_review: bool = False,
+          history: list | None = None) -> dict:
     """Activity gate → bounded conversation review → relevance ranking → delivery cap.
 
     All context is read-only. The injectable review_conversations seam tests selection without
     paid calls; live judgment evaluation uses that same seam and the actual shared policy.
     """
-    from source_context import allowed
     import delivery_effects
-    entries = [e for e in entries if (not delivery_effects.source_for_event(e.get('event') or {})
-                or allowed(delivery_effects.source_for_event(e.get('event') or {})))]
+    import ledger_io
+
     min_n = _int_env("SOTTO_DIGEST_MIN", 8) if min_n is None else min_n
     prefs = preferences.load_explicit()
-    # A muted person leaves the review BEFORE anything is built from it — not just the candidate
-    # list. The message context below is assembled per ENTRY, so filtering only candidates still
-    # sent a muted person's words to the review model (and into the delivered item's `messages`)
-    # whenever someone else in their group thread qualified. Per entry sender, once, here.
-    entries = [e for e in entries
-               if not preferences.proactively_muted(_s(e.get("sender")), e.get("event") or {}, prefs)]
+    history = entries if history is None else history
+    entries = [entry for entry in entries if _visible_entry(entry, prefs)]
     candidates = [e for e in entries if _s(e.get("verdict_class")) != "signal"
                   and e.get("verdict") != "drop"
                   and not relevance.is_automated_assistant(e.get("event") or {})]
@@ -291,27 +379,53 @@ def check(entries: list, min_n: int | None = None, *, track_review: bool = False
                      for e in candidates)
     if not actionable and sum(_counts_toward_threshold(e) for e in candidates) < min_n:
         return {"deliver": False}
-    # Keep every message as context: newest-per-person alone can hide an ask or its later answer.
-    by_sender: dict = {}
+    loops = {row['anchor_key']: row for row in ledger_io.load_entries() if row.get('anchor_key')}
+    bound, saved, thread_rows = _saved_task_context(candidates, history, prefs, loops)
+    pinned = {}
+    anchor_candidates = {}
+    for candidate in candidates:
+        binding = bound.get(id(candidate))
+        if binding:
+            key, original = binding
+            pinned.setdefault(key, set()).add(id(original))
+            anchor_candidates.setdefault(id(original), {})[candidate['event']['anchor_key']] = candidate
+    # Keep original source messages and later replies. A synthetic title never substitutes for
+    # the originating message, even when the task's display name and direct handle happen to match.
+    by_thread: dict = {}
     entries_by_key: dict[str, list[dict]] = {}
     for entry in entries:
-        entries_by_key.setdefault(_conversation_key(entry), []).append(entry)
+        if id(entry) not in saved:
+            entries_by_key.setdefault(_conversation_key(entry), []).append(entry)
     for entry in reversed(candidates):
-        key = _conversation_key(entry)
-        if key not in by_sender:
-            by_sender[key] = entry
-        elif _band(entry) < _band(by_sender[key]):
-            by_sender[key] = entry
+        binding = bound.get(id(entry))
+        if binding:
+            key, original = binding
+            entries_by_key[key] = list(thread_rows[key].values())
+            entry = original
+        elif id(entry) in saved:
+            continue
+        else:
+            key = _conversation_key(entry)
+        if key not in by_thread or _band(entry) < _band(by_thread[key]):
+            by_thread[key] = entry
     accepted = _accepted()
-    ranked_all = [pair for pair in sorted(by_sender.items(), key=lambda pair: _band(pair[1]))
-                  if _item_id(pair[0], entries_by_key[pair[0]]) not in accepted]
-    ranked = ranked_all[:REVIEW_CONVERSATION_CAP]
-    messages = {key: [_message(entry) for entry in entries_by_key[key]] for key, _ in ranked}
+    ranked = []
+    for key, entry in sorted(by_thread.items(), key=lambda pair: _band(pair[1])):
+        rows = entries_by_key[key]
+        bounded = _bounded_rows(rows, pinned.get(key))
+        # Older accepted native items keep their receipt identities. A newly bound saved task
+        # versions its exact bounded source read, including any protected original.
+        item_id = _item_id(key, bounded if key in pinned else rows)
+        if item_id not in accepted:
+            ranked.append((entry, item_id, bounded))
+            if len(ranked) > REVIEW_CONVERSATION_CAP:
+                break
+    reviewed = [rows for _, _, rows in ranked[:REVIEW_CONVERSATION_CAP]]
     conversations = [{"id": i, "sender": _item(entry)["sender"],
-                      "messages": sorted(messages[key], key=lambda m: delivery_effects.instant(m['ts']) or 0)[-REVIEW_MESSAGES_CAP:]}
-                     for i, (key, entry) in enumerate(ranked)]
+                      "messages": [_message(row, loops) for row in reviewed[i]]}
+                     for i, (entry, _, _) in enumerate(ranked[:REVIEW_CONVERSATION_CAP])]
     try:
-        judgments = review_conversations(conversations)
+        judgments = review_conversations(conversations) if conversations else []
         # Fail closed on missing/duplicate/invented IDs, not partial model output silently accepted.
         ids = [j.get("id") for j in judgments]
         if (any(type(i) is not int for i in ids) or sorted(ids) != list(range(len(conversations)))
@@ -319,35 +433,77 @@ def check(entries: list, min_n: int | None = None, *, track_review: bool = False
                        for j in judgments)):
             raise ValueError("incomplete digest relevance review")
         selected, reviewed_silent = [], []
+        unsupported = False
         for j in judgments:
-            if j["class"] == "ignore" or j.get("sender_role") == "assistant":
-                i = j["id"]
-                reviewed_silent.append(_item_id(ranked[i][0], entries_by_key[ranked[i][0]]))
-                continue
             i = j["id"]
-            entry = ranked[i][1]
+            entry, item_id, _ = ranked[i]
+            if j["class"] == "ignore" or j.get("sender_role") == "assistant":
+                reviewed_silent.append(item_id)
+                continue
+            messages = conversations[i]["messages"]
+            grounded = _grounded_excerpt(j, messages)
+            if grounded is None:
+                unsupported = True
+                continue
+            index, request_index, excerpt, status = grounded
+            evidence, request = reviewed[i][index], reviewed[i][request_index]
+            reference = delivery_effects.request_reference(request.get('event') or {})
+            anchors = anchor_candidates.get(id(request), {})
+            anchor = None
+            if reference and len(anchors) == 1:
+                # Do not let one obligation's deadline/version suppress a sibling from the same
+                # message, even if the sibling did not itself generate a queued nudge.
+                ref_key = (reference['source'], reference['id'])
+                if sum(ref_key in delivery_effects.request_references(row)
+                       and row.get('status', 'open') in ledger_io.ACTIVE for row in loops.values()) == 1:
+                    anchor = next(iter(anchors.values()))
+            if messages[request_index].get('request_closed'):
+                if any(not m['is_from_me'] and not m.get('request_closed') and m['text'].strip()
+                       and not relevance.is_automated_assistant(row.get('event') or {})
+                       for m, row in zip(messages, reviewed[i], strict=True)):
+                    unsupported = True
+                else:
+                    reviewed_silent.append(item_id)
+                continue
             item = _item(entry)
-            item.update(relevance=j["class"], why=j["why"], messages=conversations[i]["messages"])
-            for field in ("deadline", "priority_id", "priority_revision"):
-                if j.get(field) is not None:
-                    item[field] = j[field]
-            item["item_id"] = _item_id(ranked[i][0], entries_by_key[ranked[i][0]])
+            item.update(relevance=j["class"], excerpt=excerpt, status=status, messages=messages,
+                        display_sender="You" if messages[index]["is_from_me"] else _item(evidence)["sender"],
+                        item_id=item_id)
+            if status == 'waiting' and not _is_group(request.get('event') or {}):
+                sender = _s(request.get('sender')).strip()
+                if _sender_known(sender) and sender.casefold() != 'unknown':
+                    item['request_sender'] = ' '.join(sender.split())
             band = ({"urgent": 0, "actionable": 1, "scheduling_ask": 1}.get(j["class"],
                     2 + int(_band(entry) == 2)))
-            selected.append((band, relevance.tie_break_key(j), i, item))
+            selected.append((band, relevance.tie_break_key(j), i, item, evidence, request, reference, anchor))
         selected.sort(key=lambda row: (row[0], row[1], row[2]))
         chosen = selected[:ITEM_CAP]
-        items = [item for _, _, _, item in chosen]
+        items = [row[3] for row in chosen]
         if not items:
-            result = ({'deliver': False} if len(ranked_all) <= REVIEW_CONVERSATION_CAP
+            if unsupported:
+                raise ValueError("unsupported digest excerpt")
+            result = ({'deliver': False} if len(ranked) <= REVIEW_CONVERSATION_CAP
                       else {'deliver': False, '_review_incomplete': True})
             if track_review:
                 result['_reviewed_silent'] = reviewed_silent
             return result
         eligibility, deadlines = [], []
-        for _, _, i, item in chosen:
-            descriptor = delivery_effects.for_bundle({'events': [ranked[i][1]]})
+        for _, _, _, item, evidence, request, reference, anchor in chosen:
+            if anchor:
+                saved_descriptor = delivery_effects.for_bundle({'events': [anchor]})
+                for effect in saved_descriptor['effects']:
+                    effect.pop('event', None)  # the exact source row below owns the reply route
+                eligibility.extend(saved_descriptor['effects'])
+                if saved_descriptor['valid_until'] is not None:
+                    deadlines.append(saved_descriptor['valid_until'])
+            descriptor = delivery_effects.for_bundle({'events': [evidence]})
             for effect in descriptor['effects']:
+                if reference:
+                    effect['request_reference'] = reference
+                    effect['notification_sender'] = notification_sender({
+                        'event': request.get('event') or {}, 'person': _item(request)['sender']})
+                if item['status'] == 'waiting':
+                    effect['superseded_by_inbound'] = True
                 # Replies already considered by this review are context. Only a newer observed
                 # reply supersedes the held digest; otherwise a partial reply blocks it forever.
                 effect['observed_until'] = max((m['ts'] for m in item['messages']),
@@ -357,7 +513,7 @@ def check(entries: list, min_n: int | None = None, *, track_review: bool = False
                 deadlines.append(descriptor['valid_until'])
         result = {'deliver': True, 'items': items, 'item_ids': [i['item_id'] for i in items],
                   'effects': eligibility, 'valid_until': min(deadlines) if deadlines else None}
-        if len(ranked_all) > REVIEW_CONVERSATION_CAP:
+        if unsupported or len(ranked) > REVIEW_CONVERSATION_CAP:
             # queue.jsonl plus the accepted-item IDs are the durable replay cursor. Do not offer
             # a time stamp while any conversation, especially an unjudged busy row, sits beyond
             # the bounded review slice; the next check must see those remaining identities.
@@ -377,9 +533,13 @@ def check(entries: list, min_n: int | None = None, *, track_review: bool = False
 
 def run_check(now: datetime) -> dict:
     """A failed review preserves coverage; a delivered review closes it only on acceptance."""
-    entries = [e for e in entries_since(read_stamp())
-               if (_parse_iso(e.get('ts')) or now) <= now]
-    result = check(entries, track_review=True)
+    stamp = read_stamp()
+    history = [entry for entry in entries_since(None)
+               if (_available_at(entry) or now) <= now
+               and (source_observed_time(entry.get('event') or {}) or now) <= now]
+    entries = [entry for entry in history if stamp is None or (
+        (available := _available_at(entry)) is not None and available > stamp)]
+    result = check(entries, track_review=True, history=history)
     if result.get('retryable') or result.get('budget_exhausted') or result.get('admission_busy'):
         return result
     reviewed_silent = result.pop('_reviewed_silent', [])

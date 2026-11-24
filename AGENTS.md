@@ -72,6 +72,9 @@ is an incomplete change.
   `sotto-agent/` in the source checkout, or the repository root in the generated standalone tree
   (source checkout: `ship.sh` uses `.venv` too). This is the shared backend/release
   gate used by local shipping and CI: Ruff, pipeline/receiver/adapter/proxy tests and available account tests, skill
-  validation, shell parsing and available publication guards. It must pass before a merge touching
-  distributable files. Bridge/macOS verification remains a separate platform step. Run publication
+  validation, shell parsing and available publication guards. Its Python lane and Node lane run side by
+  side, and each shards its main test suite by file across processes (`SHARDS` in `verify.py`); a
+  failure stops its own lane while the others finish, and each failed command's whole output is printed. It must pass before a merge touching
+  distributable files. It also runs the local reader, speech and browser-harness contracts and, on
+  Linux with cargo, the Bridge core suite where the tree carries it; macOS Bridge verification remains a separate platform step. Run publication
   guard suites serially with source edits paused: their synthetic planted files exercise the guard.

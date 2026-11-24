@@ -59,7 +59,10 @@ def policy() -> str:
 def judgment_prompt(context: str, *, batch: bool = False) -> str:
     shape = ('{"judgments":[{"id":0,"class":"urgent|actionable|scheduling_ask|ambient|ignore",'
              '"sender_role":"person|assistant|unknown",'
-             '"why":"<what changes for the user, grounded in evidence>",'
+             '"why":"<private judgment reason>",'
+             '"message_index":0,"excerpt":"<verbatim contiguous span from that message>",'
+             '"status":"<waiting; omit unless an outgoing message shows a specific request or offer pending reply>",'
+             '"request_index":0,'
              '"deadline":"<evidenced ISO-8601 timestamp; omit field when absent>",'
              '"priority_id":"<matching explicit priority id; omit when absent>",'
              '"priority_revision":"<supplied priority revision; omit when absent>"}]}') if batch else (
@@ -75,7 +78,17 @@ def judgment_prompt(context: str, *, batch: bool = False) -> str:
         priority_context = ("\nExplicit current priorities (tie-break context only; never urgency, "
                             "relevance, or permission):\n" + json.dumps(priority_state) + "\n")
     task = ("Judge each conversation once using ALL its messages, including later user replies. "
-            "Return exactly one judgment for each input id; do not invent or omit ids.\n") if batch else (
+            "Return exactly one judgment for each input id. For every non-ignore judgment, select a "
+            "zero-based message index within that conversation and one exact contiguous excerpt from "
+            "its text that conveys the specific relevant ask, action or development, including its "
+            "subject and time when applicable. The selected source message is shown to the user. "
+            "Do not paraphrase, join excerpts, or mix conversations. Use status waiting only when "
+            "the latest message is a concrete owner reply or offer still awaiting a response. "
+            "For waiting, provide request_index for the exact earlier incoming ask it answers; "
+            "otherwise omit request_index. A message with request_closed true has no open saved "
+            "obligation. Do not select it as an ask or waiting reference. Consider other messages "
+            "in that conversation on their own merits. If the evidence does not support a useful "
+            "excerpt, classify as ignore.\n") if batch else (
             "Classify ONE inbound event in its supplied context.\n")
     return ("You are the relevance layer of a personal chief-of-staff.\n" + policy() + render_feedback()
             + "\n\nCurrent local time: " + _now_local(configured_tz()).isoformat() + "\n"

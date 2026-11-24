@@ -78,9 +78,8 @@ def test_skill_closed_args_focus_span_and_source_refusal(context, rec, monkeypat
 @pytest.mark.parametrize('calendar_id', [None, 'primary'])
 def test_exact_occurrence_is_bound_to_owner_request_and_existing_queue(context, rec, monkeypatch, calendar_id):
     call = setup(context, rec, monkeypatch)
-    # Exercise the real fixed-profile gate: the generic receiver fixture has no
-    # selected profile, which previously concealed a valid request being refused
-    # between receiver admission and the durable queue.
+    # Use the occurrence’s clock and the actual fixed-profile admission gate.
+    monkeypatch.setattr(time, 'time', WHEN.timestamp)
     import importlib.util
     here = Path(__file__).resolve().parent
     pack = here.parents[1] / 'sotto-chief-of-staff'
@@ -768,7 +767,7 @@ def test_a_remark_about_finished_prep_is_not_a_focus_request(text):
     assert not tool.is_owner_meeting_prep_request(text, 'focus')
 
 
-@pytest.mark.parametrize('text', ['prep me for my 3pm', 'prep for Dana', 'Prep Spencer Kim', 'prep for the call Dana was asking about'])
+@pytest.mark.parametrize('text', ['prep me for my 3pm', 'prep for Dana', 'Prep Rowan Pike', 'prep for the call Dana was asking about'])
 def test_focus_requests_that_mention_a_past_event_still_admit(text):
     assert tool.is_owner_meeting_prep_request(text, 'focus')
 

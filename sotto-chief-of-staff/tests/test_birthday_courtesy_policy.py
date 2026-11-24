@@ -15,7 +15,7 @@ from ledger_provenance import source_loop_sources
 from render_local import _format_birthdays
 
 NOW = datetime(2026, 10, 10, 12, tzinfo=timezone.utc)
-PHONE = '+14155551234'
+PHONE = '+14155550107'
 
 
 @pytest.fixture
@@ -51,6 +51,13 @@ def query(permitted=('contacts', 'imessage')):
     import os
     return loops_query.query_permitted_rows(os.environ['SOTTO_DATA'], list(permitted), now=NOW,
                                             include_request_context=True)
+
+
+def test_legacy_single_birthday_ref_expires_from_the_birthday():
+    row = {'resolution_mode': 'birthday_greeting', 'source': 'contacts', 'created_at': '2026-10-16',
+           'source_refs': {'source': 'contacts', 'source_id': 'person:birthday:2026-10-04'}}
+    assert ledger_io.is_optional_birthday_courtesy(row)
+    assert ledger_io.birthday_greeting_retired(row, '2026-11-16')
 
 
 def test_ordinary_birthdays_visible_without_automatic_debt(context):
@@ -286,7 +293,7 @@ def test_brief_and_pulse_share_one_birthday_visibility_rule(context):
     important(context, vip=True)
     root, local, cid = context
     greeting = capture(local)['active'][0]
-    cr._persist({'status': 'open', 'action_type': 'follow_up', 'contact_identifier': '+14155550999',
+    cr._persist({'status': 'open', 'action_type': 'follow_up', 'contact_identifier': '+14155550105',
                  'contact_name': 'Legacy Friend', 'channel': 'imessage', 'source': 'imessage',
                  'source_message_id': 'm-legacy', 'source_thread_id': 't-legacy',
                  'anchor_key': 'imessage:legacy', 'created_at': '2026-10-06 10:00:00',

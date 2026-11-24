@@ -108,7 +108,7 @@ async function runThreePersonClosure(message:string,asksRemaining:boolean,incomp
     const unrelated=current.find(row=>row.anchor_key==='resolve-many-4')!;
     const unrelatedBytes=unrelatedLedgerBytes(folder);
     if(legacyDates){assert.equal(unrelated.deadline,null);assert.equal(unrelated.overdue,false);assert.equal(unrelated.chase_pending,null);assert.equal(unrelated.last_chased_at,null);assert.equal(unrelated.chase_after,null);assert.equal(unrelated.handoff_asked_at,null);}
-    const names=['Tina','shimolee','Hari'];
+    const names=['Wren','ines','Theo'];
     const items=names.map(name=>{
       const matches=current.filter(row=>row.name.toLowerCase().split(' ')[0]===name.toLowerCase());
       assert.equal(matches.length,1,JSON.stringify(current.map(row=>row.name)));const row=matches[0]!;
@@ -142,7 +142,7 @@ async function runThreePersonClosure(message:string,asksRemaining:boolean,incomp
       await coordinator.recover();
       assert.equal(applies,1,'receipt recovery must not reapply the aggregate');
       assert.equal(calls,beforeRecovery,'receipt recovery must not start a model turn');
-      assert.ok(sent.some(text=>text.includes('Tina: Marked done')));
+      assert.ok(sent.some(text=>text.includes('Wren: Marked done')));
       assert.equal(journal.db.prepare("SELECT status FROM actions WHERE kind='owner_loop_tool'").get()!.status,'succeeded');
       return;
     }
@@ -151,21 +151,21 @@ async function runThreePersonClosure(message:string,asksRemaining:boolean,incomp
     const after=await client.readLoops('a'.repeat(64));
     if(incomplete==='rejected'){
       assert.deepEqual(after.you_owe.map(row=>row.anchor_key),prior.you_owe.filter(row=>['resolve-many-1','resolve-many-4'].includes(row.anchor_key)).map(row=>row.anchor_key));
-      assert.match(sent[0]!,/Tina: I couldn’t tell which one you meant/);
-      assert.match(sent[0]!,/shimolee: Marked done/);assert.match(sent[0]!,/Hari: Marked done/);
+      assert.match(sent[0]!,/Wren: I couldn’t tell which one you meant/);
+      assert.match(sent[0]!,/ines: Marked done/);assert.match(sent[0]!,/Theo: Marked done/);
       assert.equal(journal.db.prepare("SELECT status FROM actions WHERE kind='owner_loop_tool'").get()!.status,'succeeded');
     }else {
       assert.equal(after.you_owe.length+after.waiting_on_them.length,1);
       assert.equal([...after.you_owe,...after.waiting_on_them][0]!.name,'Other Person');
       assert.deepEqual([...after.you_owe,...after.waiting_on_them][0],unrelated,'unrelated task and raw-row proofs stay unchanged across apply/readback');
       assert.equal(unrelatedLedgerBytes(folder),unrelatedBytes);
-      assert.match(sent[0]!,/Tina: Marked done/);
+      assert.match(sent[0]!,/Wren: Marked done/);
       if(incomplete){
-        if(incomplete==='unknown')assert.match(sent[0]!,/shimolee: I couldn’t confirm whether this was marked done/);
-        else assert.match(sent[0]!,/shimolee: This one changed since I checked/);
-        assert.match(sent[0]!,/Hari: I haven’t changed this one/);
-        assert.doesNotMatch(sent[0]!,/shimolee: Marked done|Hari: Marked done/);
-      }else {assert.match(sent[0]!,/shimolee: Marked done/);assert.match(sent[0]!,/Hari: Marked done/);}
+        if(incomplete==='unknown')assert.match(sent[0]!,/ines: I couldn’t confirm whether this was marked done/);
+        else assert.match(sent[0]!,/ines: This one changed since I checked/);
+        assert.match(sent[0]!,/Theo: I haven’t changed this one/);
+        assert.doesNotMatch(sent[0]!,/ines: Marked done|Theo: Marked done/);
+      }else {assert.match(sent[0]!,/ines: Marked done/);assert.match(sent[0]!,/Theo: Marked done/);}
       if(asksRemaining)assert.match(sent[0]!,/Still open:\n• Other Person: /);
       else assert.doesNotMatch(sent[0]!,/Still open:|currently available list|Other Person/);
       assert.doesNotMatch(sent[0]!,/Model closure claim/);
@@ -199,19 +199,19 @@ async function runThreePersonClosure(message:string,asksRemaining:boolean,incomp
 }
 
 test('one explicit three-person closure uses one admitted action and three exact per-item receipts',
-  () => runThreePersonClosure('Tina shimolee Hari loops are closed. What else is open?',true));
+  () => runThreePersonClosure('Wren ines Theo loops are closed. What else is open?',true));
 test('a simple multi-loop completion acknowledges only those items after readback',
-  () => runThreePersonClosure('Tina shimolee Hari loops are closed.',false));
+  () => runThreePersonClosure('Wren ines Theo loops are closed.',false));
 test('lost aggregate receipt remains held and recovers without another mutation or model turn',
-  () => runThreePersonClosure('Tina shimolee Hari loops are closed.',false,'lost'));
+  () => runThreePersonClosure('Wren ines Theo loops are closed.',false,'lost'));
 test('partial multi-loop receipt keeps honest reply without completion tapback or recovery reapply',
-  () => runThreePersonClosure('Tina shimolee Hari loops are closed.',false,'unknown'));
+  () => runThreePersonClosure('Wren ines Theo loops are closed.',false,'unknown'));
 test('one unavailable selection does not block clear peers or falsely receive a completion tapback',
-  () => runThreePersonClosure('Tina shimolee Hari loops are closed.',false,'rejected'));
+  () => runThreePersonClosure('Wren ines Theo loops are closed.',false,'rejected'));
 test('definite partial multi-loop refusal gets no completion tapback while later safe chat does',
-  () => runThreePersonClosure('Tina shimolee Hari loops are closed.',false,'refused'));
+  () => runThreePersonClosure('Wren ines Theo loops are closed.',false,'refused'));
 test('real Python legacy dates do not block named-person aggregate preflight or post-write readback',
-  () => runThreePersonClosure('Tina shimolee Hari loops are closed. What else is open?',true,false,true));
+  () => runThreePersonClosure('Wren ines Theo loops are closed. What else is open?',true,false,true));
 
 async function runOwnerTaskSelection(message:string,multiple:boolean,repair:'first-only'|'missing'|'repeat'|'terminal'|'parallel'='first-only',legacyDates=false,noRemainingOwnerTasks=false) {
   const folder=mkdtempSync(join(tmpdir(),'sotto-owner-selection-connected-'));
@@ -461,15 +461,15 @@ test(`queried tasks close from possessive owner wording with current row proofs:
    const body=JSON.parse(String(init?.body??'{}'));if(body.operation==='apply')writes++;
    const response=await fetch(input,init);
    if(variant==='ambiguous'&&body.operation==='loops_query'){
-    const payload=await response.json();const row=payload.you_owe.find((r:{name:string})=>r.name==='Tina Jiang');
-    payload.you_owe.push({...row,name:'Tina Smith',anchor_key:'other-tina'});payload.counts.you_owe++;
+    const payload=await response.json();const row=payload.you_owe.find((r:{name:string})=>r.name==='Wren Halvorsen');
+    payload.you_owe.push({...row,name:'Wren Smith',anchor_key:'other-wren'});payload.counts.you_owe++;
     return new Response(JSON.stringify(payload),{status:response.status});
    }
    return response;
   }});
   const prior=await client.readLoops('a'.repeat(64));
-  assert.match(prior.you_owe.find(row=>row.name==='Tina Jiang')!.ask!,/check-in/);
-  const phrases=[variant==='wrong-description'?'Tina’s school application':'Tina’s offer check-in',variant==='bare-name'?'Shimolee':variant==='empty-description'?'Shimolee’s tasks':'Shimolee’s family photo plans'];
+  assert.match(prior.you_owe.find(row=>row.name==='Wren Halvorsen')!.ask!,/check-in/);
+  const phrases=[variant==='wrong-description'?'Wren’s school application':'Wren’s offer check-in',variant==='bare-name'?'Ines':variant==='empty-description'?'Ines’s tasks':'Ines’s family photo plans'];
   const items=phrases.map((name,index)=>{const row=prior.you_owe.find(row=>variant==='wrong-anchor'&&index===1?row.anchor_key==='resolve-many-extra':row.anchor_key===`resolve-many-${index+1}`)!;
    return {name,correction:name,anchor_key:row.anchor_key,loop_version:row.loop_version!,loop_identity:row.loop_identity!};});
   let calls=0;
@@ -477,7 +477,7 @@ test(`queried tasks close from possessive owner wording with current row proofs:
    chatTools:()=>createOwnerTaskTools({client,journal:()=>journal,sourceAuthority:authority}),
    model:new MockLanguageModelV4({doGenerate:async()=>{
     const step=calls++;
-    return {content:step===1?[{type:'tool-call',toolCallId:'close-pair',toolName:'owner_task_resolve_many',input:JSON.stringify({selection_mode:'named_people',items})}]:[{type:'text',text:step===0?'Tina: offer check-in. Shimolee: family photo plans.':'Closure result.'}],
+    return {content:step===1?[{type:'tool-call',toolCallId:'close-pair',toolName:'owner_task_resolve_many',input:JSON.stringify({selection_mode:'named_people',items})}]:[{type:'text',text:step===0?'Wren: offer check-in. Ines: family photo plans.':'Closure result.'}],
      finishReason:{unified:step===1?'tool-calls':'stop',raw:'STOP'},usage,warnings:[]};
    }})});
   const sent:string[]=[];
@@ -486,7 +486,7 @@ test(`queried tasks close from possessive owner wording with current row proofs:
    postPrepared:async request=>{sent.push(request.text);return {acceptance:'accepted',messageId:`accepted-${sent.length}`};}});
   const inbound=(eventId:string,text:string)=>({channel:'photon' as const,accountId:'account',senderId:receiver!.identity.owner_id,isDirect:true,eventId,text});
   const context={threadId:receiver.identity.route_id,destination:'photon',lineKey:'line'};
-  await coordinator.receive(inbound('query','What is open with Tina and Shimolee?'),context);
+  await coordinator.receive(inbound('query','What is open with Wren and Ines?'),context);
   const close=inbound('close',phrases.join(' and ')+' are both done. Close those two.');
   await coordinator.receive(close,context);
   const after=await client.readLoops('a'.repeat(64));
@@ -495,7 +495,7 @@ test(`queried tasks close from possessive owner wording with current row proofs:
    assert.ok(after.you_owe.every(row=>!items.some(item=>item.anchor_key===row.anchor_key)));
    assert.equal(calls,2,'query plus mutation step only; no discarded completion');
    if(variant!=='valid')assert.match(after.you_owe.find(row=>row.anchor_key==='resolve-many-extra')!.what,/catering/);
-   assert.match(sent.at(-1)!,/Tina’s offer check-in: Marked done/);assert.match(sent.at(-1)!,/Shimolee’s family photo plans: Marked done/);
+   assert.match(sent.at(-1)!,/Wren’s offer check-in: Marked done/);assert.match(sent.at(-1)!,/Ines’s family photo plans: Marked done/);
    await coordinator.receive(close,context);await coordinator.recover();assert.equal(writes,1);
   }else{
    assert.equal(writes,1);

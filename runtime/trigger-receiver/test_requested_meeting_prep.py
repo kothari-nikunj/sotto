@@ -2,11 +2,34 @@
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import requested_meeting_prep as runner
 
 PACK = Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff'
+
+
+@pytest.mark.parametrize('accepted_offer', [False, True], ids=['named-request', 'accepted-offer'])
+def test_focused_composer_in_fresh_process(tmp_path, monkeypatch, accepted_offer):
+    start = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    event = {'id': 'launch', 'summary': 'Launch planning', 'start': start,
+             'attendees': [{'email': 'dana@outside.example', 'displayName': 'Dana Example'}]}
+    inputs = {'focus': 'Dana Example', 'google': {'userEmail': 'owner@fund.example', 'events': [event]}}
+    if accepted_offer:
+        inputs['exact_meeting'] = {'event_id': 'launch', 'start': start}
+    point = 'Discuss the amended launch plan with Dana.'
+    model_result = tmp_path / 'model.json'
+    model_result.write_text(json.dumps({'prep_markdown': point, 'meetings': [
+        {'event_id': 'launch', 'start': start, 'talking_points': [point]}]}))
+    monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
+    monkeypatch.setenv('SOTTO_LLM_STUB', str(model_result))
+    monkeypatch.delenv('PYTHONPATH', raising=False)
+    result = subprocess.run([sys.executable, str(PACK / 'meeting-prep/scripts/compose_meeting_prep.py')],
+                            input=json.dumps(inputs), text=True, capture_output=True, cwd=tmp_path, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['prep_markdown'] == point
 
 
 @pytest.mark.parametrize("name_evidence", ["calendar", "contacts", "research", "gmail"])

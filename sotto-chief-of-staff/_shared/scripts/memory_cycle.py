@@ -31,7 +31,6 @@ PAGES_PER_RUN = 3
 SOURCE_RETRY_SECONDS = 3600
 UNCHANGED_EXTRACTION_ATTEMPTS = 2
 UNCHANGED_PROTOCOL_ATTEMPTS = 2
-UNCHANGED_DREAMER_ATTEMPTS = 2
 PROTOCOL_RECHECK_SECONDS = 24 * 3600
 SOURCES = ('imessage', 'whatsapp', 'gmail')
 CONTENT_BLOCK_REASONS = frozenset({'PROHIBITED_CONTENT', 'SAFETY', 'BLOCKLIST'})
@@ -387,65 +386,37 @@ def _run(now, fetch, learn, curate, path):
                 window.update(retry_after=epoch + SOURCE_RETRY_SECONDS, **diagnostic)
                 results.append({'source': source, 'status': 'failed', **diagnostic})
             jsonstore.write_atomic(path, state, indent=2)
-        # dreamer selects at most DREAM_PEOPLE changed records and returns without a model call
-        # when nothing remains, so each invocation advances one bounded unfinished batch.
-        try:
-            prepared = (dreamer.prepare(legacy_failure=state["dreamer_failure"])
-                        if curate is dreamer.run and state.get("dreamer_failure") else dreamer.prepare())
-            if curate is dreamer.run:
-                # Dreamer has durably imported or held the old unidentified batch.
-                state.pop("dreamer_failure", None)
-            dreamer_key = {'request': prepared['request_revision'],
-                           'candidates': prepared['candidate_revision']}
-        except Exception as error:
-            prepared, dreamer_key = None, None
-            preparation_error = error
-        dreamer_failure = state.get('dreamer_failure') or {}
-        dreamer_blocked = bool(dreamer_key) and (
-            all(dreamer_failure.get(key) == value for key, value in dreamer_key.items())
-            and int(dreamer_failure.get('attempts', 0)) >= UNCHANGED_DREAMER_ATTEMPTS)
-        if dreamer_failure and dreamer_key and not all(
-                dreamer_failure.get(key) == value for key, value in dreamer_key.items()):
-            state.pop('dreamer_failure', None)
+        # Dreamer owns selection and paid attempts. Keep importing old scheduler latches
+        # before retiring them from this checkpoint.
+        preparation_error = None
+        prepared = None
+        if curate is dreamer.run:
+            try:
+                legacy = state.get('dreamer_failure')
+                prepared = dreamer.prepare(legacy_failure=legacy) if legacy else dreamer.prepare()
+                state.pop('dreamer_failure', None)
+            except Exception as error:
+                preparation_error = error
         if background_hold:
-            # The hold stopped the cycle; report it even when preparation also failed, because
-            # the hold is the reason nothing ran and the one the receipt promises to retain.
             curation = {'status': 'held', 'reason': background_hold}
-        elif prepared is None:
+        elif preparation_error is not None:
             curation = {'status': 'failed', 'error': type(preparation_error).__name__}
-        elif dreamer_blocked:
-            curation = {'status': 'blocked', 'error_code': 'unchanged_dreamer_response'}
         else:
             try:
                 curation = (curate(now=now, prepared=prepared)
-                            if curate is dreamer.run else curate(now=now))
-                state.pop('dreamer_failure', None)
+                            if prepared is not None else curate(now=now))
             except gemini_transport.BackgroundModelHeldError as error:
                 curation = {'status': 'held', 'reason': error.reason}
             except HTTPError as error:
                 if gemini_transport.proxy_admission_busy(error):
                     curation = {'status': 'held', 'reason': 'model_admission_busy'}
-                    # A proxy refusal made no model call and cannot park this unchanged batch.
                 else:
-                    if error.code in (400, 413, 422) and curate is not dreamer.run:
-                        previous = state.get('dreamer_failure') or {}
-                        attempts = (int(previous.get('attempts', 0)) + 1
-                                    if all(previous.get(key) == value for key, value in dreamer_key.items()) else 1)
-                        state['dreamer_failure'] = {**dreamer_key, 'attempts': attempts,
-                                                    'code': 'provider_request_rejected'}
                     curation = ({'status': 'held', 'reason': 'background_budget_exhausted'} if error.code == 402
                                 else {'status': 'failed', 'error': type(error).__name__})
             except (dreamer.DreamerResponseError, context_learning.gemini.ModelResponseError) as error:
                 code = error.code if isinstance(error, context_learning.gemini.ModelResponseError) else str(error)
-                if curate is not dreamer.run:
-                    previous = state.get('dreamer_failure') or {}
-                    attempts = (int(previous.get('attempts', 0)) + 1
-                                if all(previous.get(key) == value for key, value in dreamer_key.items()) else 1)
-                    state['dreamer_failure'] = {**dreamer_key, 'attempts': attempts, 'code': code}
                 curation = {'status': 'failed', 'error': type(error).__name__, 'error_code': code}
                 if isinstance(error, context_learning.gemini.ModelResponseError):
-                    if curate is not dreamer.run:
-                        state['dreamer_failure']['provider_reason'] = error.provider_reason
                     curation['provider_reason'] = error.provider_reason
             except Exception as error:
                 curation = {'status': 'failed', 'error': type(error).__name__}

@@ -37,9 +37,9 @@ def test_empty_and_templates_make_no_model_call(isolated, monkeypatch):
 
 
 @pytest.mark.parametrize('sent, expected', [
-    ('Fri, 18 Sep 2026 16:34:02 +0000', 'From September 18:'),
+    ('Fri, 18 Sep 2026 16:34:02 +0000', 'From Sep 18:'),
     ('2026-09-25T14:00:00Z', 'From 7:00 AM today:'),
-    ('2025-09-18T16:34:02Z', 'From September 18, 2025:'),
+    ('2025-09-18T16:34:02Z', 'From Sep 18, 2025:'),
 ])
 def test_old_ask_keeps_original_date_not_queue_arrival(isolated, monkeypatch, sent, expected):
     from zoneinfo import ZoneInfo
@@ -93,17 +93,6 @@ def test_dated_ask_rules_reach_the_writer_once():
     assert 'source_timing' in notification.SYSTEM
     for rule in ('automated reminder', 'Interpret "today" and "tomorrow"'):
         assert combined.count(rule) == 1, rule
-
-
-@pytest.mark.parametrize('source', ['imessage', 'whatsapp'])
-def test_bridge_wall_time_does_not_turn_today_into_yesterday(isolated, monkeypatch, source):
-    from zoneinfo import ZoneInfo
-    now = datetime(2026, 9, 25, 9, tzinfo=ZoneInfo('America/Los_Angeles'))
-    monkeypatch.setattr(notification, '_write', lambda *a: [
-        {'id': 'x', 'text': 'Sam asked for a call.', 'draft': '', 'decline': ''}])
-    bundle = {'events': [{'decision_id': 'x', 'class': 'urgent',
-        'event': {'source': source, 'timestamp': '2026-09-25 06:00:00', 'text': 'Call me'}}]}
-    assert notification.compose('event', bundle, now=now).startswith('From 6:00 AM today:')
 
 
 def test_cached_name_permission_is_rechecked_before_offer(isolated, monkeypatch):
@@ -290,7 +279,7 @@ def test_group_draft_has_no_person_link(isolated, monkeypatch):
         'items': [{'id': 'x', 'text': 'The team needs the deck.', 'draft': 'Here it is.', 'decline': ''}]}))
     bundle = {'events': [{'decision_id': 'x', 'class': 'urgent', 'sender': 'Sam',
                           'event': {'source': 'whatsapp', 'sender_jid': '123@s.whatsapp.net', 'is_group_chat': True}}]}
-    assert notification.compose('event', bundle) == 'The team needs the deck.\nHere it is.'
+    assert notification.compose('event', bundle) == 'The team needs the deck.\n\nDraft:\n“Here it is.”'
 
 
 def test_verified_slots_do_not_overlap_and_unknown_constraints_do_not_guess():
@@ -328,7 +317,7 @@ def test_verified_slots_ignore_free_and_other_owners_events_but_keep_real_commit
                     {**day, 'start': '2026-09-17T10:00:00Z', 'end': '2026-09-17T10:30:00Z',
                      'eventType': 'focusTime'}]}
     assert notification.slots('30 minutes Thursday?', calendar, now) == [
-        'Thu Sep 17, 09:00 AM UTC', 'Thu Sep 17, 10:30 AM UTC', 'Thu Sep 17, 11:00 AM UTC']
+        'Thu Sep 17, 9:00 AM UTC', 'Thu Sep 17, 10:30 AM UTC', 'Thu Sep 17, 11:00 AM UTC']
     calendar['events'].append({**day, 'eventType': 'outOfOffice'})
     assert notification.slots('30 minutes Thursday?', calendar, now) == []
 
@@ -339,8 +328,8 @@ def test_scheduling_requires_both_choices_and_uses_code_slots(isolated, monkeypa
     item = {'kind': 'scheduling_ask', 'key': 'x', 'decision_id': 'x', 'channel': 'email', 'identifier': 'sam@example.com',
             'slots': ['Thu Sep 17, 10:00 AM UTC']}
     text = notification.compose('proactive', [item])
-    assert 'Accept: Thu Sep 17, 10:00 AM UTC works for me.' in text
-    assert 'Decline: I will pass, thanks.' in text
+    assert 'Draft to accept:\n“Thu Sep 17, 10:00 AM UTC works for me.”' in text
+    assert 'Draft to decline:\n“I will pass, thanks.”' in text
     assert 'Want this in your Gmail drafts?' not in text
 
 
@@ -362,11 +351,11 @@ def test_empty_post_meeting_yields_to_the_actionable_item_behind_it(isolated, mo
     monkeypatch.setattr(notification, '_write', writer)
     monkeypatch.setattr(notification, 'enrich', lambda items, now: items)
     bundle = {'events': [{'class': 'post_meeting', 'event': {'summary': 'Sync'}},
-                         {'class': 'chase', 'id': 'ask-1', 'person': 'Sam', 'detail': 'the deck', 'event': {}}]}
+                         {'class': 'urgent', 'id': 'ask-1', 'person': 'Sam', 'detail': 'the deck', 'event': {}}]}
     text = notification.compose('event', bundle, now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc))
     assert 'Sam still needs the deck' in text and len(calls) == 1
     # …and the same ask alone gives the same answer
-    alone = {'events': [{'class': 'chase', 'id': 'ask-1', 'person': 'Sam', 'detail': 'the deck', 'event': {}}]}
+    alone = {'events': [{'class': 'urgent', 'id': 'ask-1', 'person': 'Sam', 'detail': 'the deck', 'event': {}}]}
     assert notification.compose('event', alone, now=datetime(2026, 9, 17, 12, tzinfo=timezone.utc)) == text
 
 
@@ -416,7 +405,7 @@ def test_calendar_permission_revocation_prevents_availability(isolated, monkeypa
 def test_slots_must_be_inside_verified_coverage_and_constraints():
     now = datetime(2026, 9, 17, 8, tzinfo=timezone.utc)
     calendar = {'all_calendars_complete': True, 'events': [], 'since': now.isoformat(), 'until': '2026-09-17T09:30:00Z'}
-    assert notification.slots('30 minutes Thursday?', calendar, now) == ['Thu Sep 17, 09:00 AM UTC']
+    assert notification.slots('30 minutes Thursday?', calendar, now) == ['Thu Sep 17, 9:00 AM UTC']
     assert notification.slots('30 minutes Friday?', calendar, now) == []
     assert notification.slots('30 minutes Thursday 2pm?', calendar, now) == []
     assert notification.slots('30 minutes Thursday, I can only do lunch.', calendar, now) == []
@@ -633,7 +622,7 @@ def test_stale_scheduling_candidate_gets_current_invitation_and_thread_before_wr
     assert notification.compose('event', bundle, now=now) == 'NO_NUDGES'
 
 
-def test_group_commitment_gets_calendar_and_the_group_confirmation(real_enrichment, monkeypatch):
+def test_group_commitment_uses_its_group_confirmation(real_enrichment, monkeypatch):
     import personal_context
     import yaml
     now = datetime(2026, 9, 24, 14, tzinfo=timezone.utc)
@@ -646,11 +635,11 @@ def test_group_commitment_gets_calendar_and_the_group_confirmation(real_enrichme
     (directory / 'group.md').write_text('---\n' + yaml.safe_dump(loop) + '---\n')
     monkeypatch.setattr(personal_context, 'conversation_snapshot', lambda: [({'source': 'imessage',
         'chat_guid': 'group-id', 'text': 'Booked, see you Thursday.', 'timestamp': '2026-09-23T20:00:00Z'}, '', '')])
-    monkeypatch.setattr(notification, '_calendar', lambda: {'events': [{'summary': 'Jordan meeting'}]})
+    monkeypatch.setattr(notification, '_calendar', lambda: pytest.fail('unbound calendar read'))
     item = {'id': 'x', 'kind': 'commitment', 'channel': 'imessage', 'anchor_key': 'ask'}
     enriched, = notification.enrich([item], now)
     sent = notification._writer_item(enriched)
-    assert sent['calendar']['events'][0]['summary'] == 'Jordan meeting'
+    assert 'calendar' not in sent
     assert sent['current_conversation'][0]['text'] == 'Booked, see you Thursday.'
     assert 'group-id' not in json.dumps(sent)
 

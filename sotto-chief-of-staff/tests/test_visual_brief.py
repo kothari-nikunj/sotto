@@ -64,7 +64,7 @@ def test_partitions_actions_and_rejects_more_than_four_readable_cards(tmp_path):
 def test_prep_sections_remain_extracts_not_new_research():
     source = 'Meeting with Alex\nYour thread\nMet on Friday.\nWhat Example builds\nSoftware for clinics.\nThe founder\nWas an engineer.\nTraction & signals\nThree pilots are signed.\nAngles\nAsk how pilots convert to paid contracts.'
     deck = v.build(_rich_prep_source(source), 'prep')
-    assert [c['title'] for c in deck['cards']] == ['Your relationship', 'The business', 'Signals & context', 'Questions to ask']
+    assert [c['title'] for c in deck['cards']] == ['Your relationship', 'Questions to ask', 'The business', 'Signals & context']
     assert 'Was an engineer' in str(deck['cards'])
 
 
@@ -551,4 +551,16 @@ def test_complete_short_prep_with_four_sections_stays_as_text():
               'Traction & signals\nThe vendor reports three pilot clinics.\n'
               'Angles\nAsk whether the thirty-seat limit changes the annual versus monthly decision.')
     assert len(source.split()) <= v.MAX_PREP_WORDS
+    assert v.build(source, 'prep') is None
+
+
+@pytest.mark.parametrize('insertion', [
+    'I only have the calendar invitation for the thread.\nYour thread',
+    'Your thread\n' + 'Review the two signed amendments with counsel. ' * 35,
+])
+def test_prep_falls_back_to_text_if_a_paragraph_would_disappear(insertion):
+    source = ('Mara Vale · Clinic review\nYour thread\nMara asked for the renewal figures.\n'
+              'What Example builds\nA handoff log.\nTraction & signals\nTwo pilots.\n'
+              'Angles\nWhich pilot could test the next release?')
+    source = _rich_prep_source(source).replace('Your thread', insertion, 1)
     assert v.build(source, 'prep') is None

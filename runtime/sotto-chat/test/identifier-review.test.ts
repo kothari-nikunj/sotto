@@ -63,7 +63,7 @@ test('historical legacy committed/contacting records recover across restart; abs
     assert.equal(reopened.getAction(binding.actionId)!.status,'pending');
     assert.equal(modelAttempts,1,'only the pending case reaches ordinary model handling');
     assert.equal(replies.length,1);
-    assert.match(replies[0]!,/model request failed or took too long/);
+    assert.match(replies[0]!,/couldn’t finish generating a reply/);
     assert.doesNotMatch(replies[0]!,/No model replay|Dana.New|Identifier added/);
     await recovery.recover();
     assert.equal(modelAttempts,1,'accepted fixed notice is not regenerated');

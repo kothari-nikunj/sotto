@@ -17,7 +17,7 @@ export function freezeCleanupRepairSelection(journal:OperationalJournal,action:R
   if(metadata.args?.operation==='propose_cleanup'&&metadata.cleanup_repair_event_id!==undefined&&metadata.repair_next_event_id===undefined){
     const repairReply=journal.getReplyForEvent(metadata.cleanup_repair_event_id);
     journal.db.prepare('UPDATE actions SET result_json=? WHERE id=?').run(JSON.stringify({...metadata,
-      repair_next_event_id:id,repair_next_accepted:repairReply?.dispatch_status==='accepted'}),action.id as string);
+      repair_next_event_id:id,repair_next_accepted:repairReply?.dispatch_status==='accepted'&&!journal.sentAfter(String(repairReply.dispatch_id))}),action.id as string);
   }
 }
 

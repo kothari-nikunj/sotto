@@ -76,13 +76,13 @@ def test_calendar_create_adds_the_organizer_to_the_guest_list(monkeypatch, capsy
     always lists the creator as a guest, so calendar-create appends the user's own address —
     otherwise the event renders '1 guest, 1 awaiting' with the organizer missing from the list."""
     cap = {}
-    monkeypatch.setenv("SOTTO_USER_EMAIL", "me@nk-example.com")
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "me@self.example")
     monkeypatch.setattr(ga, "_run", lambda args: cap.__setitem__("args", args) or {"status": "created"})
     monkeypatch.setattr("sys.argv", ["google_action.py", "calendar-create", "--summary", "Sync",
                                      "--start", "2026-06-27T14:00:00-07:00", "--end", "2026-06-27T14:30:00-07:00",
-                                     "--attendees", "ron@antimlabs.com"])
+                                     "--attendees", "ron@antimlabs.example"])
     ga.main()
-    assert cap["args"][cap["args"].index("--attendees") + 1] == "ron@antimlabs.com,me@nk-example.com"
+    assert cap["args"][cap["args"].index("--attendees") + 1] == "ron@antimlabs.example,me@self.example"
 
 
 def test_calendar_create_uses_the_derived_google_account_email(tmp_path, monkeypatch, capsys):
@@ -92,18 +92,18 @@ def test_calendar_create_uses_the_derived_google_account_email(tmp_path, monkeyp
     monkeypatch.delenv("SOTTO_USER_EMAIL", raising=False)
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "settings.json").write_text('{"google_account_email": "me@nk-example.com"}')
-    assert ga._settings_email() == "me@nk-example.com"
+    (tmp_path / "config" / "settings.json").write_text('{"google_account_email": "me@self.example"}')
+    assert ga._settings_email() == "me@self.example"
     monkeypatch.setattr(ga, "_run", lambda args: cap.__setitem__("args", args) or {"status": "created"})
     monkeypatch.setattr("sys.argv", ["google_action.py", "calendar-create", "--summary", "Sync",
                                      "--start", "2026-06-27T14:00:00-07:00", "--end", "2026-06-27T14:30:00-07:00",
-                                     "--attendees", "ron@antimlabs.com"])
+                                     "--attendees", "ron@antimlabs.example"])
     ga.main()
-    assert cap["args"][cap["args"].index("--attendees") + 1] == "ron@antimlabs.com,me@nk-example.com"
-    assert json.loads(capsys.readouterr().out)["organizer_email"] == "me@nk-example.com"
+    assert cap["args"][cap["args"].index("--attendees") + 1] == "ron@antimlabs.example,me@self.example"
+    assert json.loads(capsys.readouterr().out)["organizer_email"] == "me@self.example"
     # env still wins over the derived setting
-    monkeypatch.setenv("SOTTO_USER_EMAIL", "other@nk-example.com")
-    assert ga._settings_email() == "other@nk-example.com"
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "other@self.example")
+    assert ga._settings_email() == "other@self.example"
 
 
 def test_calendar_create_reports_a_missing_organizer_honestly(tmp_path, monkeypatch, capsys):
@@ -115,7 +115,7 @@ def test_calendar_create_reports_a_missing_organizer_honestly(tmp_path, monkeypa
     monkeypatch.setattr(ga, "_run", lambda args: {"status": "created"})
     monkeypatch.setattr("sys.argv", ["google_action.py", "calendar-create", "--summary", "Sync",
                                      "--start", "2026-06-27T14:00:00-07:00", "--end", "2026-06-27T14:30:00-07:00",
-                                     "--attendees", "ron@antimlabs.com"])
+                                     "--attendees", "ron@antimlabs.example"])
     ga.main()
     out = json.loads(capsys.readouterr().out)
     assert out["organizer_listed"] is False
@@ -123,25 +123,25 @@ def test_calendar_create_reports_a_missing_organizer_honestly(tmp_path, monkeypa
 
 
 def test_calendar_create_reports_the_appended_organizer(monkeypatch, capsys):
-    monkeypatch.setenv("SOTTO_USER_EMAIL", "me@nk-example.com")
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "me@self.example")
     monkeypatch.setattr(ga, "_run", lambda args: {"status": "created"})
     monkeypatch.setattr("sys.argv", ["google_action.py", "calendar-create", "--summary", "Sync",
                                      "--start", "2026-06-27T14:00:00-07:00", "--end", "2026-06-27T14:30:00-07:00",
-                                     "--attendees", "ron@antimlabs.com"])
+                                     "--attendees", "ron@antimlabs.example"])
     ga.main()
     out = json.loads(capsys.readouterr().out)
-    assert out["organizer_listed"] is True and out["organizer_email"] == "me@nk-example.com"
+    assert out["organizer_listed"] is True and out["organizer_email"] == "me@self.example"
 
 
 def test_calendar_create_never_duplicates_the_organizer(monkeypatch, capsys):
     cap = {}
-    monkeypatch.setenv("SOTTO_USER_EMAIL", "Me@NK-Example.com")   # case-insensitive match
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "Me@Self.Example")   # case-insensitive match
     monkeypatch.setattr(ga, "_run", lambda args: cap.__setitem__("args", args) or {"status": "created"})
     monkeypatch.setattr("sys.argv", ["google_action.py", "calendar-create", "--summary", "Sync",
                                      "--start", "2026-06-27T14:00:00-07:00", "--end", "2026-06-27T14:30:00-07:00",
-                                     "--attendees", "ron@antimlabs.com,me@nk-example.com"])
+                                     "--attendees", "ron@antimlabs.example,me@self.example"])
     ga.main()
-    assert cap["args"][cap["args"].index("--attendees") + 1] == "ron@antimlabs.com,me@nk-example.com"
+    assert cap["args"][cap["args"].index("--attendees") + 1] == "ron@antimlabs.example,me@self.example"
 
 
 # ── calendar-rsvp ────────────────────────────────────────────────────────────
@@ -409,15 +409,15 @@ def _raw(cap) -> str:
 def test_gmail_draft_is_a_draft_not_a_send(monkeypatch, capsys):
     cap = _fake_service(monkeypatch)
     monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-draft",
-                                     "--to", "pegah@example.com", "--subject", "Railway SAFE",
-                                     "--body", "Hey Pegah — free for 15 min today?"])
+                                     "--to", "odile@example.com", "--subject", "Railway SAFE",
+                                     "--body", "Hey Odile — free for 15 min today?"])
     ga.main()
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "drafted" and out["draft_id"] == "D1"
     assert out["threaded"] is False           # no thread id passed → a fresh email, said plainly
     assert "threadId" not in cap["draft"]["body"]["message"]
     body = _raw(cap)
-    assert "Hey Pegah" in body and "Subject: Railway SAFE" in body and "To: pegah@example.com" in body
+    assert "Hey Odile" in body and "Subject: Railway SAFE" in body and "To: odile@example.com" in body
 
 
 def test_gmail_draft_threads_when_a_thread_id_exists(monkeypatch, capsys):
@@ -427,8 +427,8 @@ def test_gmail_draft_threads_when_a_thread_id_exists(monkeypatch, capsys):
     cap = _fake_service(monkeypatch, thread_result={"messages": [
         {"payload": {"headers": [{"name": "Subject", "value": "Railway SAFE allocation"},
                                  {"name": "Message-ID", "value": "<abc@mail.example.com>"}]}}]})
-    monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-draft", "--to", "pegah@example.com",
-                                     "--body", "Hey Pegah — free for 15 min today?",
+    monkeypatch.setattr("sys.argv", ["google_action.py", "gmail-draft", "--to", "odile@example.com",
+                                     "--body", "Hey Odile — free for 15 min today?",
                                      "--subject", "ignored when a thread is known",
                                      "--thread-id", "T7"])
     ga.main()

@@ -1,8 +1,9 @@
 """Pure research/prep qualification and retained-result limits; no provider or source reads."""
-import re
 import json
+import re
+from urllib.parse import urlsplit
 
-from textutil import _s
+from textutil import FREEMAIL_DOMAINS, _s
 
 MAX_ATTENDEES = 25
 MAX_ATTENDEES_TO_RESEARCH = MAX_ATTENDEES
@@ -82,30 +83,123 @@ NO_UNSOURCED_NUMBERS = (
     + SOURCE_FIDELITY
 )
 
-def postfilter_focus(entry: dict) -> dict:
-    """Deterministic grounding discipline for the focus pass (in code, not just the prompt):
-      • every traction item MUST carry its source URL in the string — url-less items are dropped
-      • empty strings/lists are dropped entirely, so an empty field can never render as a heading
-      • hard caps: 5 builds / 4 traction."""
+def attendee_company_domain(email: str) -> str:
+    address, separator, domain = _s(email).strip().partition("@")
+    domain = company_domain(domain) if address and separator else ""
+    return "" if domain in FREEMAIL_DOMAINS else domain
+
+
+TRACTION_SOURCE_RULE = (
+    "Use one complete verbatim source sentence per traction item, including the company name, "
+    "followed by the exact source URL in parentheses. Use the official company site or a source "
+    "whose same sentence also names the company's exact domain. Keep numbers, funding, "
+    "partnerships, and certification in traction, with the source's original scope. "
+    "Leave traction empty when no such sentence is available."
+)
+
+
+_CERTIFICATION_TERMS = re.compile(
+    r"\b(?:certif(?:ied|ies|y|icates?|ications?)|accredit(?:ed|s|ations?))\b", re.IGNORECASE
+)
+
+
+def company_description(value: str) -> str:
+    """Hold certification terms in unchecked public research prose."""
+    text = _s(value).strip()
+    return "" if _CERTIFICATION_TERMS.search(text) else text
+
+
+def _traction_parts(item):
+    match = re.fullmatch(r"(.+?[.!?]) \((https?://\S+)\)", item)
+    if not match:
+        return "", ""
+    claim, url = match.groups()
+    # An entire source sentence keeps qualifications such as "not certified".
+    if re.search(r"[.!?]\s", claim):
+        return "", ""
+    return claim, url
+
+
+def project_traction_sources(entry, grounding):
+    """Retain only matching source sentences from provider transport, never model JSON."""
+    deep = entry.get("company_deep")
+    items = deep.get("traction") if isinstance(deep, dict) else None
+    if not isinstance(items, list) or not isinstance(grounding, list):
+        return {}
+    claims = {_traction_parts(item.strip()) for item in items if isinstance(item, str)}
+    sources = {}
+    for basis in grounding:
+        citations = basis.get("citations") if isinstance(basis, dict) else None
+        for citation in citations if isinstance(citations, list) else ():
+            excerpts = citation.get("excerpts") if isinstance(citation, dict) else None
+            url = citation.get("url") if isinstance(citation, dict) else None
+            if not isinstance(url, str) or not isinstance(excerpts, list):
+                continue
+            for excerpt in excerpts:
+                if not isinstance(excerpt, str):
+                    continue
+                sentences = re.split(r"(?<=[.!?])\s+", " ".join(excerpt.split()))
+                for sentence in sentences:
+                    if (sentence, url) in claims and sentence not in sources.get(url, ()):
+                        sources.setdefault(url, []).append(sentence)
+    return sources
+
+
+def grounded_traction(entry, domain):
+    """Yield exact source sentences that establish both the claim and the company identity."""
+    deep = entry.get("company_deep")
+    sources = entry.get("traction_sources")
+    if not (domain and isinstance(deep, dict) and isinstance(sources, dict)):
+        return
+    name = _s(deep.get("company")).strip()
+    items = deep.get("traction")
+    if not name or not isinstance(items, list):
+        return
+    domain_pattern = rf"(?<![\w.-]){re.escape(domain)}(?![\w-]|\.[\w-])"
+    name_pattern = rf"(?<!\w){re.escape(name)}(?!\w)"
+    for item in items:
+        claim, url = _traction_parts(item.strip()) if isinstance(item, str) else ("", "")
+        excerpts = sources.get(url)
+        if not claim or not isinstance(excerpts, list) or claim not in excerpts:
+            continue
+        try:
+            host = urlsplit(url).hostname or ""
+        except ValueError:
+            continue
+        if host and re.search(name_pattern, claim, re.IGNORECASE) and (
+                host.removeprefix("www.") == domain.removeprefix("www.")
+                or re.search(domain_pattern, claim, re.IGNORECASE)):
+            yield claim, url
+
+
+def postfilter_focus(entry: dict, *, domain: str = "") -> dict:
+    """Drop empty fields and traction without retained source and company evidence."""
     cd = entry.get("company_deep")
     if not isinstance(cd, dict):
         return {}
-    builds = [_s(s).strip() for s in (cd.get("builds") or []) if isinstance(s, str)]
-    traction = [_s(s).strip() for s in (cd.get("traction") or []) if isinstance(s, str)]
-    traction = [t for t in traction if t and re.search(r"https?://\S", t)]
+    builds = [company_description(s) for s in (cd.get("builds") or []) if isinstance(s, str)]
+    supported = list(grounded_traction(entry, domain))[:MAX_TRACTION]
+    traction = [f"{claim} ({url})" for claim, url in supported]
     out = {}
     for k, v in (("company", _s(cd.get("company")).strip()),
                  ("builds", [b for b in builds if b][:MAX_BUILDS]),
-                 ("founder_story", _s(cd.get("founder_story")).strip()),
+                 ("founder_story", company_description(cd.get("founder_story"))),
                  ("traction", traction[:MAX_TRACTION]),
-                 ("market", _s(cd.get("market")).strip())):
+                 ("market", company_description(cd.get("market")))):
         if v:
             out[k] = v
     # A company name alone is not a deep dive — it's already on the Pass-A entry.
-    return {"company_deep": out} if set(out) - {"company"} else {}
+    if not set(out) - {"company"}:
+        return {}
+    filtered = {"company_deep": out}
+    if supported:
+        filtered["traction_sources"] = {}
+        for claim, url in supported:
+            filtered["traction_sources"].setdefault(url, []).append(claim)
+    return filtered
 
 
-def postfilter_company(entry: dict) -> dict:
+def postfilter_company(entry: dict, *, domain: str = "") -> dict:
     # Grounding-only fallbacks may not enforce the provider schema. Do not turn
     # malformed list fields into individual characters or coerced facts.
     deep = entry.get("company_deep")
@@ -118,7 +212,41 @@ def postfilter_company(entry: dict) -> dict:
            or any(not isinstance(item, str) for item in deep[key]))
            for key in ("builds", "traction")):
         return {}
-    return postfilter_focus(entry)
+    return postfilter_focus(entry, domain=domain)
+
+
+def project_research_for_answer(research, *, company_selector="", attendee_email=""):
+    """Render checked research without exposing raw provider output or changing receipts."""
+    result = {key: value for key, value in research.items() if key != "research_evidence"}
+    key = "companies" if company_selector else "attendees"
+    rows = result.get(key)
+    if not isinstance(rows, list):
+        return result
+    result[key] = []
+    email = _s(attendee_email).strip().lower()
+    domain = company_domain(company_selector) if company_selector else attendee_company_domain(email)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if company_selector:
+            filtered = postfilter_company(row, domain=domain)
+        else:
+            row_domain = domain if _s(row.get("email")).strip().lower() == email else ""
+            filtered = postfilter_focus(row, domain=row_domain)
+        projected = {field: value for field, value in row.items()
+                     if field not in {"company_deep", "traction_sources", "summary", "company_summary", "relevance", "domain"}}
+        for field in ("summary", "company_summary"):
+            if description := company_description(row.get(field)):
+                projected[field] = description
+        if isinstance(row.get("relevance"), list):
+            projected["relevance"] = list(filter(None, map(company_description, row["relevance"])))
+        projected.update({field: value for field, value in postfilter_deep(row).items() if field in row})
+        if company_selector and domain and row.get("domain") == domain:
+            projected["domain"] = domain
+        if "company_deep" in filtered:
+            projected["company_deep"] = filtered["company_deep"]
+        result[key].append(projected)
+    return result
 
 
 def postfilter_deep(entry: dict) -> dict:
@@ -131,11 +259,11 @@ def postfilter_deep(entry: dict) -> dict:
     for it in entry.get("recent_activity") or []:
         if not isinstance(it, dict):
             continue
-        what = _s(it.get("what")).strip()
+        what = company_description(it.get("what"))
         url = _s(it.get("source_url")).strip()
         if what and url.lower().startswith(("http://", "https://")):
             ra.append({"when": _s(it.get("when")).strip(), "what": what, "source_url": url})
-    personal = [_s(s).strip() for s in (entry.get("personal") or []) if isinstance(s, str)]
+    personal = [company_description(s) for s in (entry.get("personal") or []) if isinstance(s, str)]
     personal = [s for s in personal if s and re.search(r"https?://\S", s)]
     return {"recent_activity": ra[:MAX_RECENT_ACTIVITY], "personal": personal[:MAX_PERSONAL]}
 

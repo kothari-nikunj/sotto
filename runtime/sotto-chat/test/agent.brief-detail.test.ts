@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createBriefDetailTool, readBriefDetail } from '../src/agent/brief-detail.js';
+import { BriefDetailUnavailable, BRIEF_DETAIL_EXECUTION_GUIDE, createBriefDetailTool, readBriefDetail } from '../src/agent/brief-detail.js';
 import type { SourceAuthority } from '../src/agent/source-authority.js';
 
 const revision = 'a'.repeat(64);
@@ -76,6 +76,28 @@ test('strict projection and chat authority reject raw data, unattended mode, and
   assert.match(result.coverage_note, /historical/);
 });
 
+test('bound gallery read without receipt context uses the protected unavailable error', async () => {
+  let contacts = 0;
+  const tool = createBriefDetailTool({bridgeUrl:url,readBearer:'read-only',sourceAuthority:source(current),
+    fetch:async () => { contacts++; return response(found); }});
+  for (const receipt of [undefined, {dispatch_id:'unproved'}]) {
+    const context = { requestContext: { get: (key: string) => ({
+      mode:'chat',runId:'run',ownerRequestKey:'event',sourceRevision:revision,acceptedGalleryContext:receipt,
+    } as Record<string,unknown>)[key] } };
+    await assert.rejects(tool.execute!({current_gallery:true,offset:0,limit:80}, context as never), BriefDetailUnavailable);
+  }
+  assert.equal(contacts, 0);
+});
+
+test('bound gallery instructions use the exact selector before latest discovery', () => {
+  const tool = createBriefDetailTool({bridgeUrl:url,readBearer:'read-only',sourceAuthority:source(current)});
+  for (const guidance of [tool.description, BRIEF_DETAIL_EXECUTION_GUIDE]) {
+    assert.match(guidance, /current_gallery:true/);
+    assert.ok(guidance.indexOf('current_gallery:true') < guidance.indexOf('latest:true'));
+    assert.doesNotMatch(guidance, /For the gallery just delivered, (?:use|start with) latest:true/);
+  }
+});
+
 test('discovery returns bounded ambiguity metadata and refuses mixed or invalid selectors before contact',async()=>{
   let contacts=0;
   const matches=[{id:'a'.repeat(24),date:'2026-10-04',title:'Morning',kind:'brief' as const},{id:'b'.repeat(24),date:'2026-10-04',title:'Evening',kind:'brief' as const}];
@@ -102,7 +124,7 @@ test('installed Google adapter receives object-root gallery selector schema with
   await assert.rejects(generateText({model,prompt:'fixture',maxRetries:0,tools:{accepted_brief_detail:tool({inputSchema:native.inputSchema!})}}));
   const schema=body!.tools[0].functionDeclarations[0].parametersJsonSchema;
   assert.equal(schema.type,'object');assert.equal(schema.anyOf,undefined);assert.equal(schema.additionalProperties,false);
-  assert.deepEqual(Object.keys(schema.properties).sort(),['artifact_id','date','kind','latest','limit','offset','query']);
+  assert.deepEqual(Object.keys(schema.properties).sort(),['artifact_id','current_gallery','date','kind','latest','limit','offset','query']);
   assert.deepEqual(schema.required,['offset','limit']);
   assert.match(schema.properties.limit.description,/characters.*not number of results/);
   assert.match(schema.properties.offset.description,/Character offset/);

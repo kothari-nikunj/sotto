@@ -41,6 +41,7 @@ LOG_SPEC.loader.exec_module(sotto_log)
 # name → (relative path, contents). One byte count per file so a summary can be checked by size.
 EXHAUST = {
     "snapshot": ("knowledge/last_local_snapshot.json", '{"messages": []}'),
+    "dated_snapshot": ("knowledge/snapshots/2026-08-12.json", '{"imessage": ["private"]}'),
     "wake_payload": ("briefs/2026-08-12.morning.payload.json", '{"imessage": ["private"]}'),
     "brief_artifact": ("events/work-inputs/brief-test/artifact.json", '{"brief_text": "private"}'),
     "brief_current": ("events/work-inputs/brief-test/current/inputs.json", '{"local": "private"}'),
@@ -49,6 +50,7 @@ EXHAUST = {
     "research2": ("cache/research_2026-08-11.json", '{"cards": 2}'),
     "calendar": ("cache/calendar_today.json", '{"events": 0}'),
     "log": ("logs/compose_brief.log", "line one\nline two\n"),
+    "mcp_access": ("logs/mcp-access-2026-08-12.jsonl", '{"tool": "sotto_source_status"}\n'),
     "delivery": ("events/delivery.jsonl", '{"status": "delivered"}\n'),
     "sends": ("events/sends.jsonl", '{"result": "sent"}\n'),
     "learning_diagnostics": ("events/learning-diagnostics/brief-test.json", '{"rejected": []}'),
@@ -73,10 +75,10 @@ VERB_FILES = {
                  "events/work-inputs/brief-test/artifact.json",
                  "events/work-inputs/brief-test/current/inputs.json",
                  "events/work-inputs/brief-test/prepared/inputs.json",
-                 "knowledge/last_local_snapshot.json"],
+                 "knowledge/last_local_snapshot.json", "knowledge/snapshots/2026-08-12.json"],
     "caches": ["cache/calendar_today.json", "cache/research_2026-08-11.json",
                "cache/research_2026-08-12.json"],
-    "logs": ["logs/compose_brief.log"],
+    "logs": ["logs/compose_brief.log", "logs/mcp-access-2026-08-12.jsonl"],
     "receipts": ["events/delivery.jsonl", "events/learning-diagnostics/brief-test.json",
                  "events/sends.jsonl"],
 }
@@ -140,7 +142,7 @@ def test_each_verb_removes_exactly_its_own_files(vol, verb):
     if verb == "logs":
         # Truncate, not unlink. The shared sidecar lock is durable by protocol; deleting a lock
         # inode after release could split future lockers across two different inodes.
-        assert after == before | {"logs/compose_brief.log.lock"}
+        assert after == (before - {"logs/mcp-access-2026-08-12.jsonl"}) | {"logs/compose_brief.log.lock"}
         assert os.path.getsize(os.path.join(vol, "logs", "compose_brief.log")) == 0
     else:
         assert before - after == set(VERB_FILES[verb])
@@ -331,7 +333,7 @@ def test_cli_prints_one_json_object_and_exits_zero(vol):
         "events/work-inputs/brief-test/artifact.json",
         "events/work-inputs/brief-test/current/inputs.json",
         "events/work-inputs/brief-test/prepared/inputs.json",
-        "knowledge/last_local_snapshot.json"]
+        "knowledge/last_local_snapshot.json", "knowledge/snapshots/2026-08-12.json"]
 
 
 def test_an_unknown_verb_is_rejected_rather_than_ignored(vol):

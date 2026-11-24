@@ -66,13 +66,22 @@ Return JSON with exactly these keys:
 - **commitments** — array `[{ "meeting", "meeting_id", "owner", "owner_is_user", "what", "due"
   (or null), "to_email" (or null), "source_snippet", "existing_anchor_key" (or null) }]` —
   `owner` is who owes it (the user or another attendee). These feed the continuity ledger as open loops.
+  Give `due` as an absolute YYYY-MM-DD only when the meeting date and words establish a clear day.
   `meeting_id` is copied verbatim from the meeting block. `source_snippet` is the shortest exact
   excerpt from notes/summary/transcript supporting owner + deliverable. Keep `what` concise but use
   the source's action verb and concrete nouns verbatim so code can verify the obligation. `existing_anchor_key` may be
   copied verbatim from the open-loop context only when it is clearly the same obligation; otherwise
   it is null. Never invent an anchor.
+  Each commitment may also carry the same capture fields as a message task:
+  - `"deliverable"`: one imperative clause naming what must be handed over or done by whoever owes it, from the source request or promise.
+  - `"owed_by"`: `"owner"` when the user must deliver it; `"them"` when the counterpart must. A promise belongs to whoever made it, and a request to whoever was asked.
+  - `"fulfillment"`: `"intro"` when the owner owes an introduction to someone; `"schedule"` when the owed work is putting a meeting or call on the calendar (picking a time, booking, rescheduling); `"callback"` when the owner owes a phone call back; `"none"` for anything else. Code closes intro, schedule and callback tasks only on their own source signal (a sent intro email, a booked meeting, a connected call), so mark them from what the person asked for, never from what already happened.
+  - `"deliver_to"`: when the task is finished by contacting someone other than the asker (the intro target, or the person to reply to on their behalf), that person's exact source email or phone number when the meeting material names it; else null. For an intro, `deliver_to` is the person being introduced, never the person to check with first. Give the target's email when the source has it: only an email target on the sent introduction can close it, and a phone target only marks it as maybe done.
+  For automatic closure, quote the owner's whole promise and copy its action clause into `what`. Name both people in an introduction when the quote does. Use a closure kind only for a single action that would fully fulfill the promise. Leave compound or ambiguous promises as ordinary tasks.
 - **drafts** — array `[{ "to_name", "to_email" (or null), "channel" ("email"|"imessage"|"whatsapp"|null),
-  "subject" (or null), "body" }]` — the ready-to-send follow-ups. The body is the full message.
+  "subject" (or null), "body", "commitment_quote" (or null) }]` — the ready-to-send follow-ups.
+  The body is the full message. If it fulfills one owner commitment to this exact attendee, copy that
+  commitment's `source_snippet` verbatim into `commitment_quote`. Otherwise leave it null.
 - **procedural_candidates** — array of strings: standing rules **the user themselves stated** about
   how they work in general ("always send intros as forwardable emails", "never book me Fridays",
   "from now on lead with the numbers") — a durable rule about HOW, never a one-off task ("I'll send

@@ -100,16 +100,15 @@ def message_fields(message: dict) -> dict:
     }
 
 
-def token_path() -> str:
-    """Sotto's Google token under its explicit home; "" means disconnected.
-
-    The fixed procedures and CLI share this reader. An unset, relative or dotted home never
-    revives an ambient grant from another directory, and a missing token under the selected
-    home is a disconnect.
-    """
+def token_path(*, require_home: bool = False) -> str:
+    """Sotto's Google token under its explicit home. A missing token is a disconnect."""
     selected = os.environ.get("SOTTO_HOME")
     if (not selected or not os.path.isabs(selected) or "\x00" in selected
             or any(part in (".", "..") for part in selected.split("/"))):
+        if require_home:
+            error = RuntimeError("Google credential home is unavailable")
+            error.sotto_read_stage = "reader_load"
+            raise error
         return ""
     candidate = os.path.join(selected, "google_token.json")
     return candidate if os.path.isfile(candidate) else ""

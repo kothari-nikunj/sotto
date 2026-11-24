@@ -1,6 +1,6 @@
 ---
 name: sotto-event
-description: 'Use ONLY when you need the reference for event nudges and the midday digest, which the receiver composes itself — a triaged event bundle (a real-time iMessage/WhatsApp/call/email — or a meeting that just ended, class post_meeting — that survived the triage funnel), or the midday digest (digest mode). ONE short nudge as Sotto with a ready-to-send draft — never auto-send. NOT for polled proactive checks (that is sotto-proactive) and never invoked by the user directly.'
+description: 'Use ONLY when you need the reference for event nudges and the midday digest, which the receiver composes itself — a triaged event bundle (a real-time iMessage/WhatsApp/call/email — or a meeting that just ended, class post_meeting — that survived the triage funnel), or the midday digest (digest mode). One short nudge with a draft for review when useful and supported — never auto-send. NOT for polled proactive checks (that is sotto-proactive) and never invoked by the user directly.'
 metadata:
   tags: [proactive, events, chief-of-staff, sotto]
   category: productivity
@@ -8,17 +8,16 @@ metadata:
 
 # Sotto — Event nudge (Tier 2 of the triage funnel)
 
-> **How this runs on Sotto:** this procedure is receiver-owned. Admitted event bundles are composed
-> directly by the receiver's notification composer, and the scheduled midday digest runs the
-> receiver's digest procedure. Neither starts an agent session, and nothing here is run from chat.
+> **How this runs on Sotto:** the receiver composes notifications directly from admitted event
+> bundles. The scheduled midday digest checks for items due to surface, then the receiver formats
+> the grounded result. Both run outside chat without starting an agent session.
 > This skill is the behavior and approval reference for that composition. In chat, the owner's
 > answer to a delivered nudge goes through the matching skill (`sotto-draft-reply`,
 > `sotto-schedule`, `sotto-meeting-prep`).
 
 The composition end of event-driven proactivity: the Bridge/email poller pushes events within seconds, the
 deterministic triage funnel (Tier 0 + a Flash-Lite Tier 1) has ALREADY decided this
-one deserves the user's attention — your job is only to say it well. **ONE short message, a draft
-ready, never auto-sent.** Everything that didn't reach you was dropped or queued on purpose; do not go
+one deserves the user's attention — your job is only to say it well. **One short message. Include a draft for review when the evidence supports it.** Everything that didn't reach you was dropped or queued on purpose; do not go
 looking for more events or overriding the delivery gates.
 
 > Context lookups are read-only. The post-meeting lane alone reuses the existing source-grounded
@@ -92,10 +91,10 @@ single unsolicited pass or invent a reason for it.
      Still ONE short message (the ≤ 2-sentence nudge + the draft); plain chat text, no markdown
      headings/bold (the chatfmt rule — chat clients render them literally).
    - **Draft the no alongside the yes** (the no-draft rule in `sotto-draft-reply`). A scheduling ask
-     is declinable by definition, so the nudge carries **two labeled drafts** — `Accept:` the
-     slots offer, then `Decline:` one short no in the **decline register**
+     is declinable by definition, so the nudge carries **two labeled drafts** — `Draft to accept:` the
+     slots offer, then `Draft to decline:` one short no in the **decline register**
      (`_shared/references/voice.md`: warm, direct, ≤2 sentences, no fake busyness, no fake-open
-     door). Still ONE message: the ≤2-sentence nudge plus two short labeled lines, never two nudges.
+     door). Still ONE message: the ≤2-sentence nudge plus two labeled, quoted drafts in their own paragraphs, never two nudges.
      If Tier 1 called the ask low-value, put the decline first. Present both flat — the user picks;
      you never recommend one. A decline is `review` tier: present the text, **never pre-link it**,
      and type it `action_type: "decline"` when the user acts on it. It is recorded when OFFERED
@@ -203,11 +202,13 @@ single unsolicited pass or invent a reason for it.
    catch-up. Provider failure means retryable silence, not a completed review.
 2. **If it returns `{"deliver": false}` → output NOTHING and stop.** Silence is the correct, common
    outcome — a quiet day has no midday digest. Do not announce that there's nothing.
-3. Else compose **ONE compact catch-up message** from its reviewed `items` only. Use each item's
-   `why`, `relevance` and `messages` as evidence, not just its latest preview. Name the underlying
-   task or development and attribute relays honestly; don't ask the user to reply to a reminder
-   service as though it were the original person. Never fill unused slots, add unreviewed queue
-   entries, or restate items the evidence shows are resolved. If none remain, return `NO_NUDGES`.
+3. The receiver composes **ONE compact catch-up message** from the grounded `excerpt` and
+   `display_sender` in each selected item. When a waiting decision binds an exact earlier ask
+   to the latest owner reply, the line names the observed requester in a direct conversation and attributes the quoted reply
+   to the owner. A group title never supplies a requester. Communication
+   tasks use the retained source message and its exact conversation. The digest withholds a
+   saved communication task when that route cannot be proved. The model's reasoning stays
+   private. If no supported item remains, return `NO_NUDGES`.
    For the message use a bold **Midday catch-up**
    title line first (the reader must know what this message IS before line one; owner, Aug 26:
    an untitled digest "reads weird"), then **hard cap 6 lines** (the digest format in

@@ -10,6 +10,8 @@ import { createSottoAgentRuntime, MODEL_TURN_DEADLINE_MS } from '../src/agent/ru
 import { OWNER_WEB_READ_DEADLINE_MS } from '../src/tools/owner-web-read.js';
 import { createManagedProxyModels, ManagedProxyAdmissionBusy } from '../src/agent/models.js';
 
+import { SourceAuthorityChanged } from '../src/agent/source-authority.js';
+
 function fakeModel() {
   const model = new MockLanguageModelV4({
     doGenerate: async () => ({
@@ -244,5 +246,24 @@ test('failed model attempt reports completed numeric stages without changing the
       ['sourceCheckMs', 'standingContextMs', 'toolSetupMs', 'generationMs', 'finalSourceCheckMs', 'totalMs', 'queueMs', 'promptPreparationMs'].sort());
     assert.ok(Object.values(timings[0]!.timing).every(value => Number.isInteger(value) && value >= 0));
     assert.ok(timings[0]!.timing.totalMs! >= timings[0]!.timing.generationMs!);
+  } finally { await runtime.close(); await rm(directory, {recursive: true, force: true}); }
+});
+
+
+test('an observed source revocation stays the cause if the turn deadline fires during its check', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sotto-chat-deadline-authority-'));
+  const model = fakeModel();
+  const runtime = createSottoAgentRuntime({model, storagePath: join(directory, 'memory.db'),
+    instructions: 'Answer briefly.', modelTurnDeadlineMs: 5000,
+    readMasterContext: async ({signal}) => {
+      const keepAlive = setTimeout(() => {}, 15_000);
+      try {
+        if (!signal?.aborted) await new Promise<void>(resolve => signal?.addEventListener('abort', () => resolve(), {once: true}));
+        throw new SourceAuthorityChanged();
+      } finally { clearTimeout(keepAlive); }
+    }});
+  try {
+    await assert.rejects(runtime.generateChat({text: 'Hello', threadId: 'thread', ownerId: 'owner'}), SourceAuthorityChanged);
+    assert.equal(model.doGenerateCalls.length, 0);
   } finally { await runtime.close(); await rm(directory, {recursive: true, force: true}); }
 });

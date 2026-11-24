@@ -66,8 +66,10 @@ def test_delayed_mixed_learning_writes_only_permitted_facts_and_retries_idempote
     from knowledge_query import pack_person
     real_run = REAL_SUBPROCESS_RUN
     request, state = procedure
+    now = datetime.now(timezone.utc)
+    request = {**request, 'day': now.date().isoformat()}
     permitted = {'id': 'wa-1', 'source_id': 'wa-1', 'handle': '+15550000102',
-                 'text': 'Lee builds buoys.', 'timestamp': '2026-09-08T10:00:00Z'}
+                 'text': 'Lee builds buoys.', 'timestamp': now.isoformat()}
     permitted.update(source_ref='msg:v2:whatsapp:' + 'a' * 64, content_version='b' * 64)
     canonical = message_version_reference(permitted, 'whatsapp')
     Path(request['payload_path']).write_text(json.dumps({
@@ -111,7 +113,7 @@ def test_delayed_mixed_learning_writes_only_permitted_facts_and_retries_idempote
     person = kg.parse_person_file(Path(path).read_text())
     assert [fact.text for fact in person.facts.values()] == ['Builds buoys.']
     assert not person.title
-    assert 'Builds buoys.' in pack_person(person, True, datetime(2026, 9, 8, tzinfo=timezone.utc))
+    assert 'Builds buoys.' in pack_person(person, True, now)
     assert receipts[0]['completion'] == 'partial'
     assert receipts[0]['steps']['knowledge']['status'] == 'partial'
     payload = payloads[0]

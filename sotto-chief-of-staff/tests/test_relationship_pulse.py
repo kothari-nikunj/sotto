@@ -222,14 +222,13 @@ def test_outgoing_call_counts_as_from_you():
                                "call_type": "phone"}]}
     people = rp._interactions_by_contact(local)
     assert len(people["Priya"]["from_me"]) == 1 and not people["Priya"]["from_them"]
-    # End-to-end: they texted 8d ago, you called them back 5d ago → NOT waiting on you.
-    # (compute re-derives recent_calls from the raw `calls` via resolve_contact_names.)
+    # A later connected call clears the waiting-on-you suggestion from a prior text.
     local2 = {"contacts": [{"name": "Priya", "phones": ["+14155550101"]}],
               "imessage": [{"handle": "+14155550101", "is_from_me": False, "is_group_chat": False,
                             "timestamp": (NOW - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S"),
                             "text": "call me?"}],
-              "calls": [{"phone": "+14155550101", "is_outgoing": True, "is_answered": True,
-                         "timestamp": ts, "call_type": "phone"}]}
+              "calls": [{"phone": "+14155550101", "is_outgoing": True, "is_answered": False,
+                         "timestamp": ts, "duration_seconds": 42, "call_type": "phone"}]}
     out = rp.compute(local2, NOW)
     assert not [x for x in out["attention_queue"] if x["queue_type"] == "waiting_on_you"]
 
@@ -552,7 +551,7 @@ def test_compact_commitments_never_trust_a_stored_id_the_identifier_does_not_pro
     _pulse_person(tmp_path, monkeypatch, 'c_abc123', 'John Smith', ['+15555550123'])
     text = _commitment_text([
         dict(name='John Smith', identifier='+15555550123', channel='imessage', what='Send deck', canonical_id='c_abc123'),
-        dict(name='John Smith', identifier='+14155550999', channel='imessage', what='Pay invoice', canonical_id='c_abc123'),
+        dict(name='John Smith', identifier='+14155550105', channel='imessage', what='Pay invoice', canonical_id='c_abc123'),
         dict(name='John Smith', identifier='', channel='manual', what='Book the venue', canonical_id='c_abc123')])
     assert text.count('John Smith') == 2 and 'Pay invoice' in text and '; 1 other open item' in text
 

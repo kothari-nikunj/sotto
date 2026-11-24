@@ -5,6 +5,7 @@ in a running interpreter; exact offline uv regeneration reads only copied lock i
 """
 import importlib.util
 from pathlib import Path
+import re
 import shutil
 
 import pytest
@@ -111,8 +112,10 @@ def test_case_g_transitive_hand_downgraded(tmp_path):
     real_tree(tmp_path)
     for relative in ('requirements.txt', 'requirements-dev.txt'):
         path = tmp_path / relative
-        assert 'pyparsing==3.3.2' in path.read_text(), 'fixture assumption: pyparsing is locked at 3.3.2'
-        path.write_text(path.read_text().replace('pyparsing==3.3.2', 'pyparsing==2.0.0'))
+        locked = path.read_text()
+        changed, count = re.subn(r'^pyparsing==[0-9.]+ ', 'pyparsing==2.0.0 ', locked, flags=re.M)
+        assert count == 1 and changed != locked
+        path.write_text(changed)
     expect_closure_violation(tmp_path)
 
 

@@ -79,6 +79,24 @@ def parse_observed_time(value):
     return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
 
 
+def source_observed_time(event):
+    """Prefer explicit instants; older Mac display clocks use the configured owner zone."""
+    explicit = event.get('timestamp_utc')
+    if explicit is not None:
+        parsed = _parse_ts(_s(explicit))
+        return parsed.astimezone(timezone.utc) if parsed and parsed.utcoffset() is not None else None
+    raw = event.get('timestamp') or event.get('date')
+    parsed = _parse_ts(_s(raw))
+    if parsed and parsed.tzinfo is None and event.get('source') in (
+            'imessage', 'whatsapp', 'calls', 'whatsapp_calls', 'phonecalls'):
+        local = parsed.replace(tzinfo=_resolve_tz(configured_tz()) or timezone.utc)
+        # Repeated and nonexistent DST hours have no unique instant without an offset.
+        if local.utcoffset() == local.replace(fold=1).utcoffset():
+            return local.astimezone(timezone.utc)
+        return None
+    return parse_observed_time(raw)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -201,3 +219,54 @@ def _user_local_date(tz: str) -> str:
 def _time_frame(tz: str) -> str:
     h = _now_local(tz).hour
     return "morning" if h < 12 else "afternoon" if h < 17 else "evening"
+
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august",
+           "september", "october", "november", "december")
+_PROMISE_WEEKDAY_RE = re.compile(
+    r"\b(?:by|on|before|until|till|this|next)\s+(mon|tue|wed|thu|fri|sat|sun)[a-z]*\b", re.I)
+_PROMISE_MONTHDAY_RE = re.compile(
+    r"\b(?:by|on|before|until|till)\s+(?:the\s+)?(?:(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+    r"|(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?)\b", re.I)
+
+
+def promised_date(text: str, ref: datetime):
+    """The date a reply names for delivery — "by Tuesday", "tomorrow", "on the 16th of March",
+    "end of week", "next week" — as YYYY-MM-DD, or None when the text names none. Deliberately
+    small: a promise Sotto can't read is a promise it waits the usual days on."""
+    t = _s(text).lower()
+    if not t:
+        return None
+    day = ref.date() if isinstance(ref, datetime) else ref
+    m = _PROMISE_MONTHDAY_RE.search(t)
+    if m:
+        dnum = int(m.group(1) or m.group(4))
+        mon = (m.group(2) or m.group(3))[:3]
+        month = next(i for i, name in enumerate(_MONTHS, 1) if name.startswith(mon))
+        try:
+            candidate = day.replace(month=month, day=dnum)
+        except ValueError:
+            return None
+        if candidate < day:
+            try:
+                candidate = candidate.replace(year=day.year + 1)
+            except ValueError:
+                return None
+        return candidate.strftime("%Y-%m-%d")
+    if re.search(r"\btomorrow\b", t):
+        return (day + timedelta(days=1)).strftime("%Y-%m-%d")
+    if re.search(r"\b(?:end of (?:the )?week|eow|this week)\b", t):
+        ahead = (4 - day.weekday()) % 7          # the coming Friday (today, if Friday)
+        return (day + timedelta(days=ahead)).strftime("%Y-%m-%d")
+    if re.search(r"\bnext week\b", t):
+        return (day + timedelta(days=7)).strftime("%Y-%m-%d")
+    if re.search(r"\b(?:end of (?:the )?month|eom)\b", t):
+        first_next = (day.replace(day=1) + timedelta(days=32)).replace(day=1)
+        return (first_next - timedelta(days=1)).strftime("%Y-%m-%d")
+    m = _PROMISE_WEEKDAY_RE.search(t)
+    if m:
+        target = next(i for i, name in enumerate(_WEEKDAYS) if name.startswith(m.group(1).lower()))
+        ahead = (target - day.weekday()) % 7 or 7
+        return (day + timedelta(days=ahead)).strftime("%Y-%m-%d")
+    return None

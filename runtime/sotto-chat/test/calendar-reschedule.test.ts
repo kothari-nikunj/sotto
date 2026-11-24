@@ -6,7 +6,7 @@ import test from 'node:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { RequestContext } from '@mastra/core/request-context';
+import { executeTool } from './helpers/execute-tool.js';
 import { OperationalJournal } from '../src/journal/index.js';
 import { ConversationCoordinator, type ModelRequest } from '../src/conversation.js';
 import { createOwnerCalendarClient } from '../src/tools/owner-calendar-client.js';
@@ -30,10 +30,7 @@ function fixture(previewReview: CalendarPreview["review"] | ((actionId:string)=>
         } });
     const tools = createOwnerCalendarTools({ client, journal: () => journal, sourceAuthority: { read: async () => ({ version: 2 as const, complete: true, revision, bridge_sources: [], google_sources: ['calendar' as const] }) } });
     const call = async (name: keyof typeof tools, input: unknown, request: ModelRequest, overrides: Record<string, unknown> = {}) => {
-        const requestContext = new RequestContext();
-        for (const [key, value] of Object.entries({ mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey, sourceRevision: revision, allowOwnerSkill: request.allowOwnerSkill, ...overrides }))
-            requestContext.set(key, value);
-        return tools[name].execute!(input as never, { requestContext, abortSignal: request.signal } as never);
+        return executeTool(tools[name], input, request.signal, { mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey, sourceRevision: revision, allowOwnerSkill: request.allowOwnerSkill, ...overrides });
     };
     return { journal, client, call, get contacts() { return contacts; }, close() { journal.close(); rmSync(folder, { recursive: true, force: true }); } };
 }
@@ -232,19 +229,20 @@ test('creation normalizes guest identity and binds the complete review to its ba
 });
 
 
-for(const scenario of ['wrong_wrapper','wrong_reply','undelivered','intervening'] as const)test(`creation accepted-review fence: ${scenario}`,async()=>{
- const proposal=calendarCreateProposalSchema.parse({operation:'propose_create',summary:'Cedar planning',start:args.start,end:args.end,attendees:[],location:'',description:''});
+for(const scenario of ['wrong_wrapper','wrong_reply','undelivered','intervening','caption','edited_title','changed_source'] as const)test(`creation accepted-review fence: ${scenario}`,async()=>{
+ const details={summary:'Cedar planning',start:args.start,end:args.end,attendees:[],location:'',description:''};
+ const proposal=calendarCreateProposalSchema.parse({operation:'propose_create',...details});
  const f=fixture(actionId=>{const r={...proposal,operation:'create' as const,calendar_id:'primary' as const,event_id:calendarCreateEventId(actionId),effective_attendees:[],organizer_email:null,organizer_added:false,notifications:'all' as const,source_revision:revision,review_hash:''};r.review_hash=calendarReviewHash(r);return r;});
  let refused=0;
  const c=new ConversationCoordinator({journal:f.journal,ownerCalendar:f.client,ownerPolicy:{channel:'photon',accountId:'account',ownerId:'owner'},model:{generate:async request=>{
-  if(request.text==='Review')await f.call('calendar_create_review',{summary:proposal.summary,start:proposal.start,end:proposal.end,attendees:[],location:'',description:''},request);
-  else if(request.text==='yes'){await assert.rejects(f.call(scenario==='wrong_wrapper'?'calendar_move_confirm':'calendar_create_confirm',{},request));refused++;}
+  if(request.text==='Review')await f.call('calendar_create_review',details,request);
+  else if(request.text.startsWith('yes')){await assert.rejects(f.call(scenario==='wrong_wrapper'?'calendar_move_confirm':'calendar_create_confirm',{},request,scenario==='changed_source'?{sourceRevision:'b'.repeat(64)}:{}));refused++;}
   return {text:'Please clarify.',sourceRevision:revision};
  }},postPrepared:async()=>({acceptance:scenario==='undelivered'?'rejected':'accepted',messageId:'accepted-review'})});
  try{
   await c.receive(inbound('review','Review'),context);
   if(scenario==='intervening')await c.receive(inbound('other','Another question'),context);
-  await c.receive({...inbound('yes','yes'),...(scenario==='wrong_reply'?{replyBound:true,replyToMessageId:'another-provider-message'}:{})},context);
+  await c.receive({...inbound('yes',scenario==='edited_title'?'yes, title should be Morgan / Dana':'yes'),...(scenario==='caption'?{media:[{mimeType:'image/png',filename:'example.png'}]}:{}),...(scenario==='wrong_reply'?{replyBound:true,replyToMessageId:'another-provider-message'}:{})},context);
   if(scenario==='undelivered'){
    const row=f.journal.db.prepare("SELECT id FROM inbound_events WHERE source_id='yes'").get()!;
    f.journal.startRun({runId:'confirm-undelivered',eventId:row.id as string});

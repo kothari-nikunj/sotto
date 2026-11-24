@@ -298,3 +298,28 @@ def test_calendar_evidence_retains_availability_and_owner_response(monkeypatch):
     assert shared['attendees'][0]['owner'] is False
     monkeypatch.setenv('SOTTO_USER_EMAIL', 'OWNER@example.com')
     assert api._owner_projection('calendar', {**row, 'calendar_id': 'team'})['attendees'][0]['owner'] is True
+
+
+ZOOM = ('Join Zoom Meeting\nhttps://us02web.zoom.us/j/81234567890?pwd=abcdefghijklmnopqrstuvwxyz123456\n\n'
+        'Meeting ID: 812 3456 7890\nPasscode: 123456\n\n' + '• +1 646 555 0123 US (New York)\n' * 30)
+
+
+def test_a_calendar_over_the_byte_bound_returns_what_fits_in_time_order():
+    # 60 projected events of ~1.7 KB over 26 days exceeded 64 KiB and failed the whole read (H4).
+    rows = [{'id': f'e{i:02d}', 'summary': f'Sync {i}', 'description': ZOOM,
+             'start': {'dateTime': f'2026-11-{10 + i // 3:02d}T{9 + i % 3:02d}:00:00-08:00'},
+             'end': {'dateTime': f'2026-11-{10 + i // 3:02d}T{9 + i % 3:02d}:30:00-08:00'},
+             'attendees': [{'email': f'person{j}@example.com', 'responseStatus': 'accepted'} for j in range(6)]}
+            for i in range(60)]
+    rows[1]['description'] = 'agenda ' * 4000  # one field over its own bound
+    result = api.read_owner('calendar_list', {'start': '2026-11-09T00:00:00Z', 'end': '2026-12-05T00:00:00Z'},
+                            lambda: Session(calendar=rows))
+    ids = [item['id'] for item in result['items']]
+    assert 0 < len(ids) < 60 and ids == [f'e{i:02d}' for i in range(len(ids))]
+    assert len(json.dumps(result, ensure_ascii=False).encode()) <= 64 * 1024
+    assert result['truncated'] is True and result['observation']['complete'] is False
+    first_omitted = rows[len(ids)]['start']['dateTime']
+    assert result['next_from'] == api.datetime.fromisoformat(first_omitted).astimezone(
+        api.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    assert result['items'][1]['clipped'] == ['description']
+    assert 'clipped' not in result['items'][0]

@@ -8,25 +8,25 @@ tq = importlib.util.module_from_spec(spec); spec.loader.exec_module(tq)
 
 def test_local_queue_needs_response_and_resolves_names():
     local = {
-        "contacts": [{"name": "Jake Rosen", "phones": ["+12069994970"]}],
+        "contacts": [{"name": "Quinn Albrecht", "phones": ["+12065550143"]}],
         "imessage": [
             # Jake asked, user hasn't replied → needs response, name resolves from contacts
-            {"handle": "+12069994970", "text": "can you intro me?", "is_from_me": False, "timestamp": "2026-06-25T09:00"},
+            {"handle": "+12065550143", "text": "can you intro me?", "is_from_me": False, "timestamp": "2026-06-25T09:00"},
             # an unknown phone-only sender → dropped
-            {"handle": "+18885551234", "text": "your code is 123", "is_from_me": False, "timestamp": "2026-06-25T08:00"},
+            {"handle": "+18885550100", "text": "your code is 123", "is_from_me": False, "timestamp": "2026-06-25T08:00"},
         ],
     }
     q = tq.local_queue(local, "imessage")
     names = [i["name"] for i in q]
-    assert "Jake Rosen" in names                       # resolved + surfaced
+    assert "Quinn Albrecht" in names                       # resolved + surfaced
     assert all("888" not in i["identifier"] for i in q)  # phone-only OTP sender dropped
 
 
 def test_local_queue_skips_already_replied():
-    local = {"contacts": [{"name": "Mira", "phones": ["+12065550000"]}],
+    local = {"contacts": [{"name": "Mira", "phones": ["+12065550100"]}],
              "imessage": [
-                 {"handle": "+12065550000", "text": "thanks!", "is_from_me": False, "timestamp": "2026-06-25T09:00"},
-                 {"handle": "+12065550000", "text": "you got it", "is_from_me": True, "timestamp": "2026-06-25T09:05"},
+                 {"handle": "+12065550100", "text": "thanks!", "is_from_me": False, "timestamp": "2026-06-25T09:00"},
+                 {"handle": "+12065550100", "text": "you got it", "is_from_me": True, "timestamp": "2026-06-25T09:05"},
              ]}
     assert tq.local_queue(local, "imessage") == []     # user replied last → not in queue
 

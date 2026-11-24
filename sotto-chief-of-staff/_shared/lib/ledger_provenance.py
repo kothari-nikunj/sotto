@@ -22,6 +22,21 @@ INTERNAL_KEYS = frozenset({"_path", "_malformed", "content_provenance"})
 MAX_FRONTMATTER_BYTES = 64 * 1024
 MAX_FRONTMATTER_NODES = 4096
 HEX_DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
+REF_TYPE_KEYS, REF_ID_KEYS = ("sourceType", "source_type", "source"), ("sourceId", "source_id", "id")
+
+
+def source_refs(row):
+    refs = row.get("source_refs") or []
+    return [refs] if isinstance(refs, dict) else refs
+
+
+def ref_fields(ref) -> tuple[str, str, str]:
+    """A stored source ref as (source type, source id, snippet), whichever shape wrote it: the
+    resolver's `{sourceType, sourceId}` or a Granola follow-up's `{source, source_id}`."""
+    if not isinstance(ref, dict):
+        return "", "", ""
+    source, ident = (next((str(ref[key]) for key in keys if ref.get(key)), "") for keys in (REF_TYPE_KEYS, REF_ID_KEYS))
+    return source, ident, str(ref.get("snippet") or "")
 
 
 class UnknownProvenanceError(ValueError):
@@ -142,8 +157,7 @@ def _refs(value, *, granola_thread=False):
     for ref in value:
         if type(ref) is not dict:
             raise UnknownProvenanceError("invalid evidence row")
-        source = _one_field(ref, ("sourceType", "source_type", "source"))
-        identity = _one_field(ref, ("sourceId", "source_id", "id"))
+        source, identity = _one_field(ref, REF_TYPE_KEYS), _one_field(ref, REF_ID_KEYS)
         if source is None or (identity is None and not (source == "granola" and granola_thread
                                                      and type(ref.get("snippet")) is str and ref["snippet"].strip())):
             raise UnknownProvenanceError("incomplete evidence row")
@@ -208,7 +222,7 @@ def source_loop_sources(row):
     for refs in (row.get('source_refs'), row.get('resolution_source_refs')):
         for ref in ([refs] if isinstance(refs, dict) else refs or []):
             if not isinstance(ref, dict) or any(str(ref.get(key) or '').strip().lower() in ('apple_mail', 'mail')
-                                               for key in ('source', 'sourceType', 'source_type')):
+                                               for key in REF_TYPE_KEYS):
                 raise UnknownProvenanceError("ambiguous source authority")
     if row.get("content_provenance") is not None:
         kind, sources = classify_ledger_sources(row)

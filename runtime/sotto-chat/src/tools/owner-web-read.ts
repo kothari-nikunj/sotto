@@ -1,4 +1,4 @@
-import {ownerReadRequest, contextualReadRequest, readCancelled} from './read-admission.js';
+import {ownerReadRequest, readCancelled} from './read-admission.js';
 /** Neutral admitted paid URL read; no model-selected provider or reply target. */
 import {createHash} from 'node:crypto';
 import {z} from 'zod';
@@ -100,7 +100,7 @@ export type OwnerWebReadReceipt=z.infer<typeof ownerWebReadReceiptSchema>;
 export const ownerWebReadRejectionSchema=z.enum(['event_conflict','source_unavailable','url_unavailable','unavailable','review_unavailable','target_changed','approval_required','proposal_consumed']);
 export type OwnerWebReadRejection=z.infer<typeof ownerWebReadRejectionSchema>;
 export function webReadAdmissionMatches(text:string,args:OwnerWebReadArgs):boolean {
-  if(!('operation' in args)){if(readCancelled(text))return false;if(args.reply_target&&!contextualReadRequest(text)&&!ownerReadRequest(text))return false;if(!args.reply_target)return ownerWebReadUrlMatches(text,args.url);const tokens=[...new Set(ownerUrlTokens(args.reply_target.text))];return ownerUrlTokens(text).length===0&&tokens.length===1&&ownerWebReadUrlMatches(args.reply_target.text,args.url)&&args.source_revision===args.reply_target.source_revision;}
+  if(!('operation' in args)){if(readCancelled(text))return false;if(args.reply_target&&!ownerReadRequest(text))return false;if(!args.reply_target)return ownerWebReadUrlMatches(text,args.url);const tokens=[...new Set(ownerUrlTokens(args.reply_target.text))];return ownerUrlTokens(text).length===0&&tokens.length===1&&ownerWebReadUrlMatches(args.reply_target.text,args.url)&&args.source_revision===args.reply_target.source_revision;}
   if(args.operation==='confirm_docsend')return validDocsendReview(args.review);
   if(args.passcode!==undefined&&!text.includes(args.passcode))return false;
   if(args.operation==='propose_docsend')return true;

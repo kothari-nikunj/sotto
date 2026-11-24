@@ -12,14 +12,14 @@ test('targeted contact results keep same-name candidates and omit unrelated priv
   const rows = Array.from({length: 2000}, (_, i) => ({name: `Other Contact ${i}`,
     phones: ['+15555550000'], emails: [`other${i}@example.test`], notes: 'private '.repeat(100)}));
   rows.push({name: 'Dana Reed', phones: ['+14155550123'], emails: ['dana@one.test'], notes: 'private first'});
-  rows.push({name: 'Dana Reed', phones: ['+442055550123'], emails: ['dana@two.test'], notes: 'private second'});
+  rows.push({name: 'Dana Reed', phones: ['+442079460123'], emails: ['dana@two.test'], notes: 'private second'});
   const result = searchContactResult(wrapped(rows), 'Dana Reed', 10);
   assert.equal(unpack(result).contacts.length, 2);
   assert.equal(unpack(result).matched, 2);
   assert.equal(unpack(result).truncated, false);
   assert.ok(JSON.stringify(result).length < 1000);
   assert.ok(!JSON.stringify(result).includes('private'));
-  assert.equal(unpack(searchContactResult(wrapped(rows), 'dana@two.test', 10)).contacts[0].phones[0], '+442055550123');
+  assert.equal(unpack(searchContactResult(wrapped(rows), 'dana@two.test', 10)).contacts[0].phones[0], '+442079460123');
   assert.equal(unpack(searchContactResult(wrapped(rows), '+1 (415) 555-0123', 10)).contacts.length, 1);
   assert.equal(unpack(searchContactResult(wrapped(rows), 'Dana Reed', 1)).truncated, true);
   assert.equal(unpack(searchContactResult(wrapped(rows), 'missing', 10)).matched, 0);

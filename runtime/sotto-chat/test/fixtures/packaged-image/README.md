@@ -25,6 +25,10 @@ These are targeted checks for the retired integration; they do not claim to dete
 renamed or deliberately concealed implementation. Unit tests plant each rejected artifact shape
 to keep the check sensitive. Running those unit tests alone is not a built-image verification.
 
+Two fresh Python workers run accepted-offer and direct meeting prep against a fictional named
+attendee. Source reads and the model response use fixtures. Both workers must return the
+expected prep through the installed procedure, including the real composer and knowledge lookup.
+
 The Node contract test imports compiled runtime modules from `/app` and the packaged Python
 client from `/app/adapters/sotto`. It checks fixed and first-contact activation through a
 loopback HTTP listener, using synthetic identities and credentials. It does not exercise a

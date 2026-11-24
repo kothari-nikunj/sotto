@@ -30,31 +30,31 @@ def test_notes_to_prep_to_specific_fulfillment_once(tmp_path, monkeypatch):
     meeting = {
         'meeting_id': 'granola-1', 'title': 'Dana sync',
         'start': '2026-09-18T16:00:00Z', 'end': '2026-09-18T17:00:00Z',
-        'attendees': [{'email': 'nikunj@example.com', 'name': 'Nikunj Kothari'},
+        'attendees': [{'email': 'casey@example.com', 'name': 'Casey Lindgren'},
                       {'email': 'dana@acme.com', 'name': 'Dana'}],
-        'attendee_emails': ['nikunj@example.com', 'dana@acme.com'],
-        'your_notes': "Nikunj: I'll send Dana the deck.",
+        'attendee_emails': ['casey@example.com', 'dana@acme.com'],
+        'your_notes': "Casey: I'll send Dana the deck.",
     }
     monkeypatch.setattr(capture.compose_followup, 'build_context',
                         lambda inputs, _hours: ('grounded', inputs['granola']))
     monkeypatch.setattr(capture.compose_followup, 'compose', lambda *_args, **_kwargs: {
         'followup_markdown': 'Send Dana the deck.', 'drafts': [],
-        'commitments': [{'meeting_id': 'granola-1', 'owner': 'Nikunj',
+        'commitments': [{'meeting_id': 'granola-1', 'owner': 'Casey',
                          'owner_is_user': True, 'what': 'send Dana the deck',
                          'to_email': 'dana@acme.com',
-                         'source_snippet': "Nikunj: I'll send Dana the deck."}]})
+                         'source_snippet': "Casey: I'll send Dana the deck."}]})
 
     captured = capture.extract_apply_meeting(
-        meeting, 'nikunj@example.com', data_root=str(tmp_path))
+        meeting, 'casey@example.com', data_root=str(tmp_path))
     assert captured['ledger']['written'] == 1
     anchor = captured['ledger']['recorded_anchor_keys'][0]
     row = resolver._load_items()[anchor]
     assert row['resolution_mode'] == 'source_grounded' and row['status'] == 'open'
 
     upcoming = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
-    context, _ = prep.build_context({'google': {'userEmail': 'nikunj@example.com', 'events': [{
+    context, _ = prep.build_context({'google': {'userEmail': 'casey@example.com', 'events': [{
         'id': 'next-dana', 'summary': 'Dana follow-up', 'start': upcoming,
-        'attendees': [{'email': 'nikunj@example.com', 'self': True},
+        'attendees': [{'email': 'casey@example.com', 'self': True},
                       {'email': 'dana@acme.com', 'displayName': 'Dana'}]}]}})
     assert 'send Dana the deck' in context and '[you owe]' in context
 

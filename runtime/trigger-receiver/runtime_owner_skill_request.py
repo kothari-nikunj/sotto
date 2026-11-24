@@ -5,7 +5,7 @@ import re
 
 from runtime_meeting_prep_selection import validate_selection as validate_meeting_prep_selection
 
-from runtime_read_admission import (READ_CONTEXT_WINDOW_MS, owner_read_request, contextual_read_request,
+from runtime_read_admission import (READ_CONTEXT_WINDOW_MS, owner_read_request,
                                     owner_subject_mention, valid_research_subject, research_target_answer, explicit_read_reference,
                                     prep_research_request)
 
@@ -191,7 +191,6 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation, qu
         subject = args['selection'].get('company', args['selection'].get('person', ''))
         if (not valid_research_subject(subject, args['selection']['mode'])
                 or not (research_target_answer(body['text'], subject, args['selection']['mode']) if 'prior_request' in args
-                        else contextual_read_request(body['text']) if 'prior_selection' in args
                         else owner_read_request(body['text']))):
             return {'version': 1, 'status': 'rejected', 'code': 'needs_context'}
     if 'source_revision' in args:
@@ -276,6 +275,8 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation, qu
                              **({'skill': 'ask-research', 'question': question}
                                 if body['args']['skill'] == 'ask-research' else
                                 {'skill': body['args']['skill']} if body['args']['skill'] in ('followup', 'relationship-pulse', 'proactive') else {}))
+    except queue.AdmissionWindowClosedError:
+        return {'version': 1, 'status': 'rejected', 'code': 'prep_window_closed'}
     except ValueError as error:
         if str(error) == 'work admission conflict':
             return {'version': 1, 'status': 'rejected', 'code': 'event_conflict'}

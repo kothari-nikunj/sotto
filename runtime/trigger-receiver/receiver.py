@@ -79,6 +79,7 @@ _humanize_ago = SETUP_MARKUP._humanize_ago
 _tile = SETUP_MARKUP._tile
 _plain_tile = SETUP_MARKUP._plain_tile
 WORK_QUEUE = _load_shared_lib('work_queue')
+REQUESTED_PREP = _load_shared_lib('requested_meeting_prep')
 REQUESTED_BRIEF = _load_shared_lib('requested_brief')
 RUNTIME_OWNER_BRIEF_REQUEST = _load_shared_lib('runtime_owner_brief_request')
 RUNTIME_OWNER_MEETING_PREP_REQUEST = _load_shared_lib('runtime_owner_meeting_prep_request')
@@ -173,6 +174,12 @@ CLAIM_STALE_SECS = _load_shared_lib("funnel_policy").CLAIM_STALE_SECS
 # once and persisted (0600). Printed to stdout at boot as a full setup URL, so the user grabs it
 # from the deploy logs.
 SETUP_CODE = None
+# Wrong /setup?code= guesses, counted per socket peer (never a client-supplied header). After
+# SETUP_FAIL_FREE, each further wrong guess waits; a right code is always compared and always works.
+SETUP_FAIL_FREE = 5
+SETUP_FAIL_DELAY_SECS = 1.0
+_SETUP_FAILS: dict = {}
+_SETUP_FAILS_LOCK = threading.Lock()
 
 
 def resolve_setup_code() -> str:
@@ -299,15 +306,19 @@ def _dashboard_loop_rows():
 # Last live Bridge consent tokens seen by this process, keyed by data root, mode and tenant.
 # They keep the revision about consent, not Mac availability; they never grant a Bridge source.
 _BRIDGE_CONSENT_SEEN = {}
+# Last successful health probe per key, reused by MCP before-read checks for BRIDGE_PROBE_CACHE_SECS.
+_BRIDGE_PROBE_CACHE = {}
+BRIDGE_PROBE_CACHE_SECS = 30
 
 
-def _runtime_source_authority(*, include_search_policy=False) -> dict:
+def _runtime_source_authority(*, include_search_policy=False, bridge_probe='live', report_probe_failure=False) -> dict:
     """Bind independent Bridge, Google and connector evidence to current consent generations.
 
     `bridge_sources` is live availability; the revision binds Bridge *consent* tokens. A sleeping
     Mac or a timed-out probe empties `bridge_sources` but keeps the revision, so a Google-only
     approval survives it, while any Bridge, cloud, ledger, Google or connector consent change still
-    changes the revision.
+    changes the revision. `bridge_probe='cached'` reuses a recent probe; `'none'` checks consent
+    only (no Bridge round trip, so `bridge_sources` is empty and the revision uses seen consent).
     """
     unavailable = {'version': 2, 'revision': None, 'complete': False,
                    'bridge_sources': [], 'google_sources': [], 'connector_sources': []}
@@ -338,18 +349,34 @@ def _runtime_source_authority(*, include_search_policy=False) -> dict:
             Path(DATA) / 'connectors/granola.json'))
         policy = None
         local_search = {'status': 'unknown'}
-        if RELAY.bridge_connected():
+        probe_failure = 'bridge_offline' if bridge_probe != 'none' else None
+        seen_key = (str(DATA), managed_mode, os.environ.get('SOTTO_TENANT_ID', '') if managed_mode else '')
+        cached = _BRIDGE_PROBE_CACHE.get(seen_key) if bridge_probe == 'cached' else None
+        # A cached probe is reused only while it is still the newest consent seen (never a rollback).
+        if (cached and time.monotonic() - cached[0] <= BRIDGE_PROBE_CACHE_SECS
+                and cached[1] == _BRIDGE_CONSENT_SEEN.get(seen_key) and RELAY.bridge_connected()):
+            policy, local_search = cached[1], cached[2]
+            probe_failure = None
+        elif bridge_probe != 'none' and RELAY.bridge_connected():
+            probe_failure = 'internal'
             try:
                 request = {'jsonrpc': '2.0', 'id': 'source-authority', 'method': 'tools/call',
                            'params': {'name': 'health', 'arguments': {}}}
                 response = RELAY.mcp_call(request, timeout=2.0)
                 result = response.get('result') if isinstance(response, dict) else None
+                if isinstance(response, dict) and (response.get('error') or {}).get('code') == -32001:
+                    probe_failure = 'timeout'
                 if (isinstance(result, dict) and not response.get('error')
                         and result.get('isError') is not True):
                     source = _source_context()
                     health = source.unwrap_tool_result(result)
                     policy = source.bridge_source_policy(health, managed_mode)
                     local_search = source.bridge_search_policy(health)
+                    if policy:
+                        _BRIDGE_PROBE_CACHE[seen_key] = (time.monotonic(), policy, local_search)
+                        probe_failure = None
+                    elif isinstance(health, dict) and health.get('connected') is False:
+                        probe_failure = 'bridge_offline'
             except Exception:  # noqa: BLE001 - a failed Mac probe never erases independent Google consent
                 pass
         ledger_after = managed.source_authority_state(DATA) if managed_mode else None
@@ -381,7 +408,6 @@ def _runtime_source_authority(*, include_search_policy=False) -> dict:
         if corrections_after != corrections_before:
             return unavailable
         bridge_usable = managed_mode or selfhost_before is not None
-        seen_key = (str(DATA), managed_mode, os.environ.get('SOTTO_TENANT_ID', '') if managed_mode else '')
         if policy and bridge_usable:
             _BRIDGE_CONSENT_SEEN[seen_key] = policy
         consent = policy or _BRIDGE_CONSENT_SEEN.get(seen_key)
@@ -413,6 +439,8 @@ def _runtime_source_authority(*, include_search_policy=False) -> dict:
         if include_search_policy:
             # MCP status needs capability metadata; the chat authority wire contract is strict.
             result['local_search'] = local_search if policy and bridge_usable else {'status': 'unknown'}
+        if report_probe_failure and probe_failure:
+            result['bridge_probe'] = probe_failure  # Unavailable health does not establish a grant.
         return result
     except Exception:  # noqa: BLE001 - unavailable policy is never an access grant
         return unavailable
@@ -574,9 +602,10 @@ OUTBOX.HOOKS.update({
     "on_delivered": lambda payload: _on_delivered(payload),
     "offer_route": lambda payload: _capture_offer_route(payload),
     "valid": lambda payload: _delivery_valid(payload),
+    "refresh_brief_offer": lambda payload: _refresh_brief_offer(payload),
     "delivery_ready": lambda payload: _history_discovery_delivery_ready(payload),
     "on_invalid": lambda payload: _invalid_delivery(payload),
-    "on_terminal": lambda row: _owner_timer_terminal(row),
+    "on_terminal": lambda row: _outbox_terminal(row),
     # A run that exited 0 with a non-brief body is a run that died, as far as the day is concerned:
     # the same one bounded re-fire a crash gets (review, Sep 3 — without it the cron lane on a
     # no-Mac deploy had a nicer receipt and still no brief).
@@ -587,8 +616,12 @@ OUTBOX.HOOKS.update({
     "brief_gate": lambda label, day, run_id: _brief_delivery_gate(label, day, run_id),
     "routine_authorized": lambda payload: _routine_outbox_authorized(payload),
     "retained_proof_current": lambda proof: _retained_proof_current(proof),
+    "handoff_context": lambda label: _composition_evidence(label),
 })
 DASHBOARD.HOOKS["outbox_counts"] = lambda: OUTBOX.counts()
+# A set-aside outbox loses its queued rows. The Record says so once, whichever reader set it aside.
+CONNECTORS.on_set_aside = lambda p: p == OUTBOX.path() and _record_delivery(
+    'state:outbox', 'failed', 'delivery records unreadable; set aside')
 
 # The retention sweep (external review finding #5: the volume accumulated exhaust with no automatic
 # expiry). It owns THE table of what the volume keeps and for how long; this module owns only the
@@ -807,7 +840,7 @@ def _discovery_interruption_policy():
 
 def _history_discovery_delivery_ready(payload):
     import onboarding
-    reminder_notice = payload.get('label', '').startswith('owner-reminder-status:')
+    reminder_notice = payload.get('label', '').startswith(OUTBOX.OWNER_STATUS_PREFIXES)
     if payload.get('label') != onboarding.DISCOVERY_LABEL and not reminder_notice:
         return True
     policy = _discovery_interruption_policy()
@@ -818,7 +851,7 @@ def _history_discovery_delivery_ready(payload):
             or policy._prefs.effective_nudge_budget(explicit) <= 0):
         return False
     if reminder_notice:
-        return True  # status of an explicitly requested timer; quiet hours still apply
+        return True  # an owner status notice; quiet hours and snooze still apply
     # The same daily interrupt budget as every proactive send. The admission check only asks;
     # the send seam spends one unit under the run's stable reservation, so retries ride it free.
     day = policy._local_day(now)
@@ -1010,76 +1043,38 @@ def _record_delivery(label: str, status: str, detail: str = "", usage: dict | No
         pass
 
 
-# Machine markers (<!--id:…-->, <!--meeting:…-->) are dashboard/tap-link plumbing the composer
-# strips when it renders the chat artifact (chatfmt.to_chat) — but the spawned run CHOOSES which
-# artifact it prints, and one runtime upgrade was enough for a run to print the marker-laden
-# markdown instead (Aug 28: an evening brief arrived with every id inline). The send seam now
-# enforces what the composer intends: nothing shaped like a comment marker ever leaves the box,
-# whichever artifact a run printed. Vendored from chatfmt._MARKER_RE, its owner — test_docs_drift
-# pins the two patterns byte-identical, the same contract keys.py lives under.
-_MARKER_RE = re.compile(r"<!--.*?-->", re.S)
-
-# Email asks, every other channel links — one rule, stated in every skill that hands a draft over,
-# and on Sep 4, 2026 a nudge still arrived with BOTH the ask and a 200-character percent-encoded
-# `mailto:` on a "Tap to send:" line, which Telegram does not linkify (a mailto with a query is
-# plain text there) and which on a phone opens whatever mail app the OS picks. Every run this
-# process delivers is unattended, and an unattended run's email path is the Gmail-draft offer the
-# user answers in chat — so a `mailto:` has no legitimate way to reach the channel from here. The
-# seam removes it: a markdown link keeps its label, a bare URL disappears, and a line that was only
-# the URL and its "tap to send" prefix goes with it.
-_MAILTO_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(\s*mailto:[^)]*\)")
-_MAILTO_URL_RE = re.compile(r"<?mailto:[^\s<>\]\)]+>?")
-_MAILTO_STUB_RE = re.compile(r"[\W_]*(?:tap\s+(?:to\s+send|here)|send|reply)?[\W_]*", re.I)
-# Interactive replies and scheduled messages use the same recipient rules.
 MESSAGE_TARGETS = _load_shared_lib('message_targets')
+_MARKER_RE = MESSAGE_TARGETS.HTML_COMMENT_RE
+_strip_mailto = MESSAGE_TARGETS.strip_unattended_links
+_delivery_body = MESSAGE_TARGETS.delivery_body
 
 
-def _strip_mailto(text: str) -> str:
-    """Remove every `mailto:` link, and every other tap link whose recipient message_targets does
-    not validate (phone 7-15 digits, a Messages short code, or an Apple ID email) — keeping its
-    label text if it had one — from a message body, and any line that was nothing but one."""
-    text = MESSAGE_TARGETS.strip_invalid_links(text)
-    if "mailto:" not in text:
-        return text
-    kept = []
-    for line in text.split("\n"):
-        rest = line
-        if "mailto:" in rest:
-            rest = _MAILTO_URL_RE.sub("", _MAILTO_MD_LINK_RE.sub(r"\1", rest))
-        if rest == line:
-            kept.append(line)
-            continue
-        if _MAILTO_STUB_RE.fullmatch(rest):
-            continue
-        kept.append(rest.rstrip())
-    return "\n".join(kept)
-
-
-def _send_with_identity(body: str, target: str, dispatch_id: str, attempt: int, *, source_revision=None):
+def _send_with_identity(body: str, target: str, dispatch_id: str, attempt: int, **context):
     """Transport acceptance comes from the same adapter in Cloud and self-host."""
     if (os.environ.get('SOTTO_RUNTIME_PROFILE') in (
             'self-host-telegram-fixed-five-v1', 'self-host-photon-fixed-five-v1')
             and _candidate_retained_route_digest() is None):
         return False, 'Owner route unavailable', {'acceptance': 'not_attempted'}
-    return _runtime_adapter().send_receipt(body, target, SEND_TIMEOUT_SECS, dispatch_id, attempt, **({'source_revision': source_revision} if source_revision is not None else {}))
+    return _runtime_adapter().send_receipt(body, target, SEND_TIMEOUT_SECS, dispatch_id, attempt, **context)
 
 
-def _send_gallery_with_current_route(presentation, target: str, dispatch_id: str):
+def _send_gallery_with_current_route(presentation, target: str, dispatch_id: str, **context):
     if (os.environ.get('SOTTO_RUNTIME_PROFILE') in (
             'self-host-telegram-fixed-five-v1', 'self-host-photon-fixed-five-v1')
             and _candidate_retained_route_digest() is None):
         return False, 'Owner route unavailable', {'acceptance': 'not_attempted'}
-    return _runtime_adapter().send_gallery(presentation, target, dispatch_id, SEND_TIMEOUT_SECS)
+    return _runtime_adapter().send_gallery(presentation, target, dispatch_id, SEND_TIMEOUT_SECS, **context)
 
 
-def _release_invalid_brief_claim(payload):
-    """Release only our invalidated, demonstrably unaccepted claim; never infer from absence of ACK."""
-    label = payload.get('label') or ''
-    name = label.rsplit(':', 1)[-1]
+def _release_brief_claim(label, day, run_id, unaccepted):
+    """Remove this run's day marker when `unaccepted()` proves its send never reached the provider.
+
+    'open' (no reservation, or released), 'other_owner', or 'uncertain' (kept). The marker is
+    written at the send seam before the provider answers, so only that proof may release it."""
+    name = (label or '').rsplit(':', 1)[-1]
     kind = MARKED_BRIEF_KINDS.get(name)
-    run_id, day = payload.get('run_id'), payload.get('day')
     if not kind or not run_id or not day:
-        return 'open'  # old pre-claim invalidation payloads carry no reservation to release
+        return 'open'  # old pre-claim payloads carry no reservation to release
     import onboarding
     marker = delivered_marker(day, 'history-discovery' if label == onboarding.DISCOVERY_LABEL else kind)
     with CONNECTORS.file_lock(marker):
@@ -1089,11 +1084,46 @@ def _release_invalid_brief_claim(payload):
             return 'open'  # idempotent retry after release but before replacement enqueue
         if owner != run_id:
             return 'other_owner'
-        if not OUTBOX.invalidated_claim(run_id, day, label):
+        if not unaccepted():
             return 'uncertain'
         os.unlink(marker)
     _CRON_FIRED.pop(name, None)
     return 'open'
+
+
+def _release_invalid_brief_claim(payload):
+    """Release only our invalidated, demonstrably unaccepted claim; never infer from absence of ACK."""
+    label = payload.get('label') or ''
+    run_id, day = payload.get('run_id'), payload.get('day')
+    return _release_brief_claim(label, day, run_id,
+                                lambda: OUTBOX.invalidated_claim(run_id, day, label))
+
+
+def _release_failed_brief_claim(row):
+    """A brief that provably never sent gives its day back; an uncertain one keeps it.
+
+    Without this, a claimed brief whose every attempt was refused left `<day>.<kind>.delivered`
+    on the volume, so the cron and the other lane both treated the day as delivered. Failed or
+    expired does not matter (a 2 h `valid_until` ends a refused brief long before MAX_ATTEMPTS);
+    only `OUTBOX.definitely_unsent` does. Superseded rows release through their invalidate effect."""
+    label = (row.get('payload') or {}).get('label') or ''
+    if row.get('status') not in (OUTBOX.STATUS_FAILED, OUTBOX.STATUS_EXPIRED):
+        return True
+    run_id = str((row.get('payload') or {}).get('run_id') or row.get('id') or '')
+    try:
+        claim = _release_brief_claim(
+            label, str(row.get('day') or ''), run_id, lambda: OUTBOX.definitely_unsent(row))
+    except OSError:
+        return False  # the outbox keeps the row and asks again on the next pass
+    if claim == 'open' and MARKED_BRIEF_KINDS.get(label.rsplit(':', 1)[-1]):
+        print(f'[sotto] {label}: send failed before the provider accepted it — '
+              'the day is open for another brief', flush=True)
+    return True
+
+
+def _outbox_terminal(row):
+    """Producer bookkeeping the outbox runs once per terminal row, retried until it returns True."""
+    return _release_failed_brief_claim(row) and _owner_timer_terminal(row)
 
 
 def _invalid_delivery(payload):
@@ -1192,6 +1222,9 @@ def _owner_timer_reserved(reminder_id):
 # An explicit timer loses its purpose quickly; retry from its requested time, not enqueue time.
 OWNER_REMINDER_GRACE_SECS = 15 * 60
 OWNER_REMINDER_NOTICE_MAX_AGE_SECS = 24 * 60 * 60
+# Content-free on purpose: the route binding exists so reminder text never reaches another line.
+OWNER_REMINDER_ORPHANED_NOTICE = ("A reminder you set earlier couldn't be delivered on time, so I canceled it. "
+                                  "Ask me to set it again if you still need it.")
 _OWNER_REMINDER_NOTICE_LOCK = threading.Lock()
 
 
@@ -1228,9 +1261,9 @@ def _owner_timer_notice_body(rows, zone=None):
     if len(rows) == 1:
         return ("I couldn't deliver your reminder on time: " + _owner_timer_notice(rows[0], zone)
                 + ". It has been canceled; I won't send it late.")
-    return ("I couldn't deliver these reminders on time:\n"
+    return ("I couldn't deliver these reminders on time:\n\n"
             + '\n'.join('• ' + _owner_timer_notice(row, zone) for row in rows)
-            + "\nThey have been canceled; I won't send them late.")
+            + "\n\nThey have been canceled; I won't send them late.")
 
 
 def _owner_timer_notices(store, identity, thread, notice_ids):
@@ -1240,8 +1273,7 @@ def _owner_timer_notices(store, identity, thread, notice_ids):
         with OUTBOX.HOOKS['json_transaction'](OUTBOX.path(), default={'rows': []}) as doc:
             reserved = {ident for delivery in OUTBOX._rows(doc)
                         if not (delivery.get('status') == OUTBOX.STATUS_EXPIRED
-                                and delivery.get('acceptance') in ('not_attempted', 'rejected')
-                                and not delivery.get('acceptance_uncertain'))
+                                and OUTBOX.definitely_unsent(delivery))
                         for ident in _owner_timer_notice_ids(delivery.get('payload', {}).get('label', ''))}
         candidates = []
         for row in store.current(strict=True):
@@ -1279,8 +1311,7 @@ def _owner_timer_terminal(delivery):
         for notice_id in _owner_timer_notice_ids(label):
             # Only the expired members end here; a definitely unaccepted batch can be
             # replaced by its still-useful subset on the next heartbeat. Unknowns never can.
-            if (delivery['status'] == OUTBOX.STATUS_EXPIRED
-                    and delivery.get('acceptance') in ('not_attempted', 'rejected')
+            if (delivery['status'] == OUTBOX.STATUS_EXPIRED and OUTBOX.definitely_unsent(delivery)
                     and notice_id in rows and time.time() < _owner_timer_notice_deadline(rows[notice_id])):
                 continue
             store.mark_delivery_notice(notice_id, delivery['status'])
@@ -1312,13 +1343,21 @@ def _owner_reminder_tick():
         return
     identity, thread = _owner_timer_authority()
     for row in due:
-        if (RUNTIME_OWNER_REMINDER_TOOL.timer_current(row, identity, thread)
-                and not _owner_timer_reserved(row['id'])):
+        if _owner_timer_reserved(row['id']):
+            pass
+        elif RUNTIME_OWNER_REMINDER_TOOL.timer_current(row, identity, thread):
             label = 'owner-reminder:' + row['id']
             deadline = _owner_timer_deadline(row)
             _deliver_text(row['action'], label, run_id=label, valid_until=deadline, effects=[
                 {'kind': 'eligibility', 'intention_id': row['id']},
                 {'kind': 'intention', 'id': row['id']}])
+        elif time.time() >= _owner_timer_deadline(row):
+            # Bound to a route or proof that is no longer current: end it once, without its text.
+            label = 'owner-reminder-orphaned:' + row['id']
+            _deliver_text(OWNER_REMINDER_ORPHANED_NOTICE, label, run_id=label,
+                          valid_until=_owner_timer_notice_deadline(row))
+            store.mark_undelivered(row['id'], 'superseded')
+            store.mark_delivery_notice(row['id'], 'superseded')
         OUTBOX.reconcile_terminal()
     # Never enqueue inside the terminal hook: it runs under the outbox transaction.
     _owner_timer_notices(store, identity, thread, {row["id"] for row in notices})
@@ -1379,7 +1418,10 @@ def _delivery_valid(payload):
         if not _requested_telegram_job_current(requested_job, label=requested_label,
                                                target=payload.get('target')):
             return False
-    if (_scheduled_pulse_label(payload.get('label')) or payload.get('label') == 'onboarding:history-discovery:sotto-welcome-brief' or payload.get('label', '').startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', payload.get('label', ''))) and not _retained_proof_current({
+    if (_requires_offer_route(payload) and payload.get('prep_route_digest')
+            and (route := _candidate_retained_route_digest()) and route != payload['prep_route_digest']):
+        return False  # A proven route change supersedes the offer before provider contact.
+    if OUTBOX.requires_source_scope(requested_label) and not _retained_proof_current({
             'source_revision': payload.get('prep_source_revision'),
             'route_digest': payload.get('prep_route_digest')}):
         return False
@@ -1407,6 +1449,14 @@ def _delivery_valid(payload):
     return not effects or _shared_effects().valid(effects, time.time())
 
 
+def _refresh_brief_offer(payload):
+    if not any(e.get('offer', {}).get('action') == 'contextual_draft' for e in payload.get('effects', [])):
+        return payload
+    _shared_effects()
+    from brief_followup_offer import prune_queued_offer
+    return prune_queued_offer(payload)
+
+
 def _shared_effects():
     cached = getattr(_shared_effects, '_module', None)
     if cached is not None:
@@ -1423,11 +1473,6 @@ def _shared_effects():
         sys.path[:] = list(dict.fromkeys([*added, *before]))
     _shared_effects._module = module
     return module
-
-
-def _delivery_body(text: str) -> str:
-    body = _strip_mailto(_MARKER_RE.sub('', text or ''))
-    return re.sub(r'\n{3,}', '\n\n', body).strip()
 
 
 def _candidate_retained_route_proof():
@@ -1592,28 +1637,25 @@ def _retained_proof_current(proof):
             and route_before == route_after == proof['route_digest'])
 
 
-def _scheduled_pulse_label(label):
-    return label in ('cron:sotto-relationship-pulse', 'run-now:sotto-relationship-pulse')
-
-
-def _composition_evidence(label):
+def _composition_evidence(label, *, task_nudge=False, **probe_options):
     if (label.startswith('preview:')
-            or not (_scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith('routine:fresh:') or 'prep' in label or re.fullmatch(r'skill:[a-f0-9]{64}:(?:ask-research|followup|relationship-pulse|proactive)', label) or label.split(':')[-1] in (
-                'sotto-morning-brief', 'sotto-evening-brief', 'morning-brief', 'evening-brief'))):
+            or not (task_nudge or OUTBOX.delivery_proof().notification_label(label) or OUTBOX.requires_source_scope(label)
+                    or label.startswith(('routine:fresh:', *OUTBOX.HANDOFF_CONTEXT_PREFIXES)) or 'prep' in label or label.split(':')[-1] in (
+                'sotto-morning-brief', 'sotto-evening-brief', 'morning-brief', 'evening-brief', 'sotto-midday-digest'))):
         return None
     try:
         target = _deliver_target()
-        if target != 'photon' and not (target == 'telegram' and (_scheduled_pulse_label(label) or label.startswith('routine:fresh:') or REQUESTED_BRIEF.LABEL.fullmatch(label) or label == 'onboarding:history-discovery:sotto-welcome-brief')):
+        if target != 'photon' and not (target == 'telegram' and (OUTBOX.scheduled_pulse(label) or label.startswith('routine:fresh:') or REQUESTED_BRIEF.LABEL.fullmatch(label) or label == 'onboarding:history-discovery:sotto-welcome-brief')):
             return None
         route_before = _candidate_retained_route_digest()
         if not isinstance(route_before, str) or re.fullmatch(r'[a-f0-9]{64}', route_before) is None:
             return None  # unmounted route proof never slows or changes ordinary delivery
-        authority = _runtime_source_authority()
+        authority = _runtime_source_authority(**probe_options)
         route_after = _candidate_retained_route_digest()
     except Exception:
         return None
     revision = authority.get('revision')
-    if (authority.get('complete') is not True or not isinstance(revision, str)
+    if (authority.get('complete') is not True or authority.get('bridge_probe') or not isinstance(revision, str)
             or re.fullmatch(r'[a-f0-9]{64}', revision) is None or route_before != route_after):
         return None
     return {'source_revision': revision, 'route_digest': route_before}
@@ -1627,7 +1669,7 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
                   route_digest_at_composition: str | None = None,
                   source_text_sha256: str | None = None,
                   research_evidence: dict | None = None,
-                  reminder_timezone: str | None = None) -> bool | dict:
+                  reminder_timezone: str | None = None, prep_meeting_start: float | None = None) -> bool | dict:
     """Hand one skill's final text to the channel, THROUGH THE OUTBOX. Silence is a legitimate
     outcome for every one of these skills ("if there's nothing, say nothing"), so an empty run is
     recorded and never enqueued — an empty message would be the busywork theater the standing bars
@@ -1661,6 +1703,7 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
             WORK_QUEUE.get(DATA, run_id), label=label, target=target):
         raise _WorkDeferredError('requested brief authority unavailable')
     presentation = None
+    visible_lines = []
     presentation_status = {}
     try:
         text_digest_matches = (isinstance(source_text_sha256, str)
@@ -1668,11 +1711,19 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
             and hashlib.sha256(body.encode('utf-8')).hexdigest() == source_text_sha256)
     except UnicodeError:
         text_digest_matches = False
-    evidence = (_composition_evidence(label)
-                if source_revision_at_composition is not None and text_digest_matches else None)
+    evidence = None
+    if source_revision_at_composition is not None and text_digest_matches:
+        evidence = (_composition_evidence(label, task_nudge=True) if label in OUTBOX.TASK_CONTEXT.SCHEDULED_NUDGES
+                    else _composition_evidence(label))
     candidate_route = (evidence['route_digest'] if evidence
         and evidence['source_revision'] == source_revision_at_composition
         and evidence['route_digest'] == route_digest_at_composition else None)
+    if OUTBOX.feedback_skill(label) == 'meeting-prep' and not candidate_route:
+        current = evidence if source_revision_at_composition and text_digest_matches else _composition_evidence(label)
+        if not current:
+            raise _WorkDeferredError('prep authority unavailable')
+        REQUESTED_PREP.reject_handoff(WORK_QUEUE.get(DATA, run_id), current['route_digest'],
+            route_digest_at_composition, source_text_sha256 is not None and not text_digest_matches)
     offers = [e.get('offer', {}) for e in effects if e.get('kind') == 'pending_offer']
     if all(offer.get('kind') == 'handoff' for offer in offers):
         # Consent/procedure offers keep their exact-text contract. Brief handoffs may
@@ -1686,16 +1737,18 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
                                _runtime_adapter().gallery_available, diagnostics=presentation_status,
                                retained_source_revision=(source_revision_at_composition
                                                          if candidate_route else None),
-                               candidate_route_digest=candidate_route,
+                               candidate_route_digest=candidate_route, visible_lines=visible_lines,
                                **({'research_evidence': research_evidence} if research_evidence is not None and candidate_route else {}),
                                **({'required_questions': tuple(o['question'] for o in offers)} if offers else {}))
-    if (requested_telegram or _scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label)) and not candidate_route:
+    if (requested_telegram or OUTBOX.requires_source_scope(label)) and not candidate_route:
         raise _WorkDeferredError('meeting prep composition authority changed')
     payload = {"label": label, "body": body, "target": target,
                            "presentation": presentation, "presentation_status": presentation_status,
                            "usage": usage, "decision_ids": decision_ids,
                            "effects": effects or [], "run_id": run_id, "valid_until": valid_until,
                            "not_before": not_before, "coverage_until": coverage_until}
+    if prep_meeting_start is not None:
+        payload['prep_meeting_start'] = prep_meeting_start
     if presentation is None and research_evidence is not None and candidate_route:
         try:
             payload['retained_text_artifact'] = _load_shared_lib('visual_delivery').retain_text(
@@ -1705,9 +1758,19 @@ def _deliver_text(text: str, label: str, usage: dict | None = None,
             print(f'text_retention_fallback error={type(error).__name__}', file=sys.stderr)
     if reminder_timezone is not None and _owner_timer_notice_ids(label):
         payload["reminder_timezone"] = reminder_timezone
-    if (requested_telegram or _scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label)):
+    if candidate_route and target == 'photon' and ('prep' in label or MARKED_BRIEF_KINDS.get(label.rsplit(':', 1)[-1]) in ('morning', 'evening')
+            or any(e.get('kind') == 'eligibility' and e.get('anchor_key') for e in effects)):
+        _shared_effects()
+        OUTBOX.TASK_CONTEXT.attach(payload, evidence, visible_lines=visible_lines)
+    if candidate_route and OUTBOX.delivery_proof().notification_label(label):
+        payload['notification_feedback_scope'] = evidence
+    if (requested_telegram or OUTBOX.requires_source_scope(label)):
         payload['prep_source_revision'] = source_revision_at_composition
         payload['prep_route_digest'] = route_digest_at_composition
+    elif candidate_route and presentation is None and target == 'photon':
+        # Any proved Photon text, offers included, can be reply context; tasks still need a snapshot.
+        payload['prep_source_revision'] = source_revision_at_composition
+        payload['prep_route_digest'] = candidate_route
     if routine_proof:
         if not run_id:
             raise RuntimeError('routine delivery requires a work identity')
@@ -1739,6 +1802,8 @@ def _spawn_env(run_id: str = "") -> dict:
     env = {**os.environ, "SOTTO_UNATTENDED": "1"}
     env.pop('SOTTO_CHAT_SEND_TOKEN', None)
     env.pop("SOTTO_CONTROL_TOKEN", None)
+    env.pop("SOTTO_BRIEF_FEEDBACK_PROOF", None)
+    env.pop("SOTTO_SKILL_COMPOSITION_PROOF", None)
     if run_id:
         env["SOTTO_DELIVERY_RUN_ID"] = run_id
     return env
@@ -1921,6 +1986,10 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str,
     now = _local_now()
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     validity = tomorrow.timestamp() if OUTBOX.kind_for(label) != OUTBOX.KIND_NUDGE else time.time() + 4 * 3600
+    requested_prep = OUTBOX.feedback_skill(label) == 'meeting-prep'
+    if requested_prep:
+        prep_until, feedback = RUNTIME_OWNER_MEETING_PREP_REQUEST.admission_window(prompt, time.time(), feedback)
+        validity = min(validity, prep_until)
     if label.startswith('cron:'):
         schedule = next((job[1] for job in _sotto_cron_jobs() if job[0] == label[5:]), '')
         at = _fixed_daily_minute(schedule)
@@ -1934,8 +2003,7 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str,
     if _selected_fixed_profile() and label.startswith('cron:'):
         name = label[5:]
         schedule = next((job[1] for job in _sotto_cron_jobs() if job[0] == name), '')
-        # Preparation is ten minutes before the scheduled daily fire. Both preparation and
-        # the actual tick own the same local-date slot, including the second DST fold.
+        # Preparation and the daily tick share one local-date slot, including the second DST fold.
         wall_slot = (str(now.date()) if name in MARKED_BRIEF_KINDS
                      else _scheduled_slot(schedule))
         if wall_slot is None:
@@ -1952,7 +2020,7 @@ def _spawn_and_deliver(runner: list, prompt: str, label: str,
     else:
         job_id = WORK_QUEUE.enqueue(DATA, 'run', payload, key=key,
             not_before=work_not_before, valid_until=validity,
-            priority=priority, retry_terminal=retry_terminal, feedback=feedback, admission=admission,
+            priority=priority, retry_terminal=retry_terminal, feedback=feedback, admission=admission, require_live_window=requested_prep,
             shared_fixed_brief_wake=(
                 _selected_fixed_profile() and label.startswith('brief:')
                 and label[6:] in MARKED_BRIEF_KINDS))
@@ -2008,11 +2076,19 @@ def _execute_work(job):
         label = str(request.get('label') or job['kind'])
         runner = list(request['runner'])
         _require_sotto_procedure(runner, job['kind'])
-        composition_before = _composition_evidence(label)
-        if (_requested_telegram_job(job) or _scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith(('routine:fresh:', 'meeting-prep:')) or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label)) and composition_before is None:
+        scheduled_nudge = label in OUTBOX.TASK_CONTEXT.SCHEDULED_NUDGES
+        if scheduled_nudge:
+            composition_before = _composition_evidence(label, task_nudge=True, bridge_probe='none')
+            read_scope = partial(_composition_evidence, label, task_nudge=True, report_probe_failure=RELAY.bridge_connected())
+        else:
+            composition_before = _composition_evidence(label)
+        if OUTBOX.feedback_skill(label) == 'meeting-prep' and composition_before:
+            REQUESTED_PREP.check_route(job, composition_before['route_digest'])
+        if (_requested_telegram_job(job) or OUTBOX.scheduled_pulse(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith(('routine:fresh:', 'meeting-prep:')) or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label)) and composition_before is None:
             # A new owner event renews the existing activation ACK. Wait for that
             # current proof before composing an otherwise undeliverable result.
-            raise _WorkDeferredError('routine composition authority unavailable')
+            raise _WorkDeferredError('prep authority unavailable' if OUTBOX.feedback_skill(label) == 'meeting-prep'
+                                     else 'routine composition authority unavailable')
         usage_path = os.path.join(_events_dir(), f"usage-{job['id']}.json")
         prompt = request.get('prompt') or ''
         try:
@@ -2041,7 +2117,9 @@ def _execute_work(job):
         # Child creation and registration share the signal handler's lock. Thus shutdown either
         # wins before Popen (and no child is created) or snapshots the new child after registration.
         child_env = _spawn_env(job['id'])
-        if _scheduled_pulse_label(label) or label == 'onboarding:history-discovery:sotto-welcome-brief' or label.startswith('meeting-prep:') or re.fullmatch(r'skill:[a-f0-9]{64}:(?:meeting-prep|ask-research|followup|relationship-pulse|proactive)', label):
+        if composition_before and MARKED_BRIEF_KINDS.get(label.rsplit(':', 1)[-1]) in ('morning', 'evening'):
+            child_env['SOTTO_BRIEF_FEEDBACK_PROOF'] = json.dumps(composition_before)
+        if OUTBOX.requires_source_scope(label):
             child_env['SOTTO_SKILL_COMPOSITION_PROOF'] = json.dumps(composition_before)
         if re.fullmatch(r'skill:[a-f0-9]{64}:proactive', label):
             captured = _runtime_source_authority()
@@ -2054,16 +2132,26 @@ def _execute_work(job):
         with _WORK_LOCK:
             if _WORK_STOP.is_set():
                 raise _WorkInterruptedError('work interrupted by shutdown')
+            if job.get('prep_refresh'):
+                if not WORK_QUEUE.start_prep_refresh(DATA, job['id'], owner):
+                    raise REQUESTED_PREP.HandoffError('prep refresh already attempted')
+                # Staging merges effects by run id. The rebuilt prep must carry only its own effects.
+                Path(_delivery_effects_path(job['id'])).unlink(missing_ok=True)
             _RUNS_INFLIGHT[label] = _RUNS_INFLIGHT.get(label, 0) + 1
             inflight = True
             process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        text=True, env=child_env, start_new_session=True)
             _WORK_PROCESSES[process_key] = process
         deadline = time.monotonic() + ONESHOT_TIMEOUT_SECS
+        prep_until = job.get('valid_until') if OUTBOX.feedback_skill(label) == 'meeting-prep' else None
+        if prep_until is not None:
+            deadline = min(deadline, time.monotonic() + prep_until - time.time())
         while True:
             if _WORK_STOP.is_set():
                 raise _WorkInterruptedError('work interrupted by shutdown')
             if time.monotonic() >= deadline:
+                if prep_until is not None and time.time() >= prep_until:
+                    raise RUNTIME_OWNER_MEETING_PREP_REQUEST.PrepDeadlineError('meeting prep deadline reached')
                 raise TimeoutError('work timed out')
             try:
                 stdout, _stderr = process.communicate(timeout=min(30, max(1, deadline - time.monotonic())))
@@ -2108,10 +2196,11 @@ def _execute_work(job):
         if kind and not _is_silence(stdout.strip()) and not _composed_brief_recently(archive_kind, str(_local_now().date())):
             raise RuntimeError('brief runner produced no archived composition')
         effect_doc = _read_delivery_effects(job['id'])
-        composition_after = (_composition_evidence(label)
-                             if composition_before is not None else None)
-        matched_evidence = (composition_before
-                            if composition_before == composition_after else None)
+        composition_after = None
+        if composition_before:
+            composition_after = (OUTBOX.TASK_CONTEXT.nudge_scope(effect_doc.get('effects', []), stdout, read_scope)
+                                 if scheduled_nudge else _composition_evidence(label))
+        matched_evidence = composition_before if composition_before == composition_after else None
         try:
             source_text_sha256 = (hashlib.sha256(_delivery_body(stdout).encode('utf-8')).hexdigest()
                                   if matched_evidence else None)
@@ -2310,6 +2399,9 @@ def _work_one(job):
         if job['kind'] == 'source_correction':
             WORK_QUEUE.fail(DATA, job['id'], owner, 'automatic source corrections retired')
             return
+        prep = OUTBOX.feedback_skill(job['payload'].get('label', '')) == 'meeting-prep'
+        if prep:
+            RUNTIME_OWNER_MEETING_PREP_REQUEST.check_work_deadline(job, job.get('result'), owner, WORK_QUEUE, DATA)
         routine_slot = WORK_QUEUE.routine_slot_for_job(DATA, job['id'])
         if routine_slot:
             if _fresh_routine_authority(job['id'], _deliver_target()) is None:
@@ -2318,6 +2410,12 @@ def _work_one(job):
                 request = job.get('payload') or {}
                 _require_sotto_procedure(list(request['runner']), job['kind'])
         result = job.get('result')
+        if (result is not None or job.get('prep_refresh')) and OUTBOX.feedback_skill(job['payload'].get('label', '')) == 'meeting-prep':
+            if OUTBOX.owns_run(job['id']):
+                WORK_QUEUE.finish(DATA, job['id'], owner)
+                return
+            if result and result.get('route_digest_at_composition'):
+                REQUESTED_PREP.check_route(job, result['route_digest_at_composition'])
         if not _requested_telegram_job_current(job):
             raise _WorkDeferredError('requested brief authority unavailable')
         if result is None:
@@ -2326,7 +2424,11 @@ def _work_one(job):
                 # Capture execution completion BEFORE any outbox wait/retry. A
                 # saved result keeps this exact instant across worker restart.
                 result = {**result, '_routine_completed_at': datetime.now(timezone.utc).isoformat()}
+            if prep:
+                result['valid_until'] = RUNTIME_OWNER_MEETING_PREP_REQUEST.check_work_deadline(job, result, owner, WORK_QUEUE, DATA)
             WORK_QUEUE.save_result(DATA, job['id'], owner, result)
+        elif prep:
+            result['valid_until'] = job['valid_until']
         if not WORK_QUEUE.renew(DATA, job['id'], owner):
             raise RuntimeError('work lease lost before delivery handoff')
         if not _requested_telegram_job_current(job):
@@ -2339,6 +2441,8 @@ def _work_one(job):
                       run_id=job['id'], valid_until=result.get('valid_until'),
                       not_before=result.get('not_before'), coverage_until=result.get('coverage_until'),
                       routine_proof=bool(routine_slot),
+                      prep_meeting_start=RUNTIME_OWNER_MEETING_PREP_REQUEST.meeting_start(
+                          job['payload']['prompt'], result.get('effects') or ()) if prep else None,
                       source_revision_at_composition=result.get('source_revision_at_composition'),
                       route_digest_at_composition=result.get('route_digest_at_composition'),
                       source_text_sha256=result.get('source_text_sha256'),
@@ -2358,7 +2462,13 @@ def _work_one(job):
             os.unlink(_delivery_effects_path(job['id']))
         except OSError:
             pass
-    except (_WorkDeferredError, _WorkAdmissionBusyError) as error:
+    except REQUESTED_PREP.HandoffError as error:
+        disposition = WORK_QUEUE.recover_prep(DATA, job['id'], owner, str(error),
+                                              rebuild=isinstance(error, REQUESTED_PREP.SourceChangedError))
+        if disposition:
+            _record_delivery(job['payload']['label'], 'skipped' if disposition == 'pending' else 'failed',
+                             f'{error}; {disposition}', run_id=job['id'])
+    except (_WorkDeferredError, _WorkAdmissionBusyError, RUNTIME_OWNER_MEETING_PREP_REQUEST.PrepDeadlineError) as error:
         # Learning and recomposition share an input lock. Contention must not spend the three
         # fault attempts. A typed proxy refusal is equally unbilled. Release moves the next due
         # time without changing the original relevance deadline or a saved delivery result.
@@ -2367,7 +2477,8 @@ def _work_one(job):
                                        max_age_seconds=3600 if admission_busy else None)
         if disposition is None:
             return  # a newer lease owns the result and its receipt
-        reason = ('model admission busy' if isinstance(error, _WorkAdmissionBusyError)
+        reason = (str(error) if str(error) in ('prep authority unavailable', 'meeting prep deadline reached')
+                  else 'model admission busy' if isinstance(error, _WorkAdmissionBusyError)
                   else 'generation busy')
         detail = ('retry queued' if disposition in ('pending', 'ready')
                   else 'relevance deadline reached; no retry queued')
@@ -2414,8 +2525,8 @@ def _work_one(job):
 
 def _drain_work():
     while not _WORK_STOP.is_set():
-        # A lease recovered in this same process must fence the old worker just as a restart does.
-        job = WORK_QUEUE.claim(DATA, _WORK_OWNER + ':' + secrets.token_hex(16))
+        job = WORK_QUEUE.claim(DATA, _WORK_OWNER + ':' + secrets.token_hex(16),
+                               terminal_feedback=RUNTIME_OWNER_MEETING_PREP_REQUEST.terminal_feedback)
         if job is None:
             break
         worker = threading.Thread(target=_work_one, args=(job,), name='sotto-work', daemon=True)
@@ -2803,7 +2914,7 @@ def _seed_snapshot_from(payload_path: str) -> bool:
     the already-delivered path of handle_trigger. Deterministic and LLM-free: the same writer the
     brief uses (_save_local_snapshot), so contacts carry-forward and file shape can't diverge.
     Runs on a daemon thread (the Bridge's POST shouldn't wait on it); failure is logged, never
-    raised — the snapshot just stays one day staler and the next delivered brief heals it."""
+    raised, so the recovery tick can retry."""
     script = _find_sotto_script("_shared", "scripts", "compose_brief.py")
     if not script:
         print("[sotto] snapshot seed: compose_brief.py not found in any skills tree", flush=True)
@@ -2815,7 +2926,8 @@ def _seed_snapshot_from(payload_path: str) -> bool:
         out = (r.stdout or "").strip().splitlines()
         print(f"[sotto] snapshot seed from {os.path.basename(payload_path)}: "
               f"{out[-1] if out else f'exit {r.returncode}'}", flush=True)
-        return r.returncode == 0
+        result = json.loads(out[-1]) if out and r.returncode == 0 else {}
+        return result.get('seeded') is True or result.get('empty') is True
     except Exception as e:  # noqa: BLE001
         print(f"[sotto] snapshot seed FAILED ({type(e).__name__}: {e})", flush=True)
         return False
@@ -3084,8 +3196,7 @@ def _fold_into_snapshot(kind: str, date: str, local: dict, status: str,
     payload_path = os.path.join(DATA, "briefs", f"{date}.{kind}.payload.json")
     try:
         os.makedirs(os.path.join(DATA, "briefs"), exist_ok=True)
-        with open(payload_path, "w") as f:
-            json.dump(local, f)
+        CONNECTORS.write_json(payload_path, local)
     except Exception as e:  # noqa: BLE001
         return 500, {"error": f"payload stage failed: {e}"}
     threading.Thread(target=_seed_snapshot_from, args=(payload_path,), daemon=True).start()
@@ -3193,8 +3304,7 @@ def _handle_trigger(body: dict) -> tuple[int, dict]:
     # volume) must not leave the .claim held, or briefs are blocked for CLAIM_STALE_SECS.
     try:
         os.makedirs(os.path.join(DATA, "briefs"), exist_ok=True)
-        with open(payload_path, "w") as f:
-            json.dump(body.get("local_data") or {}, f)
+        CONNECTORS.write_json(payload_path, body.get("local_data") or {})
         run_skill(SKILL[kind], payload_path)
     except Exception as e:  # noqa: BLE001
         try:
@@ -3420,14 +3530,17 @@ def handle_events(body: dict) -> tuple[int, dict]:
         seen_set = set(_load_seen())
         for e in events:
             k = _event_key(e)
-            if k is not None and (k in seen_set or k in _EVENTS_INFLIGHT or k in keys):
-                continue
+            if k is not None:
+                if k in seen_set or k in keys:
+                    continue
+                if k in _EVENTS_INFLIGHT:
+                    return 503, {"error": "event batch overlaps work still in flight"}
             fresh.append(e)
             if k is not None:
                 keys.append(k)
         _EVENTS_INFLIGHT.update(keys)
     if not fresh:
-        return 200, {"verdict": "drop", "reason": "duplicate events (seen or in flight)", "bundle": {}, **retraction_status}
+        return 200, {"verdict": "drop", "reason": "duplicate events (seen)", "bundle": {}, **retraction_status}
     try:
         try:
             verdict = run_triage(fresh, bool(body.get("catchup")))
@@ -3500,6 +3613,16 @@ GMAIL_FAIL_ALERT_AFTER = 10
 GMAIL_FAIL_ALERT_EVERY_SECS = 3600
 
 
+def _record_gmail_poll_health(health, paused) -> bool:
+    """Receipt bookkeeping never stops or blocks polling: a failed write is logged and retried."""
+    try:
+        health.record(paused)
+        return True
+    except Exception as error:  # noqa: BLE001 - the poll loop must outlive its diagnostics
+        print(f"[sotto] gmail poll health receipt not written ({type(error).__name__})", flush=True)
+        return False
+
+
 def _gmail_poll_loop(secs: int) -> None:
     """Every `secs`, poll Gmail and feed new events through the SAME funnel as /bridge/events
     (dedupe → triage → maybe-agent). Every iteration is fully guarded — a poll failure must never
@@ -3508,6 +3631,8 @@ def _gmail_poll_loop(secs: int) -> None:
     resets the counter."""
     fails = 0
     last_alert = 0.0
+    health = _load_shared_lib('gmail_poll_health')
+    paused = bool(health.paused_since())  # the brief's source note reads this receipt
     while True:
         try:
             events = _poll_gmail_once()
@@ -3525,8 +3650,12 @@ def _gmail_poll_loop(secs: int) -> None:
                     if code != 200:
                         raise RuntimeError(f"gmail poll triage error: {resp}")
                 _ack_gmail_events(events)
+            if paused and _record_gmail_poll_health(health, False):
+                paused = False
         except Exception as e:  # noqa: BLE001
             fails += 1
+            if fails >= GMAIL_FAIL_ALERT_AFTER and not paused:
+                paused = _record_gmail_poll_health(health, True)
             if fails >= GMAIL_FAIL_ALERT_AFTER and (time.time() - last_alert) >= GMAIL_FAIL_ALERT_EVERY_SECS:
                 print(f"[sotto] gmail poll: {fails} consecutive failures (last: {e}) — "
                       "check Google auth on /setup", flush=True)
@@ -3949,12 +4078,35 @@ def _fresh_selfhost_brief_hold() -> bool:
                                        or not _delivery_channel_ready('cron:first-brief'))
 
 
+_RESEEDED: set = set()   # (payload path, mtime) in flight or confirmed this process
+
+
+def _reseed_lost_payloads() -> None:
+    """Retry unconfirmed wake payloads within a day; the snapshot writer orders observations."""
+    def _retry(key):
+        if not _seed_snapshot_from(key[0]):
+            _RESEEDED.discard(key)
+
+    now = time.time()
+    _RESEEDED.difference_update(key for key in _RESEEDED.copy() if now - key[1] >= 86400)
+    for path in sorted(Path(DATA, "briefs").glob("*.payload.json")):
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        key = (str(path), mtime)
+        if SEED_SNAPSHOT_TIMEOUT_SECS < now - mtime < 86400 and key not in _RESEEDED:
+            _RESEEDED.add(key)
+            threading.Thread(target=_retry, args=(key,), daemon=True).start()
+
+
 def _background_context_tick() -> None:
     """Quiet memory work and first-use delivery ride the existing heartbeat in both modes."""
     global _CONTEXT_LAST_STARTED
     import managed
     import onboarding
     try:
+        _reseed_lost_payloads()
         _maybe_bootstrap_selfhost_source_read()
         has_sources = _context_sources_ready()
         # Check durable completion before touching the channel or doing any work.
@@ -4015,8 +4167,11 @@ def _cron_tick() -> None:
         _owner_reminder_tick()
     except Exception as error:
         print(f'[sotto] owner reminder tick: {type(error).__name__}', flush=True)
-    if managed.notice_pending(DATA):
-        _deliver_text(managed.NOTICE_TEXT, managed.NOTICE_LABEL)
+    try:
+        if managed.notice_pending(DATA):
+            _deliver_text(managed.NOTICE_TEXT, managed.NOTICE_LABEL)
+    except Exception as error:
+        print(f'[sotto] no-sources notice: {type(error).__name__}', flush=True)
     _background_context_tick()
     try:
         _prepare_briefs()
@@ -4122,10 +4277,16 @@ def _retention_tick() -> None:
         print(f"[sotto] retention: {err['path']}: {err['error']}", flush=True)
 
 
-def rotate_chat_sessions() -> int | None:
+SESSION_ROTATION_FILENAME = "session_rotation.json"   # {date}: the local day sessions last rotated
+
+
+_SESSION_ROTATION_LOCK = threading.Lock()
+
+
+def rotate_chat_sessions(before: str) -> int | None:
     """Rotate the chat runtime's sessions through its private loopback API. Returns how many were
     reset, or None when the runtime's session interface is unavailable."""
-    return _runtime_adapter().archive_sessions()
+    return _runtime_adapter().archive_sessions(before)
 
 
 def _session_archive_tick() -> None:
@@ -4141,27 +4302,48 @@ def _session_archive_tick() -> None:
 
     So the day boundary comes back as a silent rotation — no reset event fires, nothing is
     broadcast. It rides the nightly housekeeping slot (retention.SWEEP_LOCAL) so the day's first
-    message starts clean. A same-day copy is still possible; a week-old one is not."""
-    today = _local_now().strftime("%Y-%m-%d")
+    message starts clean. A same-day copy is still possible; a week-old one is not.
+
+    Retry on later ticks until the runtime confirms rotation at the original sweep cutoff.
+    Both the persisted session boundary and the receiver's completion stamp are retry-safe."""
+    now = _local_now()
+    today = now.strftime("%Y-%m-%d")
     if _RETENTION_FIRED.get("sessions") == today:
         return
     hour, minute = RETENTION.SWEEP_LOCAL
-    if not _fires_now(f"{minute} {hour} * * *"):
+    if (now.hour, now.minute) < (hour, minute):
         return
-    _RETENTION_FIRED["sessions"] = today
+    cutoff = now.replace(hour=hour, minute=minute, second=0, microsecond=0, tzinfo=now.tzinfo or timezone.utc)
+    before = cutoff.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def _run():
-        n = rotate_chat_sessions()
-        if n is None:
-            print("[sotto] daily session rotation: runtime session interface unavailable — the "
-                  "transcript keeps growing until the next deploy or /new", flush=True)
-        else:
-            print(f"[sotto] daily session rotation: reset {n} chat session(s) — the next message "
-                  "starts fresh", flush=True)
+        try:
+            try:
+                with open(_cache_file(SESSION_ROTATION_FILENAME), encoding="utf-8") as f:
+                    if json.load(f).get("date") == today:
+                        _RETENTION_FIRED["sessions"] = today
+                        return
+            except (OSError, ValueError):
+                pass
+            n = rotate_chat_sessions(before)
+            if n is None:
+                print("[sotto] daily session rotation: runtime unavailable; will retry", flush=True)
+                return
+            CONNECTORS.write_json(_cache_file(SESSION_ROTATION_FILENAME), {"date": today}, durable=True)
+            _RETENTION_FIRED["sessions"] = today
+            print(f"[sotto] daily session rotation: reset {n} chat session(s)", flush=True)
+        except (OSError, ValueError) as error:
+            print(f"[sotto] daily session rotation: completion not recorded ({type(error).__name__}); will retry", flush=True)
+        finally:
+            _SESSION_ROTATION_LOCK.release()
 
-    # Its own thread: the loopback call can take up to 30 s, and the thread it would otherwise run
-    # on is the one that fires the briefs inside a 10-minute window.
-    threading.Thread(target=_run, name="sotto-session-archive", daemon=True).start()
+    # Keep the slow runtime call out of the scheduler and permit one in-flight reset.
+    if _SESSION_ROTATION_LOCK.acquire(blocking=False):
+        try:
+            threading.Thread(target=_run, name="sotto-session-archive", daemon=True).start()
+        except RuntimeError:
+            _SESSION_ROTATION_LOCK.release()
+            raise
 
 
 def start_cron_thread():
@@ -5577,7 +5759,8 @@ def _handle_owner_endpoint(handler, path, endpoint):
     try:
         policy = dict(os.environ, _configured_tz_name=_configured_tz_name, _tz_resolve=TZCHAIN.resolve,
                       _source_authority=_runtime_source_authority,
-                      _retained_route_digest=_candidate_retained_route_digest)
+                      _retained_route_digest=_candidate_retained_route_digest,
+                      _notification_feedback_receipt=OUTBOX.delivery_proof().notification_feedback_receipt)
         telegram = policy.get('SOTTO_RUNTIME_PROFILE') == 'self-host-telegram-fixed-five-v1'
         shared_project = body['identity']['route_mode'] == 'first_contact_shared_project'
         if shared_project:
@@ -5626,10 +5809,13 @@ class Handler(BaseHTTPRequestHandler):
             return True
         want = code.encode()
         q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-        for key in ("code", "setup_code"):
-            supplied = (q.get(key) or [""])[0]
+        supplied = [v for v in ((q.get(key) or [""])[0] for key in ("code", "setup_code")) if v]
+        peer = self.client_address[0]
+        for value in supplied:
             # bytes compare: compare_digest(str, str) raises on non-ASCII attacker input
-            if supplied and hmac.compare_digest(supplied.encode(), want):
+            if hmac.compare_digest(value.encode(), want):
+                with _SETUP_FAILS_LOCK:
+                    _SETUP_FAILS.pop(peer, None)
                 self._grant_cookie = code   # emitted as Set-Cookie on the response (see _write)
                 return True
         for part in (self.headers.get("Cookie") or "").split(";"):
@@ -5644,6 +5830,13 @@ class Handler(BaseHTTPRequestHandler):
                     and session['csrf']):
                 self._setup_session = session
                 return True
+        if supplied:
+            with _SETUP_FAILS_LOCK:
+                if len(_SETUP_FAILS) >= 512:   # bounded: a spray of peers cannot grow it
+                    _SETUP_FAILS.clear()
+                fails = _SETUP_FAILS[peer] = _SETUP_FAILS.get(peer, 0) + 1
+            if fails > SETUP_FAIL_FREE:
+                time.sleep(SETUP_FAIL_DELAY_SECS)
         return False
 
     def _forbid_setup(self):
@@ -6077,6 +6270,8 @@ class Handler(BaseHTTPRequestHandler):
                         and not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)}
                        if body['operation'] in ('granola_history', 'triage_queue') else {}))
                 return self._send(200, result)
+            except RUNTIME_KNOWLEDGE_READ.TimedOutError:
+                return self._send(503, {'error': 'knowledge read timed out'})
             except Exception:
                 return self._send(503, {'error': 'knowledge read unavailable'})
         if path in ('/runtime/owner-loops', '/runtime/owner-retune'):
@@ -6263,8 +6458,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/sotto/trigger':
             import managed
             authenticated = self._bridge_authed() if managed.enabled() else self._authed(token)
-        else:
-            authenticated = self._authed(token)
+        else:   # /mcp and /chat/brief serve only the co-located chat runtime, like /runtime/*
+            authenticated = self.client_address[0] in ('127.0.0.1', '::1') and self._authed(token)
         if not authenticated:
             return self._send(401, {"error": "unauthorized"})
         if path == '/chat/brief':

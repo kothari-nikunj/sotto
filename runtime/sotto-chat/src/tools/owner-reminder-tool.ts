@@ -2,7 +2,7 @@ import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import type { OperationalJournal, ExplicitOwnerLoopAuthority } from '../journal/index.js';
 import { readAuthority, SourceAuthorityChanged, type SourceAuthorityReader } from '../agent/source-authority.js';
-import { stableActionIdentity, ActionHeldError } from './action-gate.js';
+import { stableActionIdentity, ActionHeldError, OneMessageRequiredError } from './action-gate.js';
 import { ownerReminderToolArgsSchema, ownerReminderCreateArgsSchema, ownerReminderCancelArgsSchema, ownerReminderConditionalInputSchema, ownerReminderToolKind } from './owner-reminder-tool-contract.js';
 import type { OwnerTaskToolClient } from './owner-task-tool-client.js';
 import type { OwnerReminderToolClient } from './owner-reminder-tool-client.js';
@@ -64,7 +64,7 @@ export function createOwnerReminderTools(options: {
       inputSchema: ownerReminderCreateArgsSchema,
       execute: async (input, context) => {
         const {journal, authority, eventId} = trusted(context);
-        if (context.requestContext?.get('allowOwnerReminder') !== true) throw new Error('Owner reminder requires one owner message');
+        if (context.requestContext?.get('allowOwnerReminder') !== true) throw new OneMessageRequiredError();
         await sourceCurrent(context);
         const args = ownerReminderToolArgsSchema.parse(input);
         journal.ownerReminderToolAdmission(authority, eventId, true);
@@ -100,7 +100,7 @@ export function createOwnerReminderTools(options: {
       inputSchema: ownerReminderConditionalInputSchema,
       execute: async (input, context) => {
         const {journal, authority, eventId} = trusted(context);
-        if (context.requestContext?.get('allowOwnerReminder') !== true) throw new Error('Owner reminder requires one owner message');
+        if (context.requestContext?.get('allowOwnerReminder') !== true) throw new OneMessageRequiredError();
         const admitted = journal.ownerReminderToolAdmission(authority, eventId, true);
         const previous = journal.listOwnerReminderToolActionsForThread(eventId).find(action => action.source_event_id === eventId);
         if (previous) {
@@ -152,7 +152,7 @@ export function createOwnerReminderTools(options: {
       inputSchema: ownerReminderCancelArgsSchema,
       execute: async (input, context) => {
         const {journal, authority, eventId} = trusted(context);
-        if (context.requestContext?.get('allowOwnerReminder') !== true) throw new Error('Owner reminder requires one owner message');
+        if (context.requestContext?.get('allowOwnerReminder') !== true) throw new OneMessageRequiredError();
         await sourceCurrent(context);
         const args = ownerReminderCancelArgsSchema.parse(input);
         const admitted = journal.ownerReminderToolAdmission(authority, eventId, true);

@@ -25,6 +25,7 @@ SOURCE_LABELS = {
     'granola': 'Meeting Notes (Granola)',
     'attendee_research': 'Attendee Research (web search)',
     'x': 'X (attendee context)',
+    'gmail_alerts': 'Email alerts (new-mail checks between briefs are failing)',
 }
 
 

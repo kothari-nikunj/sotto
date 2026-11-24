@@ -225,7 +225,7 @@ def test_cli_json_contract(tmp_path):
 OTHER = "c_d4e5f6"
 
 
-def _write_other(name="Ben Butler", identifiers=("ben@northstar.io",), facts=None):
+def _write_other(name="Ben Butler", identifiers=("ben@nstar.test",), facts=None):
     p = kg.PersonFile(canonical_id=OTHER, name=name, identifiers=list(identifiers),
                       updated_at="2026-08-02T07:00:00Z", updated_by="brief_extraction",
                       facts={fid: kg.FactMeta(text=t, type="context", status="active", seen=1,
@@ -239,14 +239,14 @@ def _write_other(name="Ben Butler", identifiers=("ben@northstar.io",), facts=Non
 
 def test_merge_unions_the_files_and_deletes_the_source(tmp_path):
     _setup(tmp_path)
-    src = _write_other(name="Sarah", identifiers=["+14155551234"],
+    src = _write_other(name="Sarah", identifiers=["+14155550107"],
                        facts={"f_new": "Sarah is running the offsite"})
     out = ke.op_merge(OTHER, CID, NOW)
     assert out == {"ok": True, "slug": CID, "fact_count": 3, "merged_from": OTHER}
     assert not os.path.exists(src)                       # the duplicate is gone, not orphaned
     p = _person()
     assert any(f.text == "Sarah is running the offsite" for f in p.facts.values())
-    assert "sarah@acme.com" in p.identifiers and "+14155551234" in p.identifiers
+    assert "sarah@acme.com" in p.identifiers and "+14155550107" in p.identifiers
     assert p.name == "Sarah Chen"                        # the surviving file keeps its identity
 
 
@@ -254,7 +254,7 @@ def test_merge_refuses_conflicting_identifiers(tmp_path):
     """Two John Smiths with two different emails: the merge the audit warned about, refused."""
     import pytest
     _setup(tmp_path)
-    src = _write_other(name="Sarah Chen", identifiers=["sarah@globex.com"])
+    src = _write_other(name="Sarah Chen", identifiers=["sarah@globx.test"])
     with pytest.raises(ke.EditError, match="identifiers conflict"):
         ke.op_merge(OTHER, CID, NOW)
     assert os.path.exists(src)                           # nothing was written, nothing removed
@@ -276,7 +276,7 @@ def test_merge_validates_both_slugs_and_refuses_a_self_merge(tmp_path):
 
 def test_merge_forgets_the_suggestion_it_confirmed(tmp_path):
     _setup(tmp_path)
-    _write_other(name="Sarah", identifiers=["+14155551234"])
+    _write_other(name="Sarah", identifiers=["+14155550107"])
     path = os.path.join(str(tmp_path), "knowledge", "merge_suggestions.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"updated_at": "2026-08-06T07:00:00Z", "suggestions": [
@@ -290,14 +290,14 @@ def test_merge_forgets_the_suggestion_it_confirmed(tmp_path):
 
 def test_merge_cli_contract(tmp_path):
     _setup(tmp_path)
-    _write_other(name="Sarah", identifiers=["+14155551234"])
+    _write_other(name="Sarah", identifiers=["+14155550107"])
     env = {**os.environ, "SOTTO_DATA": str(tmp_path)}
     r = subprocess.run([sys.executable, CLI, "--op=merge", f"--from={OTHER}", f"--into={CID}"],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 0
     assert json.loads(r.stdout)["merged_from"] == OTHER
     # …and the refusal still speaks JSON on stdout with a non-zero exit.
-    _write_other(name="Sarah Chen", identifiers=["sarah@globex.com"])
+    _write_other(name="Sarah Chen", identifiers=["sarah@globx.test"])
     r2 = subprocess.run([sys.executable, CLI, "--op=merge", f"--from={OTHER}", f"--into={CID}"],
                         capture_output=True, text=True, env=env)
     assert r2.returncode == 2
@@ -309,7 +309,7 @@ def test_merge_cli_contract(tmp_path):
 def test_merge_dismiss_forgets_the_pair_without_touching_either_file(tmp_path):
     """"These really are two people" — the suggestion goes away, both files stay."""
     _setup(tmp_path)
-    other = _write_other(name="Sarah", identifiers=["+14155551234"])
+    other = _write_other(name="Sarah", identifiers=["+14155550107"])
     path = os.path.join(str(tmp_path), "knowledge", "merge_suggestions.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"updated_at": "2026-08-06T07:00:00Z", "suggestions": [
@@ -325,7 +325,7 @@ def test_merge_dismiss_tombstones_the_pair(tmp_path):
     """A dismissal is a decision, not a filter: it is written to `dismissed`, so the next
     suggest_name_merges() — which recomputes from the files on disk — cannot re-ask."""
     _setup(tmp_path)
-    _write_other(name="Sarah", identifiers=["+14155551234"])
+    _write_other(name="Sarah", identifiers=["+14155550107"])
     path = os.path.join(str(tmp_path), "knowledge", "merge_suggestions.json")
     ke.op_merge_dismiss(OTHER, CID, NOW)
     data = json.load(open(path, encoding="utf-8"))
@@ -584,19 +584,19 @@ def _other_person(name="Dev Patel", identifiers=("dev@other.test",)):
 
 def test_add_identifier_attaches_an_unsaved_number_to_a_known_person(tmp_path):
     """THE GAP: a text from a number in neither Contacts nor the graph reads as
-    '+1 (310) 924-5269' in every brief, and nothing could say who it is. Now something can."""
+    '+1 (310) 555-0144' in every brief, and nothing could say who it is. Now something can."""
     _setup(tmp_path)
-    r = ke.op_add_identifier(CID, "+1 (310) 924-5269", now=NOW)
+    r = ke.op_add_identifier(CID, "+1 (310) 555-0144", now=NOW)
     assert r["ok"] is True and r["added"] is True
     assert "sarah@acme.com" in _person().identifiers          # the email is not disturbed
-    assert any(kg.normalize_identifier(i) == "3109245269" for i in _person().identifiers)
+    assert any(kg.normalize_identifier(i) == "3105550144" for i in _person().identifiers)
 
 
 def test_the_added_identifier_resolves_the_person_everywhere(tmp_path):
     """Attaching it is only worth doing if the resolver then names them — the same resolver that
     names a 1:1 thread, a group's label, and each sender line inside it."""
     _setup(tmp_path)
-    ke.op_add_identifier(CID, "+1 (310) 924-5269", now=NOW)
+    ke.op_add_identifier(CID, "+1 (310) 555-0144", now=NOW)
     query = os.path.join(HERE, "..", "_shared", "knowledge", "knowledge_query.py")
     proc = subprocess.run([sys.executable, query, "--relevant-days", "7"],
                           capture_output=True, text=True,
@@ -604,12 +604,12 @@ def test_the_added_identifier_resolves_the_person_everywhere(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     entry = next(e for e in json.loads(proc.stdout)["contact_index"]
                  if e["canonical_id"] == CID)
-    assert any(kg.normalize_identifier(i) == "3109245269" for i in entry["identifiers"])
+    assert any(kg.normalize_identifier(i) == "3105550144" for i in entry["identifiers"])
 
     import render_local as rl
     identity = rl.build_identity_resolver({"contacts": [], "contact_index": [entry]})
-    assert identity("+13109245269")["name"] == "Sarah Chen"
-    assert identity("(310) 924-5269")["name"] == "Sarah Chen"   # any format, one identity
+    assert identity("+13105550144")["name"] == "Sarah Chen"
+    assert identity("(310) 555-0144")["name"] == "Sarah Chen"   # any format, one identity
 
 
 def test_an_identifier_owned_by_someone_else_is_refused_not_moved(tmp_path):
@@ -617,22 +617,22 @@ def test_an_identifier_owned_by_someone_else_is_refused_not_moved(tmp_path):
     treats as proof they are one human — so a careless add here would silently merge two strangers
     on the next brief and take one of their histories with it."""
     _setup(tmp_path)
-    _other_person(identifiers=["+13109245269"])
+    _other_person(identifiers=["+13105550144"])
     with pytest.raises(ke.EditError) as e:
-        ke.op_add_identifier(CID, "+1 (310) 924-5269", now=NOW)
+        ke.op_add_identifier(CID, "+1 (310) 555-0144", now=NOW)
     assert OTHER_CID in str(e.value) and "merge" in str(e.value)
     # …and nothing moved: both files are exactly as they were.
-    assert not any(kg.normalize_identifier(i) == "3109245269" for i in _person().identifiers)
+    assert not any(kg.normalize_identifier(i) == "3105550144" for i in _person().identifiers)
     with open(os.path.join(kg.people_dir(), f"{OTHER_CID}.md"), encoding="utf-8") as f:
-        assert "3109245269" in "".join(re.sub(r"\D", "", i)
+        assert "3105550144" in "".join(re.sub(r"\D", "", i)
                                        for i in kg.parse_person_file(f.read()).identifiers)
 
 
 def test_add_identifier_is_idempotent(tmp_path):
     _setup(tmp_path)
-    ke.op_add_identifier(CID, "+1 (310) 924-5269", now=NOW)
+    ke.op_add_identifier(CID, "+1 (310) 555-0144", now=NOW)
     before = list(_person().identifiers)
-    r = ke.op_add_identifier(CID, "(310) 924-5269", now=NOW)   # same human, different formatting
+    r = ke.op_add_identifier(CID, "(310) 555-0144", now=NOW)   # same human, different formatting
     assert r["added"] is False
     assert _person().identifiers == before
 
@@ -651,19 +651,19 @@ def test_add_identifier_over_the_cli_is_the_same_path(tmp_path):
     """The dashboard forks this CLI; chat calls the same op. One writer, one result shape."""
     _setup(tmp_path)
     out = subprocess.run([sys.executable, CLI, "--slug", CID, "--op", "add-identifier",
-                          "--identifier", "+1 (310) 924-5269"],
+                          "--identifier", "+1 (310) 555-0144"],
                          capture_output=True, text=True, env={**os.environ,
                                                               "SOTTO_DATA": str(tmp_path)})
     assert out.returncode == 0, out.stdout + out.stderr
     r = json.loads(out.stdout)
-    assert r["ok"] is True and r["added"] is True and r["identifier"] == "+1 (310) 924-5269"
+    assert r["ok"] is True and r["added"] is True and r["identifier"] == "+1 (310) 555-0144"
 
 
 def test_add_identifier_cli_reports_a_refusal_as_json_not_a_crash(tmp_path):
     _setup(tmp_path)
-    _other_person(identifiers=["+13109245269"])
+    _other_person(identifiers=["+13105550144"])
     out = subprocess.run([sys.executable, CLI, "--slug", CID, "--op", "add-identifier",
-                          "--identifier", "+13109245269"],
+                          "--identifier", "+13105550144"],
                          capture_output=True, text=True, env={**os.environ,
                                                               "SOTTO_DATA": str(tmp_path)})
     assert out.returncode == 2

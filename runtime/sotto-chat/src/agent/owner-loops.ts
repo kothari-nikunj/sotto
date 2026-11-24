@@ -16,6 +16,11 @@ export const ownerLoopEntrySchema = z.object({
   chased_count: z.number().int().nonnegative().max(1_000_000),
   chase_pending: day, last_chased_at: day, chase_after: day,
   chased_out: z.boolean(), handoff_asked_at: day,
+  // Possibly handled (a later message from the owner, a meeting with them, a passed date); never a closure.
+  check: z.object({ basis: z.enum(['you_messaged', 'meeting', 'call', 'sent_to_them', 'met', 'meeting_cancelled', 'dates_passed', 'read_no_reply', 'reacted']), at: z.string().max(64),
+    source: z.enum(['imessage', 'whatsapp', 'gmail', 'calendar', 'calls', 'whatsapp_calls', 'granola']),
+    replied_since: z.string().max(64).optional(), replied_source: z.enum(['imessage', 'whatsapp', 'gmail']).optional(),
+    kind: z.enum(['love', 'like', 'dislike', 'laugh', 'emphasize', 'question', 'emoji', 'sticker']).optional() }).strict().optional(),
 }).strict();
 const count = z.number().int().nonnegative().max(1_024);
 const responseSchema = z.object({

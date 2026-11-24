@@ -130,12 +130,23 @@ def prep_meeting_events(events, self_email=''):
                         for person in human_attendees(event, owner, include_self=True))]
 
 
+def organized_by_owner(event, self_email=''):
+    owner = self_email.strip().lower()
+    organizer = event.get('organizer') or {}
+    return isinstance(organizer, dict) and bool((organizer.get('self') and _self_describes_owner(event))
+        or (owner and str(organizer.get('email') or '').strip().lower() == owner))
+
+
+def owner_rsvp(event, self_email=''):
+    owner = self_email.strip().lower()
+    return next((person['status'] for person in human_attendees(event, owner, include_self=True)
+                 if (person.get('self') and _self_describes_owner(event)) or (owner and person['email'] == owner)), None)
+
+
 def accepted_or_organized(event, self_email=''):
     """Unsolicited private context requires owner acceptance or native organizer proof."""
     owner = self_email.strip().lower()
-    organizer = event.get('organizer') or {}
-    if isinstance(organizer, dict) and ((organizer.get('self') and _self_describes_owner(event))
-            or (owner and str(organizer.get('email') or '').strip().lower() == owner)):
+    if organized_by_owner(event, owner):
         return True
     return any(person['status'] == 'accepted' and
                ((person.get('self') and _self_describes_owner(event)) or (owner and person['email'] == owner))

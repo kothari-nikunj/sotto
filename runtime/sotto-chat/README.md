@@ -257,7 +257,7 @@ and shutdown end the turn's presence; prepared-reply recovery does not start it.
 public Spectrum Space start/stop methods on the decoded chat and phone line. Telegram uses
 its public start method and has no stop primitive.
 
-Fresh durable Photon owner-DM admission triggers a best-effort read mark and the existing local request-hint tapback. The provider read mark is conversation-wide. An accepted reply replaces the hint with ✅; thanks keeps ❤️. Held/unknown replies do not get a completion tapback. Rejected task changes and partially completed multi-task changes also withhold it, while their accepted explanation still resolves the incoming request. Foreign, self, group, duplicate, and recovered historical input do not trigger this feedback. Each feedback call has a one-second waiting bound and no automatic retry. Uncertainty withholds further feedback for that owner message; a newly admitted owner message can make its own feedback attempt. Late lookups remain fenced, and an already-contacted old call settling later cannot disable the new message. These signals never authorize effects or prove delivery, and provider failure does not block the owner reply. Actual device presentation still requires live verification.
+Fresh durable Photon owner-DM admission triggers a best-effort read mark and the existing local request-hint tapback. The provider read mark is conversation-wide. Once Photon starts that read on the verified target, the processing tapback can start while the read is in flight. Completion still waits for confirmed feedback and accepted work. An accepted reply replaces the hint with ✅; thanks keeps ❤️. Held/unknown replies do not get a completion tapback. Rejected task changes and partially completed multi-task changes also withhold it, while their accepted explanation still resolves the incoming request. Foreign, self, group, duplicate, and recovered historical input do not trigger this feedback. Each feedback call has a one-second waiting bound and no automatic retry. Once uncertainty is observed, feedback that has not started stays held; a newly admitted owner message can make its own feedback attempt. Late lookups remain fenced, and an already-contacted old call settling later cannot disable the new message. These signals never authorize effects or prove delivery, and provider failure does not block the owner reply. Actual device presentation still requires live verification.
 
 The bearer-protected `/v1/health` response includes an optional in-memory `feedback` snapshot for the latest fresh owner turn. It reports fixed read, processing, and completion stages, local lookup/effect timings, accepted-reply callback status, and uncertainty. A timed-out stage stays timed out when its call settles later; late settlement is reported separately. The snapshot resets on restart and includes no message IDs, content, emoji, credentials, provider bodies or error text. It is diagnostic evidence, not confirmation of what a device displayed.
 
@@ -1267,7 +1267,7 @@ This Gmail schema check does not change the channel; the current Spectrum alignm
 
 ## Uncertain owner requests
 
-`delayed-outcome-policy.ts` contains only notice wording, allowed proof status, inspection cadence and notice-attempt data for the 17 supported action kinds. Existing typed readers and settlers still validate each receipt; the table cannot authorize an effect. The original uncertain request gets a fixed honest notice without another message. One unrefed coordinator wakeup runs at the existing one-minute cadence while a relevant action remains unknown or its final reply awaits redelivery, serializes through existing thread queues and inspects saved proof without repeating the action or calling the model for held-only input. A validated late result receives a distinct final acknowledgement. If that final reply is definitely not delivered (rejected, or cancelled before contact), the wakeup retries it up to the policy attempt bound; an accepted, unknown or dispatching final reply is never resent. The next owner message also drains such a reply and is then answered itself. `/stop`, shutdown and maintenance stop the wakeup as appropriate; unknown delivery receipts are never resent. Unsupported rejection proofs remain held. Local contracts are recorded in the behavior inventory; live verification is separate.
+`delayed-outcome-policy.ts` contains only notice wording, allowed proof status, inspection cadence and notice-attempt data for the 18 supported action kinds. Existing typed readers and settlers still validate each receipt; the table cannot authorize an effect. The original uncertain request gets a fixed honest notice without another message. One unrefed coordinator wakeup runs at the existing one-minute cadence while a relevant action remains unknown or its final reply awaits redelivery, serializes through existing thread queues and inspects saved proof without repeating the action or calling the model for held-only input. A validated late result receives a distinct final acknowledgement. If that final reply is definitely not delivered (rejected, or cancelled before contact), the wakeup retries it up to the policy attempt bound; an accepted, unknown or dispatching final reply is never resent. The next owner message also drains such a reply and is then answered itself. `/stop`, shutdown and maintenance stop the wakeup as appropriate; unknown delivery receipts are never resent. Unsupported rejection proofs remain held. Local contracts are recorded in the behavior inventory; live verification is separate.
 
 
 Research subjects and ordinary public URLs come from the current owner request or, for a follow-up
@@ -1288,6 +1288,9 @@ Admission needs a current affirmative request. `src/tools/read-admission.ts` and
 (`../trigger-receiver/runtime_read_admission.py`), refuse negated, reported (“she said…”) and
 personal-recall (“how was lunch with Dana?”) messages. A follow-up that relies on earlier context
 must also refer back to it or immediately follow that owner message (“it”, “their”, “more”), so a bare yes/ok cannot select a target.
+Replies to a delivered message use separate windows in `src/tools/delivered-context-policy.json`
+(7 days for an exact quote, 12 hours unthreaded; see `src/background-context.ts`); they supply
+context and the existing task/offer bindings, never read permission, and do not change this window.
 Research subjects must be short names, not sentences or street addresses. The receiver
 (`../trigger-receiver/runtime_owner_skill_request.py`) rechecks the current request, lookup
 identity and source revision, plus thread and freshness for research from earlier context. It does
@@ -1309,9 +1312,9 @@ active rows for one person still require clarification. The authenticated loop r
 a bounded ask for this check; source, version and identity are checked again by the writer.
 Bare “those two are done” is not a bound selection and still requires the task names.
 
-Photon adapter 3.2.0 and the gallery/presence helpers share Spectrum 12.14.0 through
+Photon adapter 3.2.1 and the gallery/presence helpers share Spectrum 12.16.0 through
 adapter-scoped dependency overrides. Both the send client and bounded history reader resolve
-Advanced iMessage 2.4.0's explicit `createGrpcClient` API. The installed RPC/signal fixtures
+Advanced iMessage 2.5.0's explicit `createGrpcClient` API with gRPC 1.14.7. The installed RPC/signal fixtures
 resolve from the actual adapter dependency chain; `photon-adapter-contract.test.ts` additionally
 checks the real adapter send path over trusted loopback TLS, and the signal fixture verifies
 application cleanup completes before exit; the history fixture checks timestamp,

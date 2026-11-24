@@ -110,7 +110,7 @@ def test_reviewer_gets_current_conversation_from_existing_renderer(task, monkeyp
          'text': 'I cannot do that slot, can we reschedule?', 'is_from_me': True, 'id': 'new1'},
         {'handle': '+12025550123', 'timestamp': '2026-10-14T17:00:00Z',
          'text': 'Yes, message me about next week.', 'is_from_me': False, 'id': 'new2'},
-        {'handle': '+12025550999', 'timestamp': '2026-10-14T17:00:00Z',
+        {'handle': '+12025550100', 'timestamp': '2026-10-14T17:00:00Z',
          'text': 'Unrelated private thread', 'is_from_me': False, 'id': 'other'}]
     monkeypatch.setattr(source_context, 'allowed', lambda source: True)
     reviews = cb._task_mention_review({'brief_markdown': '## Needs Attention Now\n' + line}, inputs)
@@ -261,7 +261,7 @@ def test_compound_presentation_keeps_scope_recipient_and_distinct_ask(monkeypatc
            'summary': 'Cedar agreement execution, diligence materials, and Maple financing',
            'ask': 'Review Cedar voting language with counsel before signing'}
     original = copy.deepcopy(row)
-    monkeypatch.setattr(cb, '_protected_action_ledger', lambda inputs: [copy.deepcopy(row)])
+    monkeypatch.setattr(cb, '_permitted_ledger_rows', lambda: [copy.deepcopy(row)])
     inputs = {'now': '2026-10-22T12:00:00Z', 'type': 'morning',
               'local': {'action_ledger': [row]}, 'google': {'emails': [
                   {'from': 'Jordan Vale <jordan@example.test>', 'threadId': 'email-project',
@@ -828,7 +828,7 @@ def test_call_review_indexes_once_and_rechecks_authority_before_model(tmp_path, 
         scope_reads.append(True)
         return ('2' if changed_scope and len(scope_reads) > 1 else '1') * 24
     monkeypatch.setattr(source_context, 'permission_fingerprint', fingerprint)
-    rows = [{'phone': '+14155550123', 'is_outgoing': True, 'is_answered': True,
+    rows = [{'phone': '+14155550123', 'is_outgoing': False, 'is_answered': True,
              'timestamp_utc': (datetime(2026, 10, 24, tzinfo=timezone.utc) + timedelta(seconds=i)).isoformat()}
             for i in range(100)]
     proofs = [render_local.call_evidence(row, 'calls') for row in rows[:2]]
@@ -860,9 +860,9 @@ def test_call_binding_io_failure_is_cached_as_unavailable(tmp_path, monkeypatch,
     attempts = []
     def broken(*args, **kwargs):
         attempts.append(True)
-        raise OSError('synthetic unreadable authority')
+        raise OSError('unreadable authority')
     monkeypatch.setattr(source_context, 'permission_fingerprint', lambda: '1' * 24)
-    row = {'phone': '+14155550123', 'is_outgoing': True,
+    row = {'phone': '+14155550123', 'is_outgoing': False,
            'is_answered': True, 'timestamp_utc': '2026-10-24T16:18:42Z'}
     ident, text = render_local.call_evidence(row, 'calls')
     action = {'evidence': [{'sourceType': 'calls', 'sourceId': ident, 'snippet': text}]}
@@ -932,7 +932,7 @@ def test_messaging_closure_legacy_id_prefers_native_snapshot_without_guessing(tm
                     '_loop_context': True, '_loop_context_sources': ['gmail', 'imessage']}
     messages = [supplemental] if case == 'supplemental_only' else [supplemental, native]
     if case == 'conflicting_native':
-        messages.append({**native, 'handle': '+14155550999'})
+        messages.append({**native, 'handle': '+14155550105'})
     if case == 'malformed_native':
         original = render_local.message_evidence_id
         def broken_native(message, source):
@@ -997,7 +997,7 @@ def test_unmatched_call_does_not_arm_unrelated_fingerprint_hold(tmp_path, monkey
         reads.append(True)
         return ('1' if len(reads) == 1 else '2') * 24
     monkeypatch.setattr(source_context, 'permission_fingerprint', fingerprint)
-    row = {'phone': '+14155550123', 'is_outgoing': True, 'is_answered': True,
+    row = {'phone': '+14155550123', 'is_outgoing': False, 'is_answered': True,
            'timestamp_utc': '2026-10-24T16:18:42Z'}
     contacted = []
     def model(prompt, options):

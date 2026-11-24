@@ -67,21 +67,21 @@ def _outcomes(tmp_path):
 
 def test_link_for_records_the_offered_draft(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    url = al.link_for("imessage", "+1 (415) 555-1234", "On my way — 5 min out.")
+    url = al.link_for("imessage", "+1 (415) 555-0107", "On my way — 5 min out.")
     assert url.startswith("imessage://")
     rows = [json.loads(l) for l in
             (tmp_path / "events" / "drafts.jsonl").read_text().splitlines()]
     assert rows[0]["channel"] == "imessage"
-    assert rows[0]["identifier"] == "+14155551234"      # normalized exactly as the link embeds it
+    assert rows[0]["identifier"] == "+14155550107"      # normalized exactly as the link embeds it
     assert rows[0]["text"] == "On my way — 5 min out."
     # a bare open-the-thread link carries no draft → no row
-    al.link_for("imessage", "+14155551234")
+    al.link_for("imessage", "+14155550107")
     assert len((tmp_path / "events" / "drafts.jsonl").read_text().splitlines()) == 1
 
 
 def test_a_decline_is_recorded_but_still_never_linked(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    url = al.link_for("imessage", "+14155551234", "Can't make it, sorry.", action_type="decline")
+    url = al.link_for("imessage", "+14155550107", "Can't make it, sorry.", action_type="decline")
     assert url == ""                                     # the never-pre-link-a-decline rule holds
     rows = [json.loads(l) for l in
             (tmp_path / "events" / "drafts.jsonl").read_text().splitlines()]
@@ -93,34 +93,34 @@ def test_a_decline_is_recorded_but_still_never_linked(tmp_path, monkeypatch):
 def test_verbatim_send_is_executed_and_edit_is_edited_and_sent(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     t0 = NOW - timedelta(hours=2)
-    _write_draft(tmp_path, t0, "imessage", "+14155551234", "On my way — 5 min out.")
-    _write_draft(tmp_path, t0, "whatsapp", "16505550000",
+    _write_draft(tmp_path, t0, "imessage", "+14155550107", "On my way — 5 min out.")
+    _write_draft(tmp_path, t0, "whatsapp", "16505550100",
                  "Great chat today — I'll send the deck by Thursday.")
-    _write_signal(tmp_path, t0 + timedelta(minutes=9), "+1 (415) 555-1234",
+    _write_signal(tmp_path, t0 + timedelta(minutes=9), "+1 (415) 555-0107",
                   "On my way — 5 min out.")             # verbatim, formatting differences only
-    _write_signal(tmp_path, t0 + timedelta(minutes=30), "16505550000",
+    _write_signal(tmp_path, t0 + timedelta(minutes=30), "16505550100",
                   "Great chat today — I'll send the deck by Thursday, and I'll loop in Priya.",
                   source="whatsapp")                    # the draft plus the user's own addition
     s = do.run(now=NOW)
     assert (s["executed"], s["edited_and_sent"], s["dismissed"]) == (1, 1, 0)
     by_contact = {r["contact"]: r for r in _outcomes(tmp_path)}
-    assert by_contact["+14155551234"]["outcome"] == "executed"
-    assert by_contact["+14155551234"]["tier"] == "one_tap"
-    assert by_contact["16505550000"]["outcome"] == "edited_and_sent"
-    assert "similarity" in by_contact["16505550000"]["edits"]
+    assert by_contact["+14155550107"]["outcome"] == "executed"
+    assert by_contact["+14155550107"]["tier"] == "one_tap"
+    assert by_contact["16505550100"]["outcome"] == "edited_and_sent"
+    assert "similarity" in by_contact["16505550100"]["edits"]
 
 
 def test_expired_send_observation_is_unknown_not_a_dismissal(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    _write_draft(tmp_path, NOW - timedelta(hours=30), "imessage", "+14155551234", "Want to grab lunch?")
-    _write_draft(tmp_path, NOW - timedelta(hours=1), "imessage", "+16505550000", "Sounds good!")
+    _write_draft(tmp_path, NOW - timedelta(hours=30), "imessage", "+14155550107", "Want to grab lunch?")
+    _write_draft(tmp_path, NOW - timedelta(hours=1), "imessage", "+16505550100", "Sounds good!")
     s = do.run(now=NOW)
     assert (s["dismissed"], s["unknown"], s["pending"]) == (0, 1, 1)
     expired = next(r for r in _outcomes(tmp_path) if r["outcome"] == "unknown")
     assert expired["reason"] == "observation_window_elapsed"
     assert "source_event_id" not in expired  # no send failure or no-send claim
     # Unrelated activity is telemetry about the lane, not evidence that this draft was rejected.
-    _write_signal(tmp_path, NOW - timedelta(hours=20), "+12125550000", "totally unrelated text")
+    _write_signal(tmp_path, NOW - timedelta(hours=20), "+12125550100", "totally unrelated text")
     s2 = do.run(now=NOW)
     assert (s2["dismissed"], s2["unknown"], s2["pending"]) == (0, 1, 1)
     assert len(_outcomes(tmp_path)) == 1
@@ -129,10 +129,10 @@ def test_expired_send_observation_is_unknown_not_a_dismissal(tmp_path, monkeypat
 def test_late_ingested_signal_can_resolve_a_previously_unknown_draft(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     offered = NOW - timedelta(hours=30)
-    _write_draft(tmp_path, offered, "imessage", "+14155551234", "Want to grab lunch?")
+    _write_draft(tmp_path, offered, "imessage", "+14155550107", "Want to grab lunch?")
     assert do.run(now=NOW)["unknown"] == 1
     # The queue row arrives late, but its original event timestamp is still inside the offer window.
-    _write_signal(tmp_path, offered + timedelta(hours=20), "+14155551234", "Want to grab lunch?")
+    _write_signal(tmp_path, offered + timedelta(hours=20), "+14155550107", "Want to grab lunch?")
     summary = do.run(now=NOW)
     assert summary["executed"] == 1 and summary["unknown"] == 0
     outcomes = _outcomes(tmp_path)
@@ -142,8 +142,8 @@ def test_late_ingested_signal_can_resolve_a_previously_unknown_draft(tmp_path, m
 def test_grading_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     t0 = NOW - timedelta(hours=2)
-    _write_draft(tmp_path, t0, "imessage", "+14155551234", "On my way.")
-    _write_signal(tmp_path, t0 + timedelta(minutes=5), "+14155551234", "On my way.")
+    _write_draft(tmp_path, t0, "imessage", "+14155550107", "On my way.")
+    _write_signal(tmp_path, t0 + timedelta(minutes=5), "+14155550107", "On my way.")
     do.run(now=NOW)
     s2 = do.run(now=NOW)
     assert s2["graded"] == 0
@@ -156,9 +156,9 @@ def test_inferred_non_use_cannot_become_a_mute_offer(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     for hours in (30, 29, 28):
-        _write_draft(tmp_path, NOW - timedelta(hours=hours), "imessage", "+14155551234",
+        _write_draft(tmp_path, NOW - timedelta(hours=hours), "imessage", "+14155550107",
                      f"Follow-up draft offered {hours} hours ago")
-    _write_signal(tmp_path, NOW - timedelta(hours=20), "+12125550000", "An unrelated reply")
+    _write_signal(tmp_path, NOW - timedelta(hours=20), "+12125550100", "An unrelated reply")
     assert do.run(now=NOW)["dismissed"] == 0
     assert not (tmp_path / "preferences.json").exists()
     import retune_scan
@@ -179,7 +179,7 @@ def _write_email_signal(tmp_path, ts, to, text, cc=""):
     p.parent.mkdir(parents=True, exist_ok=True)
     ev = {"source": "email", "is_from_me": True, "body": text, "date": _iso(ts),
           "id": f"email:{to}:{_iso(ts)}",
-          "from": "Me <me@fpv.example.com>", "to": to, "cc": cc}
+          "from": "Me <me@hbr.example.com>", "to": to, "cc": cc}
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps({"ts": _iso(ts), "verdict_class": "signal",
                             "sender": "Me", "event": ev}) + "\n")
@@ -240,8 +240,8 @@ def test_native_timestamp_and_cross_channel_counterpart_drive_matching(tmp_path,
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     offered = NOW - timedelta(hours=3)
     text = "Can you send the signed agreement this week?"
-    _write_draft(tmp_path, offered, "imessage", "+14155551234", text)
-    _write_signal(tmp_path, offered + timedelta(hours=1), "14155551234", text,
+    _write_draft(tmp_path, offered, "imessage", "+14155550107", text)
+    _write_signal(tmp_path, offered + timedelta(hours=1), "14155550107", text,
                   source="whatsapp", seen_at=NOW + timedelta(days=2), rowid="late-cross")
     assert do.run(now=NOW + timedelta(days=2))["executed"] == 1
     row = _outcomes(tmp_path)[0]
@@ -253,8 +253,8 @@ def test_cross_country_numbers_with_same_final_ten_digits_do_not_match(tmp_path,
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     offered = NOW - timedelta(hours=2)
     text = "I'll send the signed agreement tonight."
-    _write_draft(tmp_path, offered, "imessage", "+442079460958", text)
-    _write_signal(tmp_path, offered + timedelta(hours=1), "12079460958", text,
+    _write_draft(tmp_path, offered, "imessage", "+442079460150", text)
+    _write_signal(tmp_path, offered + timedelta(hours=1), "12079460150", text,
                   source="whatsapp", rowid="different-country")
     assert do.run(now=NOW)["executed"] == 0
     assert _outcomes(tmp_path) == []
@@ -264,8 +264,8 @@ def test_full_uk_number_matches_whatsapp_jid_across_channels(tmp_path, monkeypat
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     offered = NOW - timedelta(hours=2)
     text = "I'll send the signed agreement tonight."
-    _write_draft(tmp_path, offered, "imessage", "+442079460958", text)
-    _write_signal(tmp_path, offered + timedelta(hours=1), "442079460958", text,
+    _write_draft(tmp_path, offered, "imessage", "+442079460150", text)
+    _write_signal(tmp_path, offered + timedelta(hours=1), "442079460150", text,
                   source="whatsapp", rowid="same-uk-number")
     assert do.run(now=NOW)["executed"] == 1
     assert _outcomes(tmp_path)[0]["source_event_id"] == "whatsapp:same-uk-number"
@@ -275,11 +275,11 @@ def test_one_send_credits_the_closest_supported_draft_once_across_restart(tmp_pa
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     text = "Can you send the updated supplier contract this week?"
     older, newer = NOW - timedelta(hours=4), NOW - timedelta(hours=2)
-    _write_draft(tmp_path, older, "imessage", "+14155551234", text)
-    _write_draft(tmp_path, newer, "imessage", "+14155551234", text)
-    _write_signal(tmp_path, NOW - timedelta(hours=1), "+14155551234", text, rowid="one-send")
+    _write_draft(tmp_path, older, "imessage", "+14155550107", text)
+    _write_draft(tmp_path, newer, "imessage", "+14155550107", text)
+    _write_signal(tmp_path, NOW - timedelta(hours=1), "+14155550107", text, rowid="one-send")
     assert do.run(now=NOW)["executed"] == 1
-    expected = {"ts": _iso(newer), "channel": "imessage", "identifier": "+14155551234",
+    expected = {"ts": _iso(newer), "channel": "imessage", "identifier": "+14155550107",
                 "text": text, "action_type": "reply"}
     assert _outcomes(tmp_path)[0]["action_id"] == do._draft_key(expected)
     assert do.run(now=NOW)["graded"] == 0
@@ -290,8 +290,8 @@ def test_preoffer_send_and_absent_native_timestamp_are_never_credited(tmp_path, 
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     text = "The implementation review is complete."
     offered = NOW - timedelta(hours=2)
-    _write_draft(tmp_path, offered, "imessage", "+14155551234", text)
-    _write_signal(tmp_path, offered - timedelta(minutes=1), "+14155551234", text,
+    _write_draft(tmp_path, offered, "imessage", "+14155550107", text)
+    _write_signal(tmp_path, offered - timedelta(minutes=1), "+14155550107", text,
                   seen_at=NOW, rowid="preoffer")
     queue = tmp_path / "events" / "queue.jsonl"
     row = json.loads(queue.read_text().splitlines()[0])
@@ -306,22 +306,22 @@ def test_late_send_repairs_legacy_inferred_nonuse_but_not_explicit_dismissal(tmp
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     offered = NOW - timedelta(hours=3)
     text = "Can you send the plan?"
-    _write_draft(tmp_path, offered, "imessage", "+14155551234", text)
+    _write_draft(tmp_path, offered, "imessage", "+14155550107", text)
     draft = json.loads((tmp_path / "events" / "drafts.jsonl").read_text())
     key = do._draft_key(draft)
     do.log_outcome.log({"action_id": key, "outcome": "dismissed", "channel": "imessage",
-                        "contact": "+14155551234", "action_type": "reply"})
-    _write_signal(tmp_path, offered + timedelta(hours=1), "+14155551234", text, rowid="late")
+                        "contact": "+14155550107", "action_type": "reply"})
+    _write_signal(tmp_path, offered + timedelta(hours=1), "+14155550107", text, rowid="late")
     assert do.run(now=NOW)["executed"] == 1
     assert [r["outcome"] for r in _outcomes(tmp_path)] == ["dismissed", "executed"]
 
     other = "Please send the budget."
-    _write_draft(tmp_path, offered, "imessage", "+16505550000", other)
+    _write_draft(tmp_path, offered, "imessage", "+16505550100", other)
     explicit = json.loads((tmp_path / "events" / "drafts.jsonl").read_text().splitlines()[-1])
     do.log_outcome.log({"action_id": do._draft_key(explicit), "outcome": "dismissed",
-                        "channel": "imessage", "contact": "+16505550000", "action_type": "reply",
+                        "channel": "imessage", "contact": "+16505550100", "action_type": "reply",
                         "feedback_source": "explicit_user"})
-    _write_signal(tmp_path, offered + timedelta(hours=1), "+16505550000", other, rowid="explicit")
+    _write_signal(tmp_path, offered + timedelta(hours=1), "+16505550100", other, rowid="explicit")
     assert do.run(now=NOW)["executed"] == 0
 
 
@@ -331,13 +331,13 @@ def test_verbatim_send_confirms_the_style_sample(tmp_path, monkeypatch):
     quoted first by style_apply)."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     sent = "On my way — 5 min out."
-    sample = {"channel": "imessage", "date": "2026-08-23", "recipient": "+14155551234",
+    sample = {"channel": "imessage", "date": "2026-08-23", "recipient": "+14155550107",
               "text": sent, "bucket": "personal_chat", "source": "observed"}
     (tmp_path / "style.json").write_text(json.dumps(
         {"recent": [sample], "canonical": {}, "confirmed": []}))
     t0 = NOW - timedelta(hours=2)
-    _write_draft(tmp_path, t0, "imessage", "+14155551234", sent)
-    _write_signal(tmp_path, t0 + timedelta(minutes=5), "+14155551234", sent)
+    _write_draft(tmp_path, t0, "imessage", "+14155550107", sent)
+    _write_signal(tmp_path, t0 + timedelta(minutes=5), "+14155550107", sent)
     s = do.run(now=NOW)
     assert s["style_confirmed"] == 1
     style = json.loads((tmp_path / "style.json").read_text())
@@ -388,7 +388,7 @@ def test_the_ledger_row_id_has_exactly_one_implementation():
     import keys
     assert do._draft_key is keys.draft_key
     assert se.draft_key is keys.draft_key
-    row = {"ts": _iso(NOW), "channel": "imessage", "identifier": "+14155550000",
+    row = {"ts": _iso(NOW), "channel": "imessage", "identifier": "+14155550102",
            "text": "Verbatim shipped message.", "action_type": "reply"}
     assert keys.draft_key(row) == do._draft_key(row) == se.draft_key(row)
 
@@ -397,7 +397,7 @@ def test_the_offered_drafts_ledger_has_exactly_one_path_owner(tmp_path, monkeypa
     """action_links writes it; the grader and the marker pruner both ask it where it is."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     assert do.action_links_drafts_path() == al.drafts_path()
-    _write_draft(tmp_path, NOW - timedelta(hours=2), "imessage", "+14155550000", "Hi there.")
+    _write_draft(tmp_path, NOW - timedelta(hours=2), "imessage", "+14155550102", "Hi there.")
     assert se._retained_draft_actions() == {
         do._draft_key(json.loads((tmp_path / "events" / "drafts.jsonl").read_text().strip()))}
 

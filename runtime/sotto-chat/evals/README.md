@@ -50,6 +50,10 @@ Google token, Keychain, real mailbox, live calendar or production volume is used
 transport supplies native-shaped inbound timestamps and accepted-send timestamps so background
 continuation runs through its normal ordering checks.
 
+Run `accepted-alert-opinion.json` and `quoted-alert-opinion.json` in separate fresh sessions.
+Both place an older chat topic before a newly accepted alert and ask “Wdyt?”. Check that the reply
+addresses the alert without an action. The second case also verifies the exact provider quote.
+
 `early-prep-offer-source-return.json` exercises a seeded production offer, “yes,” completed prep,
 source separation, topic switching and restart. `meetingPrepOfferBefore` stages the exact synthetic
 calendar occurrence through the existing producer, sends its question through captured transport,
@@ -327,3 +331,98 @@ a declined row does not prove a separate shared-calendar transport. Inspect firs
 actual returned evidence: the original transparent baseline passed a broad "free" assertion while
 saying "not free". The strengthened fixture rejects that wording, but semantic review remains
 required. No live calendar, send, mutation or device display is exercised by these runs.
+
+## Continue an actual fictional plan brief
+
+The [fictional cold-brief probe](../../../sotto-chief-of-staff/evals/README.md#fictional-plan-comments-selection-replay)
+CLI uses the historical cutoff in `fixtures/cross_source_plan.json`. For a fresh cutoff, call
+the probe's Python `run(case, cutoff, arm, live=True)` with an explicit timezone-aware UTC
+instant. Use the same cutoff for the email-only and combined reports. Keep the historical
+reports separately. The builder checks the selected case against the sender address in the
+probe prompt. From `runtime/sotto-chat`, build a scenario from each matching probe report:
+
+```sh
+../../.venv/bin/python evals/plan_continuation.py \
+  --case footbridge --brief-report /private/path/footbridge-combined.json \
+  --output /private/path/footbridge-continuation.json
+SOTTO_PYTHON=../../.venv/bin/python npm run eval:conversation -- \
+  --model-config /private/path/model.json \
+  --scenario /private/path/footbridge-continuation.json \
+  --output /private/path/new-continuation-run
+```
+
+The builder copies `brief` into `backgroundBefore` verbatim and uses the report's
+timezone-aware `cutoff` for the frozen source records. The runner delivers that ordinary
+background before a bare “yes”, then asks for a shorter version.
+
+Add `--gallery` to replay the same report through the receiver's production four-card renderer
+and outbox. The runner starts a synthetic owner session with `/new` so the receiver can acknowledge
+the actual local route. It records the accepted message, retained artifact proof and matching PNGs
+before asking “yes”. Inspect `background-gallery-0.json`, `delivered-media/` and the brief-detail
+read in `report.json`. The delivery is local and the PNGs are real renderer output. Device
+display is outside this eval. A brief with fewer than four renderable body blocks may fall back
+to text, which fails the gallery arm before a model call. Use ordinary text mode to replay that
+report or compose a new fictional brief with enough renderable content.
+
+For a changed-evidence run,
+provide `--read-cutoff` at least an hour after the brief cutoff and at or before the real
+continuation run. The operator checks the latter against the run clock. The fixture stamps
+the later WhatsApp correction exactly one hour after the brief cutoff and leaves the
+background text untouched. Use separate output files
+for each version. The builder stages fictional source consent and records only. Ordinary
+delivery supplies the reply context.
+
+The managed receiver and relay still authorize discovery, requests and responses. At startup,
+the receiver captures one consented read of the frozen Mac sources through its normal relay
+and recorder. This seeds bounded availability evidence. Later turn receipts establish which
+source data the model actually retrieved. Google capability checks use a synthetic saved token
+with read scopes only for the declared frozen Gmail and Calendar sources. Ask sees
+`read_history`, a time-window WhatsApp page with native `before` pagination. The existing
+direct `get_messages` relay shape also supports exact fixture JIDs when the receiver
+negotiates it. A well-formed absent JID returns an empty thread. This continuation
+exercises history discovery. The fixture does not advertise or serve Bridge full-text search,
+so a direct search denial records a fixture limitation. Message identifiers in
+`source-reads.jsonl` appear as `message_ids` alongside
+the requested bounds or JID and returned `jids`. Inspect those receipts and the actual returned
+evidence before grading a draft. A read of a different JID or an unrelated message does not
+establish use of the correction. Unsupported operations and malformed exact selectors leave
+sticky denial evidence. A revoked grant is checked by the production relay.
+
+Review the full accepted answer for one useful private draft, a justified clarification, or
+a miss. The held-out Greenhouse brief previously omitted its initial constraint. Preserve that
+result and any continuation failure. For the ordinary combined arm, grade the private draft after
+“yes” and again after “shorter” against the original email and the same person's correction.
+Footbridge keeps Saturday staff-only after the inspection moves to Monday. Greenhouse keeps
+Friday to dry setup while water is off until Sunday. Fail a draft that repeats these facts but
+asks whether to proceed with the superseded plan or describes both activities as still scheduled.
+Fail a draft that assumes a replacement or new date was agreed when the source leaves that open.
+Check that the response offers a concrete next step about the displaced activity if one remains;
+a generic request for more details does not help. Omit contact-matching details from the answer. A revision should be shorter and preserve the decision. Check that both turns have
+zero external effects. The recorded questions and superseded plans are exact regression examples;
+passing the wording check does not establish a semantic pass. The changed-source arm should use current evidence or
+disclose the gap before producing misleading copy. The draft must keep internal WhatsApp
+details out of third-party wording. Keep the existing stance-clarification behavior for
+ambiguous accept/decline requests. This harness change establishes source transport and
+receipt boundaries. Actual-model continuation and draft usefulness require the approved
+local run.
+
+## Saved memory versus original evidence
+
+`memory-stale-employer.json` and `memory-contradicted-investor.json` reuse this harness
+with canonical `knowledge_update` ingestion and frozen Gmail messages. Each scenario first
+requests saved memory only (zero Google reads), then explicitly asks to verify the current or
+contested fact, then repeats verification after Node restart. All turns require unchanged
+canonical records and zero Bridge sends. The expected answers remain outside model input.
+
+Run either with the approved `--model-config` as above. Their companion `.provider.json`
+files use `--scripted-provider` to verify that permitted fact references and original Gmail
+quotes reach the real tool responses. Those scripted answers do not establish model quality.
+Native qualification also requires reading the source trace and final replies: the result must
+use the correct author, source message date, negation and qualifiers, rather than treating a
+graph observation date as the source date. A stored claim can be reported as saved without
+being asserted as currently true. Do not require exactly one knowledge read for a question
+that names both a person and a company; either saved read is compatible with saved-only scope.
+
+These fixtures test attended source verification, not autonomous correction or Dreamer quality.
+They intentionally preserve the stale canonical fact because the owner forbids changes. They do
+not prove initial extraction, proactive prep, missing/revoked sources, or ordinary pilot outcomes.

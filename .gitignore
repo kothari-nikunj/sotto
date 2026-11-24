@@ -14,6 +14,7 @@ sotto-bridge/core/target/
 sotto-bridge/app/Sotto Bridge.app/
 sotto-bridge/app/Sotto-Bridge-*.dmg
 sotto-bridge/app/.build/
+sotto-bridge/app/Resources/AppIcon.icns
 # Bridge access-code signing key — the ED25519 private key that mints access codes. Its durable home
 # is the GitHub Actions secret SOTTO_BRIDGE_SIGNING_KEY; the working copy lives at
 # ~/.sotto/bridge-signing.key (0600), OUTSIDE any checkout. These patterns are the belt to that

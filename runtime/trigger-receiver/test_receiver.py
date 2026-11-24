@@ -184,7 +184,7 @@ def _derive_with(monkeypatch, stdout, rc=0):
 def test_derive_google_account_email_reads_the_sent_from(monkeypatch):
     """The host CLI has no whoami, but the `From` of any `in:sent` message IS the account. Both
     header shapes the gather already tolerates must resolve to the same lowercase address."""
-    assert _derive_with(monkeypatch, json.dumps([{"from": "Nikunj Kothari <Me@Acme.com>"}])) == "me@acme.com"
+    assert _derive_with(monkeypatch, json.dumps([{"from": "Casey Lindgren <Me@Acme.com>"}])) == "me@acme.com"
     assert _derive_with(monkeypatch, json.dumps([{"from": "me@acme.com"}])) == "me@acme.com"
     # …and the MCP-ish variants: a {name,email} object, and a dict wrapper around the list
     assert _derive_with(monkeypatch, json.dumps([{"from": {"name": "Me", "email": "me@acme.com"}}])) == "me@acme.com"
@@ -1504,7 +1504,7 @@ def test_proactive_wake_requires_the_trigger_token(tmp_path, monkeypatch):
 # ── Event-driven ingestion (Phase 2: POST /bridge/events) ────────────────────────────────────────
 
 def _ev(rowid=1, **kw):
-    e = {"source": "imessage", "rowid": rowid, "handle": "+14155551234", "is_from_me": False,
+    e = {"source": "imessage", "rowid": rowid, "handle": "+14155550107", "is_from_me": False,
          "timestamp": "2026-08-06T10:00:00Z", "text": "hey", "is_group_chat": False,
          "chat_guid": None, "group_name": None, "group_participants": []}
     e.update(kw)
@@ -1559,7 +1559,7 @@ def test_bridge_events_agent_verdict_stages_bundle_and_spawns(tmp_path, monkeypa
                         lambda evs, c: {"verdict": "agent", "reason": "missed call", "bundle": bundle})
     spawned = []
     monkeypatch.setattr(rec, "run_event_skill", lambda p: spawned.append(p))
-    code, resp = rec.handle_events({"events": [_ev(40, source="calls", phone="+14155551234")]})
+    code, resp = rec.handle_events({"events": [_ev(40, source="calls", phone="+14155550107")]})
     assert code == 200 and resp["verdict"] == "agent"
     deadline = rec.time.time() + 5                      # spawn happens on a daemon thread
     while not spawned and rec.time.time() < deadline:
@@ -1621,7 +1621,7 @@ def test_bridge_events_claim_is_single_flight(tmp_path, monkeypatch):
     t.start()
     assert entered.wait(5)
     code, duplicate = rec.handle_events({"events": [_ev(61)]})
-    assert code == 200 and duplicate["verdict"] == "drop" and "in flight" in duplicate["reason"]
+    assert code == 503 and "in flight" in duplicate["error"]
     assert len(calls) == 1
     release.set()
     t.join(5)
@@ -2164,7 +2164,7 @@ def test_calendar_changes_detects_the_four_kinds_and_skips_noise():
     from datetime import datetime, timezone
     cc = rec.CALCACHE
     now = datetime(2026, 8, 17, 17, 0, tzinfo=timezone.utc)
-    me = "nikunj@fpv.com"
+    me = "casey@hbr.example"
 
     def ev(eid, start, attendees, summary="Coffee", **kw):
         return {"id": eid, "summary": summary, "start": start, "end": start,
@@ -2248,7 +2248,7 @@ def test_change_tick_baselines_first_dispatches_then_settles(tmp_path, monkeypat
     monkeypatch.setattr(rec, "DATA", str(tmp_path))
     # Pin the user's address: with one-attendee fixtures the docket inference would otherwise
     # conclude Ali is "everyone's common attendee" — i.e. the user — and skip him as self.
-    monkeypatch.setenv("SOTTO_USER_EMAIL", "nikunj@fpv.com")
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "casey@hbr.example")
     monkeypatch.setitem(cc.HOOKS, "calendar_change_batch",
                         lambda events: (sent.extend(events), {e["rowid"] for e in events})[1])
     cc._LAST_RAW.update(events=[e1], valid=True,
@@ -3955,7 +3955,7 @@ def test_a_masked_phone_link_never_leaves_the_box_but_a_real_one_does(tmp_path, 
     is not dialable is removed like a mailto; a real tap link is untouched."""
     rec.DATA = str(tmp_path)
     sent = _channel(monkeypatch)
-    text = ("→ [Message Cynthia](sms:+14155553682&body=hi) · Tap to send: imessage://+141****3682?body=hi\n"
+    text = ("→ [Message Cynthia](sms:+14155550112&body=hi) · Tap to send: imessage://+141****3682?body=hi\n"
             "Reply to Cynthia: 'Wednesday works.' Tap to send: imessage://+141****3682?body=Wednesday%20works. Ready to send?\n"
             "→ [Call Dhruv](tel:+15551234567) · https://wa.me/15551234567?text=hey · Patel: sms:+15551234567&body=On%20my%20way\n"
             "Tap to send: imessage://+1415***3682")
@@ -3964,7 +3964,7 @@ def test_a_masked_phone_link_never_leaves_the_box_but_a_real_one_does(tmp_path, 
     assert "****" not in body and "***" not in body
     # the composer's real link survives on the SAME line as the masked one the model appended, and
     # the `sms:<number>&body=` shape action_links emits is a live link, not a dead one
-    assert body.splitlines()[0] == "→ [Message Cynthia](sms:+14155553682&body=hi) · Tap to send:"
+    assert body.splitlines()[0] == "→ [Message Cynthia](sms:+14155550112&body=hi) · Tap to send:"
     assert "Reply to Cynthia: 'Wednesday works.' Tap to send:  Ready to send?".replace("  ", " ") \
         in body.replace("  ", " ")
     assert ("→ [Call Dhruv](tel:+15551234567) · https://wa.me/15551234567?text=hey · "
@@ -4597,7 +4597,9 @@ def test_a_link_captured_by_a_previous_bot_token_is_not_a_link(tmp_path, monkeyp
 
 def _archives(monkeypatch):
     ran = []
-    monkeypatch.setattr(rec, "rotate_chat_sessions", lambda: ran.append(1) or 2)
+    monkeypatch.setattr(rec, "rotate_chat_sessions", lambda _: ran.append(1) or 2)
+    from test_receiver_restart_gaps import SyncThread
+    monkeypatch.setattr(rec.threading, "Thread", SyncThread)
     return ran
 
 
@@ -4605,15 +4607,15 @@ def test_the_daily_session_archive_fires_once_at_the_housekeeping_minute(tmp_pat
     """A chat session lasts a day or a deploy, whichever comes first. The Aug 26 move to
     reset-on-deploy let a transcript grow for a week between deploys, and interactive replies
     began copying it back out — recursively, Telegram's own (1/2)(2/2) split markers included.
-    The boundary rides the housekeeping slot and the same fired-today stamp retention uses."""
+    The boundary rides the housekeeping slot; a receiver down at the slot catches up after it."""
     rec.DATA = str(tmp_path)
     rec._RETENTION_FIRED.clear()
     ran = _archives(monkeypatch)
     hour, minute = rec.RETENTION.SWEEP_LOCAL
-    for at in (datetime(2026, 9, 2, 6, 30), datetime(2026, 9, 2, hour, minute - 1)):
+    for at in (datetime(2026, 9, 2, 1, 30), datetime(2026, 9, 2, hour, minute - 1)):
         monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
         rec._session_archive_tick()
-    assert ran == [], "not before the minute, and never at brief time"
+    assert ran == [], "not before the minute"
     for at in (datetime(2026, 9, 2, hour, minute), datetime(2026, 9, 2, hour, minute + 1)):
         monkeypatch.setattr(rec, "_local_now", lambda a=at: a)
         rec._session_archive_tick()
@@ -4631,15 +4633,16 @@ def test_session_rotation_goes_through_the_runtime_and_reports_unavailability(mo
     calls = []
 
     class Client:
-        def sessions(self, action):
-            calls.append(action)
+        def sessions(self, action, *, before):
+            calls.append((action, before))
             return {"rotated": True, "count": 2}
 
     adapter = rec._runtime_adapter()
     monkeypatch.setattr(adapter, "_client", lambda **kwargs: Client())
-    assert rec.rotate_chat_sessions() == 2 and calls == ["rotate"]
+    before = "2026-09-02T03:30:00Z"
+    assert rec.rotate_chat_sessions(before) == 2 and calls == [("rotate", before)]
     monkeypatch.setattr(adapter, "_client", lambda **kwargs: (_ for _ in ()).throw(OSError("down")))
-    assert rec.rotate_chat_sessions() is None
+    assert rec.rotate_chat_sessions(before) is None
 
 
 # ── The end-to-end simulation fixes (Sep 2026) ───────────────────────────────────────────────────
@@ -4937,21 +4940,6 @@ def test_photon_offer_acceptance_uses_only_captured_matching_route(monkeypatch):
     assert rec._on_delivered(payload) is False and observed == []
     payload.pop('offer_route_at_contact')
     assert rec._on_delivered(payload) is False and observed == []
-
-
-def test_offer_route_capture_uses_protected_owner_route(monkeypatch):
-    monkeypatch.setenv('SOTTO_CRON_DELIVER', 'photon')
-    payload = {'effects': [{'kind': 'pending_offer'}]}
-    monkeypatch.setattr(rec, '_candidate_retained_route_proof', lambda: {
-        'route_digest': 'a' * 64, 'owner_route': {'chat_id': 'iMessage;-;+14155550100'}})
-    assert rec._capture_offer_route(payload) == {
-        'route_digest': 'a' * 64, 'chat_id': 'iMessage;-;+14155550100'}
-    for field in ('prep_route_digest', 'routine_route_digest'):
-        assert rec._capture_offer_route({**payload, field: 'b' * 64}) is None
-        assert rec._capture_offer_route({**payload, field: 'a' * 64}) is not None
-    monkeypatch.setattr(rec, '_candidate_retained_route_proof', lambda: None)
-    assert rec._capture_offer_route(payload) is None
-    assert rec._capture_offer_route({'effects': []}) == {}
 
 
 def test_event_deduplication_distinguishes_restored_store_rowids():

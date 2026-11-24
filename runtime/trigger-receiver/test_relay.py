@@ -313,9 +313,28 @@ def test_forwarded_requests_advertise_accepted_fields_without_touching_the_calle
     r.mcp_call({"jsonrpc": "2.0", "id": 2, "method": "resources/list"}, timeout=5)
     bt.join()
     assert call == original
-    assert seen[0]["params"]["_meta"] == {"progressToken": "p", relay.BRIDGE_ACCEPTS_META: ["source_coverage", "source_coverage_v2", "search_metadata_v1"]}
+    accepts = ["source_coverage", "source_coverage_v2", "search_metadata_v1",
+               "history_reactions_coverage_v1", "history_failure_reason_v1", "whatsapp_chat_read_v1"]
+    assert seen[0]["params"]["_meta"] == {"progressToken": "p", relay.BRIDGE_ACCEPTS_META: accepts}
     assert seen[0]["params"]["arguments"] == {"since_hours": 24}
-    assert seen[1]["params"] == {"_meta": {relay.BRIDGE_ACCEPTS_META: ["source_coverage", "source_coverage_v2", "search_metadata_v1"]}}
+    assert seen[1]["params"] == {"_meta": {relay.BRIDGE_ACCEPTS_META: accepts}}
+
+
+def test_whatsapp_thread_requires_the_matching_managed_source(monkeypatch):
+    import managed
+
+    permitted = {'whatsapp'}
+    monkeypatch.setattr(managed, 'enabled', lambda: True)
+    monkeypatch.setattr(managed, '_consented_sources', lambda _: permitted)
+    request = {'method': 'tools/call', 'params': {
+        'name': 'get_messages', 'arguments': {'source': 'whatsapp'}}}
+    response = {'structuredContent': {'source': 'whatsapp', 'messages': []}}
+    assert managed.validate_tool_request(None, request)
+    assert managed.validate_tool_response(None, request, response)
+    assert not managed.validate_tool_response(None, request, {'structuredContent': {'messages': []}})
+    assert managed.filter_tool_list(None, {'tools': [{'name': 'get_messages'}]}) == {'tools': []}
+    permitted.clear()
+    assert not managed.validate_tool_response(None, request, response)
 
 
 def test_expired_forward_is_never_delivered_after_reconnect():
@@ -352,6 +371,14 @@ def test_fresh_relay_is_disconnected_even_right_after_host_boot(monkeypatch):
     r = relay.Relay(bridge_timeout=40.0)
     monkeypatch.setattr(relay.time, "monotonic", lambda: 5.0)   # host booted 5s ago
     assert not r.bridge_connected()
+    assert r.bridge_last_seen_at is None
+    assert r.poll(timeout=0) is None
+    assert r.bridge_connected()
+    seen = r.bridge_last_seen_at
+    assert seen.endswith('+00:00')
+    monkeypatch.setattr(relay.time, "monotonic", lambda: 46.0)
+    assert not r.bridge_connected()
+    assert r.bridge_last_seen_at == seen
 
 
 def test_bridge_connected_timing():

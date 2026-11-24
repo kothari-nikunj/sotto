@@ -49,6 +49,19 @@ def test_pending_revision_replacement_is_atomic_and_leased_result_is_preserved(t
     assert work.get(tmp_path, new)['status'] == 'leased'
 
 
+def test_replacing_pending_wake_does_not_admit_its_old_key_again(tmp_path):
+    wake = {'label': 'brief:sotto-morning-brief'}
+    key = 'brief:morning:day:revision1'
+    old = work.enqueue(tmp_path, 'run', wake, key=key, shared_fixed_brief_wake=True)
+    assert admit(tmp_path) == old
+    new = admit(tmp_path, 'brief:morning:day:revision2', replace_pending=True)
+    assert new != old and work.get(tmp_path, old) is None
+    with pytest.raises(RuntimeError, match='fixed work outcome requires reconciliation'):
+        work.enqueue(tmp_path, 'run', wake, key=key, shared_fixed_brief_wake=True)
+    assert admit(tmp_path) == new
+    assert work.get(tmp_path, old) is None
+
+
 def test_terminal_model_budget_needs_explicit_readmission(tmp_path):
     job = admit(tmp_path)
     assert work.claim(tmp_path, 'worker')['id'] == job
@@ -145,6 +158,50 @@ def test_saved_result_disposition_is_not_delivery_acceptance(tmp_path):
     slot = work.fixed_slot(tmp_path, authority_digest=AUTH, name='sotto-morning-brief',
                            wall_slot='2026-11-01')
     assert slot['last_work_status'] == 'ready'
+
+
+def test_fixed_slot_status_uses_live_job_until_prune(tmp_path):
+    wake = {'label': 'brief:sotto-morning-brief'}
+    key = 'brief:morning:day:revision1'
+    job = work.enqueue(tmp_path, 'run', wake, key=key, shared_fixed_brief_wake=True)
+    assert admit(tmp_path) == job
+
+    def slot_status():
+        return work.fixed_slot(tmp_path, authority_digest=AUTH, name='sotto-morning-brief',
+                               wall_slot='2026-11-01')['last_work_status']
+
+    # Previous workers could leave a live transition in either fence.
+    path = tmp_path / 'events' / 'work.sqlite3'
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE fixed_slots SET last_work_status='leased' WHERE job_id=?", (job,))
+        db.execute("UPDATE fixed_brief_wakes SET last_work_status='leased' WHERE job_id=?", (job,))
+    assert slot_status() == 'pending'
+
+    assert work.claim(tmp_path, 'worker')['id'] == job
+    assert slot_status() == 'leased'
+    assert work.fail(tmp_path, job, 'worker', 'retry composition') == 'pending'
+    assert slot_status() == 'pending'
+    due = work.get(tmp_path, job)['due']
+    assert work.claim(tmp_path, 'worker', now=due)['id'] == job
+    work.save_result(tmp_path, job, 'worker', {'text': 'saved'})
+    assert slot_status() == 'result_saved'
+    assert work.fail(tmp_path, job, 'worker', 'retry handoff') == 'ready'
+    assert slot_status() == 'ready'
+    due = work.get(tmp_path, job)['due']
+    assert work.claim(tmp_path, 'worker', now=due)['id'] == job
+    assert slot_status() == 'result_saved'
+    assert work.finish(tmp_path, job, 'worker')
+    assert slot_status() == 'done'
+    with sqlite3.connect(path) as db:
+        assert db.execute('SELECT last_work_status FROM fixed_slots').fetchone() == ('leased',)
+        assert db.execute('SELECT last_work_status FROM fixed_brief_wakes').fetchone() == ('leased',)
+    work.claim(tmp_path, 'other', now=work.get(tmp_path, job)['finished'] + work.RETENTION_SECONDS + 1)
+    assert work.get(tmp_path, job) is None
+    assert slot_status() == 'done'
+    with sqlite3.connect(path) as db:
+        assert db.execute('SELECT last_work_status FROM fixed_brief_wakes').fetchone() == ('done',)
+    assert work.enqueue(tmp_path, 'run', wake, key=key, shared_fixed_brief_wake=True) == job
+    assert work.get(tmp_path, job) is None
 
 
 def test_pruned_work_row_keeps_compact_fence_and_no_delivery_claim(tmp_path):

@@ -124,7 +124,7 @@ test('original Intentions exact pending loop -> conditional reminder -> real due
   assert.equal((await coordinator.receive(inbound('conditional-lost', text), context)).status, 'held');
   assert.equal(calls.filter(op => op === 'create').length, 1);
   assert.equal(sent.length, 1, 'the immediate receipt inspection produces one confirmation without another owner input');
-  assert.match(sent[0]!, /Conditional reminder set\./);
+  assert.match(sent[0]!, /Conditional reminder set for /);
   const action = journal.db.prepare("SELECT * FROM actions WHERE kind='owner_reminder_tool'").get()!;
   assert.equal(action.status, 'succeeded', 'only the committed receipt settles reminder creation');
   assert.ok(calls.includes('inspect'));
@@ -137,7 +137,7 @@ test('original Intentions exact pending loop -> conditional reminder -> real due
   assert.deepEqual(await coordinator.recover(), [], 'the already accepted confirmation does not replay on restart');
   assert.equal((await coordinator.receive(inbound('conditional-lost', text), context)).status, 'duplicate');
   assert.equal(step, prior); assert.equal(calls.filter(op => op === 'create').length, 1);
-  assert.ok(calls.includes('inspect')); assert.match(sent.at(-1)!, /Conditional reminder set\./);
+  assert.ok(calls.includes('inspect')); assert.match(sent.at(-1)!, /Conditional reminder set for /);
   assert.equal(journal.getAction(action.id as string)!.status, 'succeeded');
   assert.equal(sent.length, 1, 'restart and duplicate owner input do not send another confirmation');
   const afterProof = sent.length; await coordinator.recover();

@@ -531,3 +531,69 @@ def test_person_deleted_during_scan_drops_checkpoint_instead_of_holding(monkeypa
     batch = dreamer.prepare()
     assert batch['candidates'] == [] and batch['unreadable_people'] == 0
     assert cid not in state()['facts'] and cid not in state()['reviewed']
+
+
+def test_new_source_reaches_prior_summary_and_reader_without_new_work_or_namesake():
+    import context_learning
+    import knowledge_query
+
+    def learn(email, reference, text, day):
+        observations = context_learning.observations('gmail', [{
+            'id': reference, 'from': email, 'resolved_name': 'Mira',
+            'date': f'2026-10-{day}T09:00:00Z', 'body': text,
+        }], NOW)
+        def extract(*args, **kwargs):
+            return json.dumps({'people': [{'subject_id': 'p1', 'facts': [
+                {'text': text, 'refs': [observations[0]['ref']]}]}]})
+        assert context_learning.learn(observations, llm=extract, now=NOW)['facts'] == 1
+
+    old = 'Mira currently works at Cedar Labs.'
+    new = 'Mira left Cedar Labs and now leads product at Elm Studio.'
+    namesake = 'Mira currently leads a different studio.'
+    learn('mira@example.test', 'cedar', old, '01')
+    path = Path(kg.find_person_file(identifier='mira@example.test'))
+    saved = kg.parse_person_file(path.read_text())
+    saved.identifiers.append('mira-alias@example.test')
+    kg.write_person_file(str(path), saved, NOW)
+    learn('another@example.test', 'other', namesake, '01')
+    def summarize(prompt, *args, **kwargs):
+        return json.dumps({'people': [{'id': person['id'], 'summary_refs': list(person['facts']),
+                                      'conflicts': [], 'equivalent_groups': []}
+                                     for person in json.loads(prompt)]})
+    assert dreamer.run(summarize, NOW)['reviewed'] == 2
+    learn('mira-alias@example.test', 'elm', new, '06')
+    prepared = dreamer.prepare()
+    candidate, = prepared['candidates']
+    def compare(prompt, *args, **kwargs):
+        person, = json.loads(prompt)
+        facts = {fact['text']: fid for fid, fact in person['facts'].items()}
+        assert set(facts) == {old, new}
+        assert candidate['work'] == [facts[new]]
+        assert person['facts'][facts[new]]['refs'] == ['gmail:elm']
+        return json.dumps({'people': [{'id': person['id'], 'summary_refs': [facts[new]],
+                         'conflicts': [[facts[old], facts[new]]], 'equivalent_groups': []}]})
+
+    assert dreamer.run(compare, NOW, prepared)['reviewed'] == 1
+    assert str(path) == kg.find_person_file(identifier='mira-alias@example.test')
+    packed = knowledge_query.pack_person(kg.parse_person_file(path.read_text()), False, NOW)
+    assert 'Unresolved memory conflict' in packed and old in packed and new in packed
+    assert namesake not in packed
+    assert not dreamer.prepare()['candidates']
+
+
+def test_withdrawal_of_prepared_fact_prevents_model_contact(monkeypatch):
+    cid, _ = seed(0)
+    prepared = dreamer.prepare()
+    monkeypatch.setattr(kg, 'source_invalidated_refs', lambda: {'synthetic:0:0'})
+    assert dreamer.run(lambda *_args, **_kw: pytest.fail('withdrawn fact reached model'),
+                       NOW, prepared)['status'] == 'changed_before_contact'
+    assert state()['facts'][cid]['f_000']['attempts'] == 0
+
+
+def test_malformed_optional_summary_references_do_not_block_pending_work():
+    cid, path = seed(0)
+    person = kg.parse_person_file(path.read_text())
+    person.summary_refs = [{'broken': 'legacy reference'}]
+    kg.write_person_file(str(path), person, NOW)
+    candidate, = dreamer.prepare()['candidates']
+    assert candidate['id'] == cid and candidate['work'] == ['f_000']

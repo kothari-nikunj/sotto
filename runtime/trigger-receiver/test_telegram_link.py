@@ -66,7 +66,7 @@ def _updates(*updates):
     return _ok(list(updates))
 
 
-def _private_msg(update_id, user_id, first="Nikunj", last="Kothari", text=None, is_bot=False):
+def _private_msg(update_id, user_id, first="Casey", last="Lindgren", text=None, is_bot=False):
     """A private message that CARRIES the phrase unless a test hands it other text — the default is
     exactly what tapping the deep link sends."""
     text = f"/start {PHRASE}" if text is None else text
@@ -138,7 +138,7 @@ def test_capture_ignores_channel_posts_groups_and_bots_and_takes_the_human(monke
         _private_msg(14, 111111, first="Later"),            # arrived after; must not win
     )}))
     assert tg.capture_first_sender(TOKEN, PHRASE, timeout_secs=5) == {
-        "ok": True, "user_id": 8675309, "name": "Nikunj Kothari",
+        "ok": True, "user_id": 8675309, "name": "Casey Lindgren",
         "text": f"hello sotto {PHRASE}"}
     # found on the first poll — then ONE zero-wait call at update 13's offset, so Telegram
     # confirms the pairing message and the gateway that starts later never receives it

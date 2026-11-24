@@ -18,23 +18,27 @@ Env: SOTTO_DATA (ledger root), SOTTO_TIMEZONE (for "today"/age).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
 import argparse
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
+from itertools import repeat, zip_longest
 
 # Shared tz helpers so "today"/age match the brief; shared ledger loader so all the
 # read views agree on what's open (ledger_io).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from textutil import _s  # noqa: E402
-from timeutil import _now_local, _calendar_day, configured_tz  # noqa: E402
+from timeutil import _now_local, _calendar_day, _parse_ts, configured_tz  # noqa: E402
 import ledger_io  # noqa: E402
-from delivery_effects import loop_version, loop_identity  # noqa: E402
+import loop_checks  # noqa: E402
+import signal_closes  # noqa: E402
 from ledger_provenance import project_entries  # noqa: E402
+from delivery_effects import loop_version, loop_identity  # noqa: E402
 
 # Direction is defined ONCE, in ledger_io: `waiting_on` is what THEY owe you; everything else
 # active — `follow_up_stale` included, since it resolves on your outgoing message and expires on
@@ -45,7 +49,7 @@ def _entry(it: dict, today: datetime, today_str: str, *, include_request_context
     name = ledger_io.contact_label(it)
     label = ledger_io.task_label(it)
     if include_ask:
-        label = _s(it.get("summary")).strip() or label
+        label = ledger_io.deliverable(it) or _s(it.get("summary")).strip() or label
     deadline = _calendar_day(it.get("deadline"))
     courtesy = ledger_io.is_optional_birthday_courtesy(it)
     if courtesy:
@@ -114,10 +118,12 @@ def rank_entries(entries: list[dict], today: str) -> list[dict]:
 
 
 def _query_rows(active_rows: list[dict], parked_rows: list[dict] | None,
-                *, log_diagnostic: bool, now: datetime | None = None, include_request_context=False, include_ask=False) -> dict:
+                *, log_diagnostic: bool, now: datetime | None = None, include_request_context=False,
+                include_ask=False, permitted: frozenset[str] | None = None, client_view=False) -> dict:
     today = now or _now_local(configured_tz() or "+00:00")
     today_str = today.strftime("%Y-%m-%d")
     you_owe, waiting = [], []
+    checks = loop_checks.read(permitted=permitted)
     # No second birthday visibility rule here: active_entries/load_active already applied
     # ledger_io.hidden_from_obligation_views, the same predicate the brief reads.
     for it in active_rows:   # ACTIVE and not user-snoozed — ledger_io owns both rules
@@ -126,6 +132,11 @@ def _query_rows(active_rows: list[dict], parked_rows: list[dict] | None,
         if ledger_io.normalize_action_type(it.get("action_type")) in ("meeting_prep", "meeting_info"):
             continue
         e = _entry(it, today, today_str, include_request_context=include_request_context, include_ask=include_ask)
+        check = checks.get(e["loop_version"])
+        if check:
+            e["check"] = {key: value for key, value in check.items() if key != "message_at"}
+        if client_view:
+            e = _client_entry(e, it)
         (waiting if ledger_io.is_waiting_on(it.get("action_type")) else you_owe).append(e)
     you_owe = rank_entries(you_owe, today_str)
     waiting = rank_entries(waiting, today_str)
@@ -163,7 +174,8 @@ def query(include_parked: bool = False) -> dict:
 
 
 def query_permitted_rows(data_root: str, permitted: list[str], *, include_parked=False,
-                         now: datetime | None = None, include_request_context=False, include_ask=False) -> dict:
+                         now: datetime | None = None, include_request_context=False, include_ask=False,
+                         client_page=None) -> dict:
     """Protected canonical read using the caller's captured current source grants."""
     if type(permitted) is not list or any(type(source) is not str for source in permitted) or type(include_parked) is not bool or type(include_request_context) is not bool or type(include_ask) is not bool:
         raise ValueError('permitted loop read invalid')
@@ -171,10 +183,113 @@ def query_permitted_rows(data_root: str, permitted: list[str], *, include_parked
     if not isinstance(clock, datetime) or clock.tzinfo is None or clock.utcoffset() is None:
         raise ValueError('permitted loop clock invalid')
     visible = permitted_rows(data_root, permitted)
-    result = _query_rows(ledger_io.active_entries(visible, clock), visible if include_parked else None,
-                         log_diagnostic=False, now=clock, include_request_context=include_request_context, include_ask=include_ask)
+    active = ledger_io.active_entries(visible, clock)
+    result = _query_rows(active, visible if include_parked else None, log_diagnostic=False, now=clock,
+                         include_request_context=include_request_context, include_ask=include_ask,
+                         permitted=frozenset(permitted), client_view=client_page is not None)
+    if client_page is not None:
+        return _client_commitments(result, visible, clock, client_page)
     result['coverage'] = 'currently_permitted_canonical_loops'
     return result
+
+
+CLIENT_PAGE_BYTES = 48 * 1024
+CLIENT_CURSOR = re.compile(r'([a-f0-9]{64}):([0-9]{1,9})\Z')
+REFERENCE_FIELDS = ('sourceType', 'source_type', 'source', 'sourceId', 'source_id', 'id', 'timestamp', 'date')
+
+
+def _client_refs(row, field):
+    refs = row.get(field) or []
+    if isinstance(refs, dict):
+        refs = [refs]
+    return [{key: _s(ref[key])[:512] for key in REFERENCE_FIELDS if key in ref}
+            for ref in (refs if len(refs) <= 1 else (refs[0], refs[-1]))]
+
+
+def _client_entry(entry, row):
+    excluded = {*ledger_io.CHASE_STATE_FIELDS, 'chased_out'}
+    result = {key: value[:512] if isinstance(value, str) else value for key, value in entry.items()
+              if key not in excluded and key != 'check'}
+    if entry.get('check'):
+        result['check'] = {key: _s(value)[:128] for key, value in entry['check'].items()
+                           if key in ('basis', 'at', 'source', 'kind', 'replied_since', 'replied_source')}
+    result.update(source_refs=_client_refs(row, 'source_refs'),
+                  recorded_at=_s(row.get('recorded_at'))[:128] or None,
+                  source_timestamp=_s(row.get('source_timestamp'))[:128] or None)
+    return result
+
+
+def _client_handled(visible, clock, handled_days, direction):
+    cutoff = clock - timedelta(days=handled_days)
+    handled = []
+    for row in visible:
+        if (row.get('status') != 'resolved' or row.get('resolution') in ('merged_duplicate', 'user_retargeted')
+                or ledger_io.normalize_action_type(row.get('action_type')) in ledger_io.MEETING_TYPES
+                or ledger_io.hidden_from_obligation_views(row, clock)):
+            continue
+        waiting = ledger_io.is_waiting_on(row.get('action_type'))
+        if direction != 'both' and waiting != (direction == 'they_owe'):
+            continue
+        signal = row.get('resolution') if signal_closes.is_signal_close(row) else None
+        recorded = row['resolution_basis'].get('recorded_at') if signal else None
+        stamp = _s(recorded or row.get('closed_at') or row.get('resolved_at'))
+        when = _parse_ts(stamp)
+        if when is None:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=clock.tzinfo)
+        if not cutoff <= when <= clock:
+            continue
+        entry = _client_entry(_entry(row, clock, clock.date().isoformat(), include_ask=True), row)
+        entry.pop('anchor_key')
+        resolution_refs = _client_refs(row, 'resolution_source_refs')
+        entry.update(handled_at=stamp, closed_by=signal, resolution_source_refs=resolution_refs,
+                     direction='they_owe_you' if waiting else 'you_owe',
+                     completion_basis=ledger_io.completion_basis('resolved', _s(row.get('resolution')),
+                         evidence_visible=bool(resolution_refs and (signal or row.get('resolution_evidence')))))
+        handled.append((when, entry))
+    return [entry for _, entry in sorted(handled, key=lambda pair: pair[0], reverse=True)]
+
+
+def _client_commitments(result, visible, clock, page_options):
+    limit, cursor, direction, handled_days = page_options
+    streams = {'you_owe': result['you_owe'] if direction != 'they_owe' else [],
+               'waiting_on_them': result['waiting_on_them'] if direction != 'you_owe' else []}
+    for entries in streams.values():
+        for entry in entries:
+            entry.pop('anchor_key')
+    streams['recently_handled'] = _client_handled(visible, clock, handled_days, direction) if handled_days else []
+    rows = [item for group in zip_longest(*(zip(repeat(key), entries) for key, entries in streams.items()))
+            for item in group if item is not None]
+    # Invalidate the cursor on visible state changes, preserving original rank and consent.
+    def encode(value):
+        return json.dumps(value, allow_nan=False, separators=(',', ':'), sort_keys=True).encode()
+    revision = hashlib.sha256(encode([direction, handled_days]))
+    for item in rows:
+        revision.update(encode(item))
+    version = revision.hexdigest()
+    match = CLIENT_CURSOR.fullmatch(cursor)
+    offset = 0 if cursor == 'first' else int(match[2]) if match and match[1] == version else -1
+    page = {'complete': False, 'next_cursor': None, 'byte_limit': CLIENT_PAGE_BYTES}
+    if offset < 0 or (cursor != 'first' and not 0 < offset < len(rows)):
+        return {'status': 'changed', 'guidance': 'Commitments changed or cursor is invalid. Restart with cursor=first.',
+                'client_page': page}
+    out = {key: [] for key in streams}
+    out.update(counts={key: len(entries) for key, entries in streams.items()},
+               coverage='currently_permitted_canonical_loops', absence_is_authoritative=False,
+               handled_days=handled_days, direction=direction, client_page=page)
+    start = offset
+    for key, entry in rows[offset:offset + limit]:
+        out[key].append(entry)
+        if len(encode(out)) > CLIENT_PAGE_BYTES:
+            out[key].pop()
+            if offset == start:
+                raise ValueError('commitment row exceeds client page byte limit')
+            break
+        offset += 1
+    page.update(complete=offset == len(rows),
+                next_cursor=None if offset == len(rows) else f'{version}:{offset}')
+    return out
 
 
 def permitted_rows(data_root, permitted):
@@ -308,8 +423,7 @@ def _obligation_history(data_root: str, permitted: list[str], *, canonical_id=''
                 # Provenance has already validated the source union. Return only evidence fields.
                 # Preserve original field names, which existing readers and evidence IDs use.
                 item = {field: excerpt(f'{key}.{index}.{field}', ref[field], 1200 if field == 'snippet' else 512)
-                        for field in ('sourceType', 'source_type', 'source', 'sourceId', 'source_id', 'id',
-                                      'snippet', 'timestamp', 'date') if field in ref}
+                        for field in (*REFERENCE_FIELDS, 'snippet') if field in ref}
                 out.append(item)
             if len(values) > 4:
                 truncated.append(key)
@@ -322,10 +436,14 @@ def _obligation_history(data_root: str, permitted: list[str], *, canonical_id=''
                  'source_timestamp_kind', 'source_thread_id', 'source_message_id', 'deadline', 'snoozed_until',
                  'reopened_at', 'parked_at', 'last_chased_at', 'handoff_asked_at')}
         item['source_timestamp_state'] = 'recorded' if item['source_timestamp'] else 'unavailable'
+        # The exact binding an owner correction needs, e.g. to reopen a task Sotto closed itself.
+        item.update(loop_version=loop_version(row), loop_identity=loop_identity(row))
+        if signal_closes.is_signal_close(row):
+            item['closed_by'] = row['resolution']
         chased = _s(row.get('chased_count'))
         item['chased_count'] = int(chased) if re.fullmatch(r'[0-9]{1,9}', chased) else None
         item.update(status=status, direction='they_owe_you' if ledger_io.is_waiting_on(row.get('action_type')) else 'you_owe',
-                    ask=excerpt('ask', row.get('ask') or row.get('summary')),
+                    ask=excerpt('ask', ledger_io.deliverable(row) or row.get('ask') or row.get('summary')),
                     summary=excerpt('summary', row.get('summary')),
                     source_snippet=excerpt('source_snippet', row.get('source_snippet'), 1200),
                     source_refs=refs('source_refs'), resolution_source_refs=refs('resolution_source_refs'),

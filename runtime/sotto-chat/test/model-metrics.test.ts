@@ -248,3 +248,69 @@ test('managed compatibility transport exposes malformed terminal output after on
    assert.equal(JSON.stringify(values).includes(privateText),false);
  }finally{await runtime.close();await rm(directory,{recursive:true,force:true});}
 });
+
+test('malformed tool output before any tool starts gets one tool-free answer within the same turn', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'tool-free-chat-recovery-'));
+  const requests: Array<{tools?: unknown[]}> = [];
+  const model = createManagedProxyModels({
+    origin: 'https://proxy.example', allowedOrigin: 'https://proxy.example', bearer: 'fixture',
+    chatModelId: 'chat-fixture', nativeMediaModelId: 'media-fixture',
+    fetch: async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      const first = requests.length === 1;
+      return new Response(JSON.stringify({id: 'fixture', created: 1, model: 'chat-fixture',
+        choices: [{index: 0, message: {role: 'assistant', content: first ? '' : 'The message confused the dates.'},
+          finish_reason: first ? 'MALFORMED_FUNCTION_CALL' : 'stop'}],
+        usage: {prompt_tokens: 1, completion_tokens: 1, total_tokens: 2}}),
+      {status: 200, headers: {'content-type': 'application/json'}});
+    },
+  });
+  const fixture = createTool({id: 'fixture_tool', description: 'Fixture tool', inputSchema: z.object({}),
+    execute: async () => assert.fail('No tool can run during recovery')});
+  let proofReads=0;
+  const runtime = createSottoAgentRuntime({storagePath: join(directory, 'memory.db'),
+    instructions: 'Respond safely.', model: model.chatModel, chatTools: () => ({fixture_tool: fixture}),
+    sourceAuthority:{read:async () => {
+      if (++proofReads===2) return {version:2,complete:false,revision:null,bridge_sources:[],google_sources:[]};
+      return {version:2,complete:true,revision:'a'.repeat(64),bridge_sources:[],google_sources:[]};
+    }}});
+  try {
+    const result = await runtime.generateChat({text: 'Why did you tell me the call was today?',
+      threadId: 'thread', ownerId: 'owner', runId: 'fixture-run'});
+    assert.equal(result.text, 'The message confused the dates.');
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0]?.tools?.length, 1);
+    assert.equal(requests[1]?.tools?.length ?? 0, 0);
+  } finally {
+    await runtime.close();
+    await rm(directory, {recursive: true, force: true});
+  }
+});
+
+test('malformed terminal output after a tool starts keeps the existing failure fence', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'chat-tool-failure-fence-'));
+  let modelCalls = 0;
+  let toolCalls = 0;
+  const fixture = createTool({id: 'fixture_tool', description: 'Fixture tool', inputSchema: z.object({}),
+    execute: async () => { toolCalls++; return {status: 'recorded'}; }});
+  const runtime = createSottoAgentRuntime({storagePath: join(directory, 'memory.db'),
+    instructions: 'Respond safely.', chatTools: () => ({fixture_tool: fixture}),
+    model: new MockLanguageModelV4({doGenerate: async () => {
+      const first = ++modelCalls === 1;
+      return {
+        content: first ? [{type: 'tool-call', toolCallId: 'fixture-call', toolName: 'fixture_tool', input: '{}'}] : [],
+        finishReason: first ? {unified: 'tool-calls', raw: 'TOOL_CALLS'} : {unified: 'error', raw: 'MALFORMED_FUNCTION_CALL'},
+        usage: {inputTokens: {total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0},
+          outputTokens: {total: 1, text: 1, reasoning: 0}}, warnings: [],
+      };
+    }})});
+  try {
+    await assert.rejects(runtime.generateChat({text: 'Record the example.', threadId: 'thread', ownerId: 'owner'}),
+      error => classifyModelFailure(error).category === 'invalid_tool_call');
+    assert.equal(toolCalls, 1);
+    assert.equal(modelCalls, 2);
+  } finally {
+    await runtime.close();
+    await rm(directory, {recursive: true, force: true});
+  }
+});

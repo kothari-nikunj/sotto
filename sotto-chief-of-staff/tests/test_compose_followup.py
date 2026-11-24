@@ -180,7 +180,7 @@ def test_compose_rejects_fabricated_quote_wrong_direction_and_wrong_object():
     meeting = {"meeting_id": "m-sync", "title": "Sync", "date": _iso(2),
                "attendee_emails": ["dana@example.com"],
                "transcript": ("Dana: I'll send the deck tomorrow.\n"
-                              "Dana said Nikunj will send the model.\n"
+                              "Dana said Casey will send the model.\n"
                               "Dana: I'll review the memo.\n"
                               "Dana: I will not send the report.")}
 
@@ -195,7 +195,7 @@ def test_compose_rejects_fabricated_quote_wrong_direction_and_wrong_object():
             {"meeting_id": "m-sync", "owner": "Dana", "owner_is_user": False,
              "what": "send deck", "source_snippet": "Dana: I'll wire the money tomorrow."},
             {"meeting_id": "m-sync", "owner": "Dana", "owner_is_user": False,
-             "what": "send model", "source_snippet": "Dana said Nikunj will send the model."},
+             "what": "send model", "source_snippet": "Dana said Casey will send the model."},
             {"meeting_id": "m-sync", "owner": "Dana", "owner_is_user": False,
              "what": "send memo", "source_snippet": "Dana: I'll review the memo."},
             {"meeting_id": "m-sync", "owner": "Dana", "owner_is_user": False,

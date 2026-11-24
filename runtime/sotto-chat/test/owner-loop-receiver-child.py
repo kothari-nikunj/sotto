@@ -1,4 +1,4 @@
-"""Offline HTTP fixture for the private owner-command receiver route."""
+"""Local owner-tool fixture."""
 import json
 import os
 import pathlib
@@ -227,7 +227,7 @@ if os.environ.get('SOTTO_TEST_KNOWLEDGE_READ') == '1':
     import knowledge_update
     if not list((data_root / 'knowledge/people').glob('*.md')):
         knowledge_update.apply({'person_updates': [{'person_name': 'Dana Cedar',
-            'identifier': 'dana@cedar.com', 'facts': [{'fact':
+            'identifier': 'dana@cedar.test', 'facts': [{'fact':
                 'In 2020 Dana discussed pediatric clinic procurement with Cedar.',
                 'source': 'gmail', 'source_ref': 'synthetic-old-topic-message', 'confidence': 0.95},
                 *([{'fact': 'Dana enjoys hiking in Yosemite.', 'source': 'gmail',
@@ -243,7 +243,7 @@ if os.environ.get('SOTTO_TEST_KNOWLEDGE_READ') == '1':
 
 if os.environ.get('SOTTO_TEST_RELATIONSHIP_EDIT') == '1':
     knowledge_update.apply({'person_updates': [{'person_name': 'Evan Birch',
-        'identifier': 'evan@birch.com', 'facts': [{'fact': 'Evan enjoys cycling.',
+        'identifier': 'evan@birch.test', 'facts': [{'fact': 'Evan enjoys cycling.',
         'source': 'gmail', 'source_ref': 'synthetic-evan', 'confidence': 0.95}]}]},
         now=datetime(2020, 1, 1, tzinfo=timezone.utc))
 
@@ -267,7 +267,7 @@ if os.environ.get('SOTTO_TEST_LOOPS_READ') == '1':
         row = {'anchor_key': 'connected-'+name, 'status':'open', 'source':source,
             'channel':'email' if source=='gmail' else 'imessage', 'action_type':action,
             'contact_name':'Dana Cedar' if name=='owe' else 'Eli Cedar',
-            'contact_identifier':'dana@cedar.com' if name=='owe' else 'eli@cedar.com',
+            'contact_identifier':'dana@cedar.test' if name=='owe' else 'eli@cedar.test',
             'source_thread_id':'connected-thread-'+name,'source_message_id':'connected-message-'+name,
             'source_refs':[{'sourceType':source,'sourceId':'connected-message-'+name}],
             'summary':summary,'created_at':'2026-10-01'}
@@ -382,11 +382,11 @@ if os.environ.get('SOTTO_TEST_LOOP_RESOLVE_MANY') == '1':
     import runtime_owner_loop
     writer = runtime_owner_loop._load_writer()._load_continuity()
     if not (data_root / 'resolve-many-fixture-seeded').exists():
-        for index, name in enumerate(('Tina Jiang','Shimolee Kothari','Hari Raghavan','Other Person'),1):
+        for index, name in enumerate(('Wren Halvorsen','Ines Varga','Theo Lindqvist','Other Person'),1):
             writer._persist({'anchor_key':f'resolve-many-{index}','action_type':'follow_up',
                 'channel':'email','status':'open','created_at':'2026-10-01 10:00:00',
                 'summary': ('Discuss her product lead offer' if index==1 else 'Choose dates for family photos' if index==2 else f'Reply to {name}'),
-                'ask': ('Message Tina about the offer check-in' if index==1 else 'Pick a date and location' if index==2 else f'Reply to {name}'),
+                'ask': ('Message Wren about the offer check-in' if index==1 else 'Pick a date and location' if index==2 else f'Reply to {name}'),
                 'contact_name':name,'contact_identifier':f'person{index}@example.com',
                 **({'canonical_id':f'c_fixture{index}'} if os.environ.get('SOTTO_TEST_SAME_PERSON_TASKS')=='1' else {}),
                 'source':'gmail','source_message_id':f'resolve-many-message-{index}',
@@ -398,7 +398,7 @@ if os.environ.get('SOTTO_TEST_LOOP_RESOLVE_MANY') == '1':
             writer._persist({'anchor_key':'resolve-many-extra','action_type':'follow_up',
                 'channel':'email','status':'open','created_at':'2026-10-01 10:00:00',
                 'summary':'Choose the catering menu','ask':'Confirm the catering menu',
-                'contact_name':'Shimolee Kothari','contact_identifier':'person2@example.com',
+                'contact_name':'Ines Varga','contact_identifier':'person2@example.com',
                 'canonical_id':'c_fixture2','source':'gmail','source_message_id':'extra-message',
                 'source_thread_id':'extra-thread',
                 **({'canonical_id':'c_distinct','contact_identifier':'other@example.com'}
@@ -533,7 +533,7 @@ if os.environ.get('SOTTO_TEST_GRANOLA_READ') == '1' or os.environ.get('SOTTO_TES
         ('mixed', [{'sourceType':'granola','sourceId':'synthetic-meeting'}, {'sourceType':'gmail','sourceId':'synthetic-mail'}], 'Denied mixed Granola Gmail commitment'),
     ):
         row = {'anchor_key':'connected-'+name,'status':'open','source':'granola','channel':'meeting',
-            'action_type':'reply','contact_name':'Dana Cedar','contact_identifier':'dana@cedar.com',
+            'action_type':'reply','contact_name':'Dana Cedar','contact_identifier':'dana@cedar.test',
             'source_thread_id':'granola:synthetic-meeting:commitment','source_refs':refs,
             'summary':summary,'created_at':'2026-10-01'}
         path = directory / (name+'.md')
@@ -713,22 +713,13 @@ if os.environ.get('SOTTO_TEST_DIRECT_PROCEDURE') == '1':
     preference_writer._sync_existing_preferences = direct_master_sync
     receiver.RUNTIME_OWNER_PREFERENCE_TOOL._preferences = lambda: preference_writer
     receiver._runtime_source_authority = lambda: {'version':2,'complete':False,'revision':None,'bridge_sources':[],'google_sources':[],'connector_sources':[]}
-
 if os.environ.get('SOTTO_TEST_USEFULNESS') == '1':
-    from datetime import datetime, timezone
     import managed
     from runtime_owner_loop import _load_writer
     _load_writer()
     import usefulness_feedback
     managed.record_google_consent(data_root, ['https://www.googleapis.com/auth/gmail.readonly'])
-    day = datetime.now(timezone.utc).date().isoformat()
-    archive = data_root / 'briefs' / f'{day}_morning.json'
-    archive.parent.mkdir(parents=True, exist_ok=True)
-    if not archive.exists():
-        archive.write_text(json.dumps({'brief_text': 'School deadline: return the form by Friday.\nDonation item: community fundraiser next week.', '_source_permissions': ['gmail']}))
-        archive.chmod(0o600)
-        marker = archive.parent / f'{day}.morning.delivered'
-        marker.write_bytes(b'synthetic accepted delivery');marker.chmod(0o600)
+    __import__('brief_usefulness_fixture').seed(receiver)
     preference_writer = receiver.RUNTIME_OWNER_PREFERENCE_TOOL._preferences()
     original_sync = preference_writer._sync_existing_preferences
     def usefulness_sync(path):
@@ -738,7 +729,6 @@ if os.environ.get('SOTTO_TEST_USEFULNESS') == '1':
     preference_writer._sync_existing_preferences = usefulness_sync
     receiver.RUNTIME_OWNER_PREFERENCE_TOOL._preferences = lambda: preference_writer
     receiver._runtime_source_authority = lambda: {'version':2,'complete':True,'revision':'a'*64,'bridge_sources':[],'google_sources':['gmail'],'connector_sources':[]}
-
 docsend_dashboard_token = None
 if os.environ.get('SOTTO_TEST_DOCSEND') == '1':
     import owner_docsend_fixture
@@ -757,6 +747,8 @@ for command in sys.stdin:
     if command == 'usefulness-brief-prompt\n':
         import compose_brief
         print(json.dumps({'prompt':compose_brief.build_prompt(compose_brief._load_prompt(), {'type':'morning','google':{},'local':{}})}), flush=True)
+    if command.startswith('nudge-rate='):
+        __import__('nudge_rate').deliver(receiver, command)
     if command in ('execute-followup\n', 'execute-relationship-pulse\n', 'execute-proactive\n', 'execute-ask-research\n'):
         job = receiver.WORK_QUEUE.claim(receiver.DATA, 'fixture-followup-worker')
         if job:

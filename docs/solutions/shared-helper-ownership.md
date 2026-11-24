@@ -22,3 +22,13 @@ Do not add duplicate policy constants or change Docker behavior to hide a missin
 The supported consumer checks are receiver/dashboard/calendar-cache imports, current source
 and packaged layouts, exact helper semantics and the shared release gate. A successful source
 import alone does not prove packaged layout support.
+
+`outbox.py` can settle a delivery before the receiver has installed the shared library directory
+on the import path. Helpers loaded by its caller-file lookup must import without relying on that
+setup. The protected proof module establishes its own immutable library directory before importing
+its siblings. The standalone self-host Photon smoke test loads the real outbox directly and
+settles a routine receipt without the receiver path setup.
+
+When moving a helper, check qualified calls to names its old module imported. Introduction
+completion in `loop_check.py` imports `getaddresses` directly and checks only To/Cc. The general
+sent-mail recipient helper also reads Bcc, which is outside the introduction close rule.

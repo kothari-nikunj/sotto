@@ -22,7 +22,7 @@ def _call(root, person='Dana', *, sources=('gmail', 'imessage'), topic='clinic r
 def _write(root, key, **changes):
     import yaml
     row = dict(anchor_key=key, status='resolved', canonical_id='dana', contact_name='Dana',
-               contact_identifier='dana@cedar.com', action_type='reply', channel='email', source='gmail',
+               contact_identifier='dana@cedr.test', action_type='reply', channel='email', source='gmail',
                source_thread_id='original-thread', source_message_id='original-email',
                created_at='2026-06-01T14:00:00Z', source_timestamp='2026-05-31T14:00:00Z',
                summary='Send the clinic report', ask='Send the clinic report with the final clinic totals.',
@@ -77,18 +77,18 @@ def test_shared_name_alias_and_conflicting_canonical_row_do_not_join_history(gra
     import knowledge as kg
     root, _ = graph
     _write(root, 'right')
-    _write(root, 'wrong-cid', canonical_id='other', contact_identifier='dana@cedar.com')
+    _write(root, 'wrong-cid', canonical_id='other', contact_identifier='dana@cedr.test')
     other = kg.PersonFile(canonical_id='other', name='Dana', identifiers=['other@example.test'])
     (root/'knowledge/people/other.md').write_text(kg.serialize_person_file(other))
     ambiguous = _call(root)
     assert ambiguous['person_knowledge'] == {}
     assert ambiguous['coverage']['identity_resolution']['status'] == 'ambiguous'
     assert ambiguous['obligation_history']['status'] == 'identity_unresolved'
-    selected = _call(root, 'dana@cedar.com')['obligation_history']
+    selected = _call(root, 'dana@cedr.test')['obligation_history']
     assert [row['anchor_key'] for row in selected['items']] == ['right']
-    other.identifiers.append('dana@cedar.com')
+    other.identifiers.append('dana@cedr.test')
     (root/'knowledge/people/other.md').write_text(kg.serialize_person_file(other))
-    assert _call(root, 'dana@cedar.com')['obligation_history']['status'] == 'identity_unresolved'
+    assert _call(root, 'dana@cedr.test')['obligation_history']['status'] == 'identity_unresolved'
     assert [row['anchor_key'] for row in _call(root, 'dana')['obligation_history']['items']] == ['right']
 
 
@@ -142,7 +142,7 @@ def test_unreadable_person_cannot_make_a_shared_name_or_alias_appear_unique(grap
     root, _ = graph
     _write(root, 'old-clinic')
     (root/'knowledge/people/other-dana.md').write_text('---\nname: [broken\n---\n')
-    for selector in ('Dana', 'dana@cedar.com', 'dana'):
+    for selector in ('Dana', 'dana@cedr.test', 'dana'):
         result = _call(root, selector)
         assert result['person_knowledge'] == {}
         assert result['coverage']['identity_resolution']['status'] == 'unavailable'

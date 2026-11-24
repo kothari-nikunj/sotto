@@ -11,7 +11,7 @@
 # verbatim: its stages, packaged files and credential-free image checks.
 # sotto-chief-of-staff/tests/test_root_image.py fails when the two drift; change Dockerfile.runtime
 # first, then copy the same block here. Base images stay pinned by tag and multi-arch digest.
-FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS node-build
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS node-build
 WORKDIR /build/runtime/sotto-chat
 COPY runtime/sotto-chat/package.json runtime/sotto-chat/package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
@@ -20,12 +20,12 @@ COPY runtime/sotto-chat/src/ ./src/
 RUN npm run typecheck && npm run build \
  && node --input-type=module -e 'await import("./dist/bootstrap/main.js"); await import("chat"); await import("@chat-adapter/telegram"); await import("@photon-ai/chat-adapter-imessage"); await import("@spectrum-ts/core");'
 
-FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS node-production
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS node-production
 WORKDIR /build/runtime/sotto-chat
 COPY runtime/sotto-chat/package.json runtime/sotto-chat/package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 
-FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS runtime
+FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df AS runtime
 ENV NODE_ENV=production \
     MASTRA_TELEMETRY_DISABLED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

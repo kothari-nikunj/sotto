@@ -22,8 +22,8 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
         policy=policy, data_root=data_root, activation=activation,
         telegram_verifier=telegram_verifier, chat_client=chat_client)
     writer = _preferences()
-    if type(body['args']) is dict and body['args'].get('operation') in ('usefulness-list', 'usefulness'):
-        return _usefulness(body, proof, writer, policy)
+    if type(body['args']) is dict and body['args'].get('operation') in ('usefulness-list', 'usefulness', 'notification-usefulness'):
+        return _usefulness(body, proof, writer, policy, data_root)
     if type(body['args']) is dict and body['args'].get('operation') in ('snooze-nudges','unsnooze-nudges'):
         from datetime import datetime, timezone
         args = body['args']
@@ -218,21 +218,31 @@ def perform(body, *, bearer, root, policy, data_root, capability, activation,
             'args_hash': proof['args_hash'], 'outcome': outcome}
 
 
-def _usefulness(body, proof, writer, policy):
+def _usefulness(body, proof, writer, policy, data_root):
     import json
     import re
     from runtime_owner_loop import _load_writer
     _load_writer()
     import usefulness_feedback as feedback
     from personal_context import item_locator
+    from runtime_read_admission import READ_CONTEXT_WINDOW_MS
     args = body['args']
     listing = args['operation'] == 'usefulness-list'
-    required = {'operation', 'source_revision'} if listing else {'operation', 'rating', 'reference', 'archive_version', 'excerpt', 'source_revision'}
+    notification = args['operation'] == 'notification-usefulness'
+    required = ({'operation', 'source_revision'} if listing else
+                {'operation', 'rating', 'dispatch_id', 'provider_message_id', 'route_digest', 'payload_hash', 'source_revision'}
+                if notification else {'operation', 'rating', 'reference', 'archive_version', 'excerpt', 'source_revision'})
     if set(args) != required or type(args['source_revision']) is not str or not re.fullmatch(r'[a-f0-9]{64}', args['source_revision']):
         raise ValueError('usefulness arguments invalid')
     if listing and body['operation'] != 'read' or not listing and body['operation'] not in ('apply', 'inspect'):
         raise ValueError('usefulness operation invalid')
-    if not listing:
+    if notification:
+        if (body['identity']['channel'] != 'photon' or args['rating'] not in ('useful', 'not_useful')
+                or not all(isinstance(args[key], str) and re.fullmatch(pattern, args[key]) for key, pattern in (
+                    ('dispatch_id', r'(?:[a-f0-9]{16}|[a-f0-9]{32})'), ('route_digest', r'[a-f0-9]{64}'),
+                    ('payload_hash', r'[a-f0-9]{64}'), ('provider_message_id', r'[^\x00-\x1f\x7f\ud800-\udfff]{1,512}')))):
+            raise ValueError('notification usefulness target invalid')
+    elif not listing:
         if (args['rating'] not in ('useful', 'not_useful') or type(args['reference']) is not str
                 or not re.fullmatch(r'\d{4}-\d{2}-\d{2}_(morning|evening|welcome)', args['reference'])
                 or type(args['archive_version']) is not str or not re.fullmatch(r'[a-f0-9]{64}', args['archive_version'])
@@ -251,9 +261,23 @@ def _usefulness(body, proof, writer, policy):
             captured = grants
         elif captured != grants:
             raise writer.OwnerPreferenceRefusalError('source_unavailable')
+        if notification:
+            route = policy.get('_retained_route_digest')
+            if not callable(route) or route() != args['route_digest']:
+                raise writer.OwnerPreferenceRefusalError('target_unavailable')
     guard.permitted = lambda source: source in captured
     def select():
         guard()
+        if notification:
+            match = re.fullmatch(r'(?:this (?:was|is) |that (?:was|is) )?(not useful|useful)[.!]?', body['text'].strip(), re.I)
+            if not match or match[1].lower().replace(' ', '_') != args['rating']:
+                raise writer.OwnerPreferenceRefusalError('owner_span_unavailable')
+            accepted = policy['_notification_feedback_receipt'](data_root, args, proof['admitted_at_ms'], READ_CONTEXT_WINDOW_MS)
+            if accepted is None:
+                raise writer.OwnerPreferenceRefusalError('target_unavailable')
+            if accepted.get('source') not in captured:
+                raise writer.OwnerPreferenceRefusalError('source_unavailable')
+            return accepted
         items = feedback.items(permitted=guard.permitted, versions=True)
         guard()
         selected = next((item for item in items if item['reference'] == args['reference']), None)

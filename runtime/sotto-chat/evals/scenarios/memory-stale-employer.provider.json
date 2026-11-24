@@ -1,0 +1,118 @@
+{
+  "instructions": "Synthetic transport contract only. Scripted tool choices and answers are not model-quality evidence. Inspect real returned saved evidence and original source records; no writes or external sends.",
+  "steps": [
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "mira@example.test",
+            "--person-coverage",
+            "--facts-only"
+          ]
+        }
+      }
+    },
+    {
+      "text": "Saved memory says Mira works at Cedar Labs; I have not checked the original email.",
+      "toolResultContains": [
+        "gmail:memory-employer-old",
+        "gmail:memory-employer-new",
+        "source_timestamp"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "run_sotto_script",
+        "arguments": {
+          "id": "knowledge-query",
+          "args": [
+            "--person",
+            "mira@example.test",
+            "--person-coverage",
+            "--facts-only"
+          ]
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "gmail_get",
+        "arguments": {
+          "message_id": "memory-employer-old"
+        }
+      },
+      "toolResultContains": [
+        "gmail:memory-employer-old",
+        "gmail:memory-employer-new",
+        "source_timestamp"
+      ]
+    },
+    {
+      "tool": {
+        "name": "gmail_get",
+        "arguments": {
+          "message_id": "memory-employer-new"
+        }
+      },
+      "toolResultContains": [
+        "I currently work at Cedar Labs.",
+        "memory-employer-old",
+        "Mira Example <mira@example.test>",
+        "Thu, 01 Oct 2026 09:00:00 +0000"
+      ]
+    },
+    {
+      "text": "Mira now works at Oak Labs. Her November 5 email says she left Cedar Labs in October.",
+      "toolResultContains": [
+        "I left Cedar Labs in October. I now work at Oak Labs.",
+        "memory-employer-new",
+        "Mira Example <mira@example.test>",
+        "Thu, 05 Nov 2026 09:00:00 +0000"
+      ]
+    },
+    {
+      "tool": {
+        "name": "skill",
+        "arguments": {
+          "name": "sotto-ask"
+        }
+      }
+    },
+    {
+      "tool": {
+        "name": "gmail_get",
+        "arguments": {
+          "message_id": "memory-employer-new"
+        }
+      }
+    },
+    {
+      "text": "Mira wrote that she left Cedar Labs in October and now works at Oak Labs.",
+      "toolResultContains": [
+        "I left Cedar Labs in October. I now work at Oak Labs.",
+        "memory-employer-new",
+        "Mira Example <mira@example.test>",
+        "Thu, 05 Nov 2026 09:00:00 +0000"
+      ]
+    }
+  ]
+}

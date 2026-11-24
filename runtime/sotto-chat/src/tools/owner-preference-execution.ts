@@ -1,7 +1,8 @@
 /** Framework-neutral private preference execution; model runtimes supply only trusted context. */
 import type {OperationalJournal, ExplicitOwnerLoopAuthority} from '../journal/index.js';
 import {readAuthority, SourceAuthorityChanged, type SourceAuthorityReader} from '../agent/source-authority.js';
-import {stableActionIdentity, ActionHeldError} from './action-gate.js';
+import {stableActionIdentity, ActionHeldError, OneMessageRequiredError} from './action-gate.js';
+import {acceptedQuotedBackgroundProof} from '../background-context.js';
 import {ownerPreferenceToolArgsSchema, ownerPreferenceToolKind, usefulnessListSchema, type UsefulnessList} from './owner-preference-tool-contract.js';
 import type {OwnerPreferenceToolClient} from './owner-preference-tool-client.js';
 export interface OwnerPreferenceExecutionContext {
@@ -38,9 +39,9 @@ export function createOwnerPreferenceExecution(options: OwnerPreferenceExecution
   };
   const change = async (input: unknown, context: OwnerPreferenceExecutionContext) => {
     const {journal, authority, eventId} = trusted(context);
-    if (context.allowOwnerPreference !== true) throw new Error('Owner preference requires one owner message');
+    if (context.allowOwnerPreference !== true) throw new OneMessageRequiredError();
     const args = ownerPreferenceToolArgsSchema.parse(input);
-    if(args.operation==='usefulness'||args.operation==='snooze-nudges'||args.operation==='unsnooze-nudges') {
+    if(args.operation==='usefulness'||args.operation==='notification-usefulness'||args.operation==='snooze-nudges'||args.operation==='unsnooze-nudges') {
       journal.ownerReminderToolAdmission(authority,eventId,true);
       const existing=journal.listOwnerPreferenceToolActionsForThread(eventId).find(action=>action.source_event_id===eventId);
       if(existing) {
@@ -51,7 +52,7 @@ export function createOwnerPreferenceExecution(options: OwnerPreferenceExecution
         if(saved.status==='rejected')return {status:'rejected',code:saved.rejection};
         if(saved.status!=='pending')throw new ActionHeldError();
       }
-      if(args.operation==='usefulness') {if(await usefulnessSource(context)!==args.source_revision)throw new SourceAuthorityChanged();}
+      if(args.operation==='usefulness'||args.operation==='notification-usefulness') {if(await usefulnessSource(context)!==args.source_revision)throw new SourceAuthorityChanged();}
       else await sourceCurrent(context);
     } else await sourceCurrent(context);
     const admission = journal.ownerReminderToolAdmission(authority, eventId, true);
@@ -137,7 +138,7 @@ export function createOwnerPreferenceExecution(options: OwnerPreferenceExecution
   };
   const rateUsefulness = async (input:{rating:'useful'|'not_useful';reference:string;excerpt:string},context:OwnerPreferenceExecutionContext) => {
     const {journal,authority,eventId}=trusted(context);
-    if(context.allowOwnerPreference!==true)throw new Error('Owner preference requires one owner message');
+    if(context.allowOwnerPreference!==true)throw new OneMessageRequiredError();
     journal.ownerReminderToolAdmission(authority,eventId,true);
     const existing=journal.listOwnerPreferenceToolActionsForThread(eventId).find(action=>action.source_event_id===eventId);
     if(existing) {
@@ -154,5 +155,20 @@ export function createOwnerPreferenceExecution(options: OwnerPreferenceExecution
     if(!item)throw new Error('Usefulness target unavailable');
     return change({operation:'usefulness',...input,archive_version:item.archive_version,source_revision:listed.source_revision},context);
   };
-  return {read, change, acceptOffer,confirmProcedure,listUsefulness,rateUsefulness};
+  const rateNotification = async (rating:'useful'|'not_useful', context:OwnerPreferenceExecutionContext) => {
+    const {journal,authority,eventId}=trusted(context);
+    if(context.allowOwnerPreference!==true)throw new OneMessageRequiredError();
+    journal.ownerReminderToolAdmission(authority,eventId,true);
+    const existing=journal.listOwnerPreferenceToolActionsForThread(eventId).find(action=>action.source_event_id===eventId);
+    if(existing){
+      const args=journal.readOwnerPreferenceToolAction(existing.id as string,authority).request.args;
+      if(args?.operation!=='notification-usefulness'||args.rating!==rating)throw new Error('Owner preference event conflicts with saved arguments');
+      return change(args,context);
+    }
+    const quoted=acceptedQuotedBackgroundProof(journal,eventId);
+    if(!quoted)throw new Error('Reply directly to the accepted notification to rate it.');
+    const revision=await usefulnessSource(context);
+    return change({operation:'notification-usefulness',rating,...quoted,source_revision:revision},context);
+  };
+  return {read, change, acceptOffer,confirmProcedure,listUsefulness,rateUsefulness,rateNotification};
 }

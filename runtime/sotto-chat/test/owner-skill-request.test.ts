@@ -71,7 +71,7 @@ test('meeting-prep command maps only complete sweep/focus and rejects subprocess
   assert.deepEqual(parseSkillCommand([], 'relationship-pulse'), {skill: 'relationship-pulse', selection: {mode: 'current'}});
   for (const args of [['--person', 'Dana'], ['--backlog'], ['--out', '/tmp/pulse']]) assert.throws(() => parseSkillCommand(args, 'relationship-pulse'));
   assert.deepEqual(parseSkillCommand([]), {skill: 'meeting-prep', selection: {mode: 'sweep'}});
-  assert.deepEqual(parseSkillCommand(['--focus', 'Spencer Kim']), {skill: 'meeting-prep', selection: {mode: 'focus', focus: 'Spencer Kim'}});
+  assert.deepEqual(parseSkillCommand(['--focus', 'Rowan Pike']), {skill: 'meeting-prep', selection: {mode: 'focus', focus: 'Rowan Pike'}});
   const meeting = {event_id:'exact-calendar-id',start:'2026-10-28T15:00:00+00:00'};
   assert.deepEqual(parseSkillCommand(['--focus','Cedar review'],'meeting-prep',meeting),
     {skill:'meeting-prep',selection:{mode:'focus',focus:'Cedar review',meeting}});
@@ -83,7 +83,7 @@ test('meeting-prep command maps only complete sweep/focus and rejects subprocess
   assert.throws(()=>parseSkillCommand([],'meeting-prep',meeting));
   assert.throws(()=>parseSkillCommand(['--person','Dana'],'ask-research',meeting));
   assert.throws(()=>parseSkillCommand(['--focus','Cedar review'],'meeting-prep',{...meeting,start:'tomorrow'}));
-  for (const args of [['--focus'], ['--focus', ' Spencer'], ['--focus', 'line\nline'], ['--event-id', 'forged'], ['--focus', 'x', '--out', '/tmp/x']]) assert.throws(() => parseSkillCommand(args));
+  for (const args of [['--focus'], ['--focus', ' Rowan'], ['--focus', 'line\nline'], ['--event-id', 'forged'], ['--focus', 'x', '--out', '/tmp/x']]) assert.throws(() => parseSkillCommand(args));
 });
 
 test('a narrow company blurb does not admit broad or focused meeting prep', () => {
@@ -117,15 +117,15 @@ test('explicit meeting prep remains available for a sweep or one meeting', () =>
     assert.equal(isOwnerMeetingPrepRequest(text, 'focus'), true, text);
     assert.equal(isOwnerMeetingPrepRequest(text, 'sweep'), false, text);
   }
-  assert.equal(isOwnerMeetingPrepRequest('Prep Spencer Kim', 'focus'), true);
+  assert.equal(isOwnerMeetingPrepRequest('Prep Rowan Pike', 'focus'), true);
   for (const text of ["prep went well", "prep is done, thanks", "prep for Dana was great, thanks", "Prep looked really good", "the prep was helpful"])
     assert.equal(isOwnerMeetingPrepRequest(text, 'focus'), false, text);
-  for (const text of ["prep me for my 3pm", "prep for Dana", "Prep Spencer Kim", "prep for the call Dana was asking about"])
+  for (const text of ["prep me for my 3pm", "prep for Dana", "Prep Rowan Pike", "prep for the call Dana was asking about"])
     assert.equal(isOwnerMeetingPrepRequest(text, 'focus'), true, text);
   assert.equal(isOwnerMeetingPrepRequest('Prep me for my 2:15', 'focus'), true);
   assert.equal(isOwnerMeetingPrepRequest('Give me meeting prep for Dana', 'focus'), true);
   assert.equal(isOwnerMeetingPrepRequest('Can you prepare me for my meeting with Dana?', 'focus'), true);
-  assert.equal(isOwnerMeetingPrepRequest('Prep Spencer Kim', 'sweep'), false);
+  assert.equal(isOwnerMeetingPrepRequest('Prep Rowan Pike', 'sweep'), false);
   assert.equal(isOwnerMeetingPrepRequest('Prepare a short blurb for Cedar Labs for my IC tomorrow', 'focus'), false);
   assert.equal(isOwnerMeetingPrepRequest('Prep a 3-4 sentence summary of Cedar Labs', 'focus'), false);
 });
@@ -167,12 +167,12 @@ for (const skill of ['meeting-prep', 'ask-research', 'ask-company', 'followup', 
   const sent: string[] = [];
   let coordinator = new ConversationCoordinator({journal, ownerPolicy, ownerSkillRequest: client,
     model: {generate: async request => {
-      await command({id: skill === 'ask-company' ? 'ask-research' : skill, args: (skill === 'relationship-pulse' || skill === 'proactive') ? [] : skill === 'followup' ? ['--backlog'] : [skill === 'ask-company' ? '--company' : skill === 'ask-research' ? '--person' : '--focus', 'Spencer Kim']}, {mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey, allowOwnerSkill: request.allowOwnerSkill, sourceRevision: 'a'.repeat(64), signal: request.signal});
+      await command({id: skill === 'ask-company' ? 'ask-research' : skill, args: (skill === 'relationship-pulse' || skill === 'proactive') ? [] : skill === 'followup' ? ['--backlog'] : [skill === 'ask-company' ? '--company' : skill === 'ask-research' ? '--person' : '--focus', 'Rowan Pike']}, {mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey, allowOwnerSkill: request.allowOwnerSkill, sourceRevision: 'a'.repeat(64), signal: request.signal});
       return 'invented completed prep';
     }}, postPrepared: async request => {assert.match(request.text, /I couldn’t confirm whether the skill request/);sent.push(request.text);return {acceptance:'accepted',messageId:'pending-notice'};}});
   let silentAccepted=0;
   try {
-    assert.equal((await coordinator.receive(inbound('prep', skill === 'proactive' ? 'Check for anything urgent' : skill === 'relationship-pulse' ? 'quick relationship pulse?' : skill === 'followup' ? 'who do I owe a reply?' : 'Prep Spencer Kim'), context)).status, 'held');
+    assert.equal((await coordinator.receive(inbound('prep', skill === 'proactive' ? 'Check for anything urgent' : skill === 'relationship-pulse' ? 'quick relationship pulse?' : skill === 'followup' ? 'who do I owe a reply?' : 'Prep Rowan Pike'), context)).status, 'held');
     const saved = journal.db.prepare('SELECT * FROM actions WHERE kind=?').get(ownerSkillRequestKind)!;
     assert.equal(saved.status, 'unknown');
     await coordinator.close(); journal.close(); journal = new OperationalJournal(join(directory, 'journal.sqlite')); journal.recoverInterrupted();
@@ -186,7 +186,7 @@ for (const skill of ['meeting-prep', 'ask-research', 'ask-company', 'followup', 
     assert.equal(admissions, 1);assert.equal(silentAccepted,0,'recovery must not fabricate fresh completion');
     assert.equal(sent.filter(text=>text.startsWith('I couldn’t confirm whether')).length,1);
     assert.deepEqual(sent.slice(1), skill === 'proactive' ? ['safe reply'] : ['safe reply', skill === 'relationship-pulse' ? 'Your relationship pulse is queued. It will arrive separately.' : skill === 'followup' ? 'Your follow-up is queued. It will arrive separately.' : (skill === 'ask-research' || skill === 'ask-company') ? 'Your research is queued. It will arrive separately.' : 'Your meeting prep is queued. It will arrive separately.']);
-    assert.equal((await coordinator.receive(inbound('prep', skill === 'proactive' ? 'Check for anything urgent' : skill === 'relationship-pulse' ? 'quick relationship pulse?' : skill === 'followup' ? 'who do I owe a reply?' : 'Prep Spencer Kim'), context)).status, 'duplicate');
+    assert.equal((await coordinator.receive(inbound('prep', skill === 'proactive' ? 'Check for anything urgent' : skill === 'relationship-pulse' ? 'quick relationship pulse?' : skill === 'followup' ? 'who do I owe a reply?' : 'Prep Rowan Pike'), context)).status, 'duplicate');
     assert.throws(() => journal.prepareOwnerPreferenceToolAction({runId: saved.run_id as string, accountId: 'account', ownerId: 'owner', lineKey: 'line', channel: 'photon', scopeHash: client.scopeHash}, saved.source_event_id as string, {operation: 'clear-tone'}), /another private mutation/);
   } finally {await coordinator.close(); journal.close(); rmSync(directory, {recursive: true, force: true});}
 });
@@ -196,13 +196,13 @@ test('journal binds exact focus, refuses changed args and reciprocal writes befo
   const journal = new OperationalJournal(join(directory, 'journal.sqlite'));
   const authority = {runId: 'run', accountId: 'account', ownerId: 'owner', lineKey: 'line', channel: 'photon' as const, scopeHash: 'c'.repeat(64)};
   try {
-    const event = journal.admitInbound({eventId: 'source', accountKey: 'account', lineKey: 'line', threadKey: 'thread', channel: 'photon', sender: 'owner', payload: JSON.stringify({inbound: inbound('source', 'Prep Spencer Kim'), context})}).event.id as string;
+    const event = journal.admitInbound({eventId: 'source', accountKey: 'account', lineKey: 'line', threadKey: 'thread', channel: 'photon', sender: 'owner', payload: JSON.stringify({inbound: inbound('source', 'Prep Rowan Pike'), context})}).event.id as string;
     journal.startRun({runId: 'run', eventId: event});
     assert.throws(() => journal.prepareOwnerSkillRequestAction(authority, event, parseSkillCommand(['--person', 'Another person'], 'ask-research')), /exact owner span/);
     assert.equal(journal.db.prepare('SELECT count(*) n FROM actions').get()!.n, 0);
-    const request = journal.prepareOwnerSkillRequestAction(authority, event, parseSkillCommand(['--focus', 'Spencer Kim']));
+    const request = journal.prepareOwnerSkillRequestAction(authority, event, parseSkillCommand(['--focus', 'Rowan Pike']));
     assert.throws(() => journal.prepareOwnerSkillRequestAction(authority, event, parseSkillCommand([])), /conflicts/);
-    assert.throws(() => journal.prepareOwnerSkillRequestAction(authority, event, parseSkillCommand(['--person', 'Spencer Kim'], 'ask-research')), /conflicts/);
+    assert.throws(() => journal.prepareOwnerSkillRequestAction(authority, event, parseSkillCommand(['--person', 'Rowan Pike'], 'ask-research')), /conflicts/);
     assert.throws(() => journal.prepareOwnerPreferenceToolAction(authority, event, {operation: 'clear-tone'}), /another private mutation/);
     assert.deepEqual(journal.readOwnerSkillRequestAction(request.actionId, authority).request, request);
   } finally {journal.close(); rmSync(directory, {recursive: true, force: true});}

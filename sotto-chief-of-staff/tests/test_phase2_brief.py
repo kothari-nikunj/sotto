@@ -325,13 +325,10 @@ def test_named_loop_suppression_requires_the_specific_ask(volume):
     entry = row("one", "Send the signed agreement")
     prose = "Alex Chen still needs an answer. <!--id:alex@example.com-->"
     assert cb._represented_loop_rows([entry], prose) == []
-    cb._record_named_loops([entry], prose, "2026-09-18", "evening")
-    saved = json.loads((volume / "briefs/2026-09-18.evening.named.json").read_text())
-    assert saved == {"anchor_keys": []}
-    cb._record_named_loops([entry], "Alex Chen: Send the signed agreement.",
-                           "2026-09-18", "evening")
-    saved = json.loads((volume / "briefs/2026-09-18.evening.named.json").read_text())
-    assert saved == {"anchor_keys": ["one"]}
+    saved = cb._named_loops([entry], prose, "2026-09-18", "evening")
+    assert saved["anchor_keys"] == []
+    saved = cb._named_loops([entry], "Alex Chen: Send the signed agreement.", "2026-09-18", "evening")
+    assert saved["anchor_keys"] == ["one"]
 
 
 def test_open_loop_markers_follow_deduplicated_asks():
@@ -372,3 +369,12 @@ def test_partial_current_messages_do_not_hide_stalled_history(volume, monkeypatc
     text = health(volume, state, inputs)
     assert "Learning from older iMessage messages is paused" in text
     assert "recent messages are available" in text
+
+
+def test_history_note_is_its_own_paragraph_under_any_greeting(volume):
+    stalled = {"sources": {"gmail": {"error_code": "provider_request_rejected"}}}
+    for brief in ("Good morning\nNeeds Attention Now\nAlex: reply.", "Good morning\n\nNeeds Attention Now\nAlex: reply."):
+        (volume / "knowledge/history-state.json").write_text(json.dumps(stalled))
+        text = cb._append_history_health({"brief_markdown": brief}, {}, NOW)["brief_markdown"]
+        first, note, rest = text.split("\n\n")
+        assert first == "Good morning" and "paused" in note and rest == "Needs Attention Now\nAlex: reply."

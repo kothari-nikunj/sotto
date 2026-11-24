@@ -25,7 +25,7 @@ def test_small_meeting_writes_stub_fact_and_company(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_USER_EMAIL", "me@mine.com")
     out = gg.run({"meetings": [_meeting(
-        ["priya@acmecorp.com", "sarah.chen@acmecorp.com", "bob@northstar.io"],
+        ["priya@acmecorp.com", "sarah.chen@acmecorp.com", "bob@northstar.test"],
         summary="Priya wants the redline back by Friday. Then a second sentence.")]})
     assert out == {"meetings": 1, "people": 3, "facts": 3, "skipped_large": 0}
 
@@ -43,7 +43,7 @@ def test_small_meeting_writes_stub_fact_and_company(tmp_path, monkeypatch):
     assert len(facts[0].text) <= gg.MAX_FACT_CHARS
 
     assert _person("sarah.chen@acmecorp.com").name == "Sarah Chen"   # derived from the local part
-    assert _person("bob@northstar.io").company == "Northstar"
+    assert _person("bob@northstar.test").company == "Northstar"
 
 
 def test_large_meeting_is_not_a_relationship(tmp_path, monkeypatch):

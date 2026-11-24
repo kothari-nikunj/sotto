@@ -184,14 +184,14 @@ def test_thread_id_is_surfaced_so_an_email_draft_can_be_threaded(tmp_path, monke
     cdir = tmp_path / "knowledge" / "continuity"
     cdir.mkdir(parents=True)
     _write(cdir, "a", {"status": "open", "action_type": "reply", "channel": "email",
-                       "contact_name": "Pegah", "contact_identifier": "pegah@example.com",
+                       "contact_name": "Odile", "contact_identifier": "odile@example.com",
                        "summary": "SAFE allocation call", "source_thread_id": "T7"})
     _write(cdir, "b", {"status": "open", "action_type": "reply", "channel": "imessage",
                        "contact_name": "Dhruv", "contact_identifier": "+15551234567",
                        "summary": "ping back"})
     out = lq.query()
     by_name = {e["name"]: e for e in out["you_owe"]}
-    assert by_name["Pegah"]["thread_id"] == "T7"
+    assert by_name["Odile"]["thread_id"] == "T7"
     assert by_name["Dhruv"]["thread_id"] == ""
 
 

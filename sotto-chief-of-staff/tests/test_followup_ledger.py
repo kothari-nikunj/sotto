@@ -69,12 +69,12 @@ def test_commitment_with_email_becomes_follow_up_ledger_item(tmp_path, monkeypat
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     res = ac.apply({"commitments": [
         {"meeting": "Acme sync", "meeting_id": "m-acme", "owner": "you", "owner_is_user": True,
-         "what": "send the deck", "source_snippet": "Nikunj: I'll send the deck",
+         "what": "send the deck", "source_snippet": "Casey: I'll send the deck",
          "due": "2026-07-04", "to_email": "dana@acme.com"}]}, USER, NOW)
     assert res["written"] == 1 and res["deduped"] == 0
     items = _ledger_items(tmp_path)
     it = items[_ganchor("m-acme", "send the deck",
-                        source_snippet="Nikunj: I'll send the deck", counterpart="dana@acme.com")]
+                        source_snippet="Casey: I'll send the deck", counterpart="dana@acme.com")]
     assert it["action_type"] == "follow_up"                   # the user owes it
     assert it["status"] == "open" and "times_surfaced" not in it
     assert it["deadline"] == "2026-07-04"
@@ -295,7 +295,7 @@ def test_same_words_in_a_later_meeting_are_a_new_occurrence(tmp_path, monkeypatc
 def test_same_source_snippet_dedupes_even_when_llm_paraphrases(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     base = {"meeting": "Weekly", "meeting_id": "week-1", "owner": "you",
-            "owner_is_user": True, "source_snippet": "Nikunj: I'll send the deck tomorrow"}
+            "owner_is_user": True, "source_snippet": "Casey: I'll send the deck tomorrow"}
     first = ac.apply({"commitments": [{**base, "what": "send the deck tomorrow"}]}, USER, NOW)
     second = ac.apply({"commitments": [{**base, "what": "share the deck with them by tomorrow"}]},
                       USER, NOW)
@@ -332,27 +332,27 @@ def test_reworded_source_snippet_folds_same_deliverable_but_keeps_different_one(
 def test_unknown_account_name_rejects_local_part_shared_by_attendee(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.delenv('SOTTO_USER_NAME', raising=False)
-    meeting = {'meeting_id': 'm-nik', 'transcript': "Nik: I'll send the deck.",
-               'attendees': [{'email': 'nik@own.com', 'name': ''},
-                             {'email': 'nik.patel@other.com', 'name': 'Nik Patel'}],
-               'attendee_emails': ['nik@own.com', 'nik.patel@other.com']}
-    result = ac.apply({'commitments': [{'meeting_id': 'm-nik', 'owner': 'Nik',
+    meeting = {'meeting_id': 'm-kit', 'transcript': "Kit: I'll send the deck.",
+               'attendees': [{'email': 'kit@own.com', 'name': ''},
+                             {'email': 'kit.patel@other.com', 'name': 'Kit Patel'}],
+               'attendee_emails': ['kit@own.com', 'kit.patel@other.com']}
+    result = ac.apply({'commitments': [{'meeting_id': 'm-kit', 'owner': 'Kit',
         'owner_is_user': True, 'what': 'send the deck',
-        'source_snippet': "Nik: I'll send the deck."}]}, 'nik@own.com', NOW,
+        'source_snippet': "Kit: I'll send the deck."}]}, 'kit@own.com', NOW,
         source_meetings=[meeting])
     assert result['written'] == 0 and result['grounding']['reasons']['owner'] == 1
 
 
 def test_full_owner_claim_does_not_make_ambiguous_first_name_quote_safe(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
-    meeting = {'meeting_id': 'm-two-nikunj', 'transcript': "Nikunj: I'll send the deck.",
-               'attendees': [{'email': USER, 'name': 'Nikunj Kothari'},
-                             {'email': 'other@example.com', 'name': 'Nikunj Patel'},
+    meeting = {'meeting_id': 'm-two-casey', 'transcript': "Casey: I'll send the deck.",
+               'attendees': [{'email': USER, 'name': 'Casey Lindgren'},
+                             {'email': 'other@example.com', 'name': 'Casey Patel'},
                              {'email': 'dana@example.com', 'name': 'Dana'}],
                'attendee_emails': [USER, 'other@example.com', 'dana@example.com']}
-    result = ac.apply({'commitments': [{'meeting_id': 'm-two-nikunj',
-        'owner': 'Nikunj Kothari', 'owner_is_user': True, 'what': 'send the deck',
-        'to_email': 'dana@example.com', 'source_snippet': "Nikunj: I'll send the deck."}]},
+    result = ac.apply({'commitments': [{'meeting_id': 'm-two-casey',
+        'owner': 'Casey Lindgren', 'owner_is_user': True, 'what': 'send the deck',
+        'to_email': 'dana@example.com', 'source_snippet': "Casey: I'll send the deck."}]},
         USER, NOW, source_meetings=[meeting])
     assert result['written'] == 0 and result['grounding']['reasons']['owner'] == 1
 
@@ -425,9 +425,9 @@ def test_wrong_direction_or_invented_reconciliation_anchor_is_ignored(tmp_path, 
 def test_explicit_owner_boolean_overrides_an_ambiguous_name(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     res = ac.apply({"commitments": [
-        {"meeting_id": "m-me", "owner": "Nikunj Kothari", "owner_is_user": True,
+        {"meeting_id": "m-me", "owner": "Casey Lindgren", "owner_is_user": True,
          "what": "send the intro"},
-        {"meeting_id": "m-other", "owner": "Nikunj Kothari", "owner_is_user": False,
+        {"meeting_id": "m-other", "owner": "Casey Lindgren", "owner_is_user": False,
          "what": "send the model"}]}, USER, NOW)
     items = _ledger_items(tmp_path)
     assert items[res["anchor_keys"][0]]["action_type"] == "follow_up"
@@ -469,11 +469,11 @@ def test_email_local_first_name_does_not_bypass_attendee_ambiguity(tmp_path, mon
 def test_exact_account_attendee_display_supplies_full_name_when_env_is_absent(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))
     monkeypatch.delenv('SOTTO_USER_NAME', raising=False)
-    meeting = {'meeting_id': 'm-owner', 'transcript': "Nikunj: I'll send the deck.",
-               'attendees': [{'email': USER, 'name': 'Nikunj Kothari'},
+    meeting = {'meeting_id': 'm-owner', 'transcript': "Casey: I'll send the deck.",
+               'attendees': [{'email': USER, 'name': 'Casey Lindgren'},
                              {'email': 'dana@example.com', 'name': 'Dana'}]}
-    commitment = {'meeting_id': 'm-owner', 'owner': 'Nikunj', 'owner_is_user': True,
-                  'what': 'send the deck', 'source_snippet': "Nikunj: I'll send the deck."}
+    commitment = {'meeting_id': 'm-owner', 'owner': 'Casey', 'owner_is_user': True,
+                  'what': 'send the deck', 'source_snippet': "Casey: I'll send the deck."}
     result = ac.apply({'commitments': [commitment]}, USER, NOW, source_meetings=[meeting])
     assert result['written'] == 1 and result['grounding']['accepted'] == 1
 
@@ -536,10 +536,12 @@ def test_same_meeting_reference_gains_timestamp_without_duplicate():
     assert row['source_refs'] == [stamped, changed]  # conflicting source evidence stays visible
 
 
-def test_same_meeting_reference_preserves_metadata_and_does_not_lose_timestamp():
+@pytest.mark.parametrize('singleton', [False, True])
+def test_same_meeting_reference_preserves_metadata_and_does_not_lose_timestamp(singleton):
     old = {'source': 'granola', 'source_id': 'meeting-one', 'snippet': "Dana: I'll send the deck."}
     stamped = {**old, 'timestamp': '2026-07-02T09:00:00Z'}
-    row = {'source_refs': [{**old, 'retained_metadata': 'original'}]}
+    ref = {**old, 'retained_metadata': 'original'}
+    row = {'source_refs': ref if singleton else [ref]}
     ac._attach_source(row, stamped)
     ac._attach_source(row, old)
     ac._attach_source(row, stamped)

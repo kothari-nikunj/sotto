@@ -11,13 +11,10 @@ without transcripts). This is the deterministic replacement: ONE command, like g
 Modes:
   default — the MCP lane: token from $SOTTO_DATA/connectors/granola.json (written by the
             receiver's /setup OAuth tile), Streamable-HTTP MCP client, tool names discovered via
-            tools/list and matched tolerantly (list_meetings / get_meetings / …,
-            get_meeting_transcript / get_transcript — the Mac's granola-mcp.ts names).
-            TWO calls, not one: the LIST tool returns titles + metadata only, so every meeting
-            without notes/summary is then read through the DETAIL tool (get_meetings, batched ≤10).
-            Listing alone yields your_notes=None + ai_summary=None, which render_local filters out —
-            i.e. a brief that never shows Granola content. Call args are derived from each tool's
-            published inputSchema (mcp.granola.ai's list_meetings takes no `limit` and rejects one).
+            tools/list and matched tolerantly. LIST (search_meetings by date range, or the older
+            list_meetings) returns metadata only, so meetings without notes are then read by id
+            through the DETAIL tool (get_meetings, batched ≤10). Call args follow each tool's
+            published inputSchema.
   --rest  — break-glass fallback (Business/Enterprise plans): GRANOLA_API_KEY against the official
             REST API https://public-api.granola.ai/v1 (GET /notes?created_after=…, per-note
             ?include=transcript), throttled to 5 req/s.
@@ -59,16 +56,11 @@ LIST_LIMIT = 50
 NO_TRANSCRIPT_TOOL_WARNING = 'no transcript tool on the Granola MCP — meetings carry notes/summaries only'
 DETAIL_BATCH = 10                                    # mcp.granola.ai get_meetings caps meeting_ids at 10
 
-# Tool-name tolerance (exact names first, in preference order; then substring fallback). The Mac
-# client (api/src/services/granola-mcp.ts) uses list_meetings + get_meeting_transcript; other
-# builds/servers of the same idea vary.
-LIST_TOOL_EXACT = ("list_meetings", "get_meetings", "list_notes", "list_recent_meetings",
-                   "query_granola_meetings", "list")
-# The LIST tool returns titles + metadata ONLY (mcp.granola.ai's own tools/list description:
-# "Returns meeting titles and metadata" … "Use get_meetings to retrieve detailed meeting content").
-# The notes/summary this whole pipeline consumes live behind the DETAIL tool, so a gather that only
-# lists produces meetings with your_notes=None + ai_summary=None — which render_local
-# ._format_granola_meetings filters out entirely, i.e. a brief with no Granola content, ever.
+LIST_PAGES = 4                                       # search_meetings cursor pages per gather
+# Tool-name tolerance (exact names first, then substring). The older server lists with list_meetings;
+# the current one with search_meetings (date range). A tool that REQUIRES ids or a query never lists.
+LIST_TOOL_EXACT = ("list_meetings", "search_meetings", "list_notes", "list_recent_meetings", "list")
+# The LIST tool returns metadata only; notes/summaries live behind the DETAIL tool.
 DETAIL_TOOL_EXACT = ("get_meetings", "get_meeting", "get_meeting_details", "get_notes", "get_note")
 TRANSCRIPT_TOOL_EXACT = ("get_meeting_transcript", "get_transcript", "fetch_transcript",
                          "meeting_transcript", "transcript")
@@ -242,8 +234,7 @@ def _salvage_meeting_markup(text: str) -> list:
     `<meetings_data> <meeting id="…" title="…" date="…"> <known_participants>…</…>
     <summary>…</summary> </meeting>`. It is intentionally not fed to an XML parser: summaries are
     Markdown and may legally contain characters that are not XML-safe. We recognize only the outer
-    meeting/section tags and attributes, unescape their data, and ignore every instruction/preamble
-    outside those tags. No markup means no salvage.
+    meeting/section tags and attributes, unescape their data, and ignore the rest.
     """
     rows = []
     for match in re.finditer(r"<meeting\b(?P<attrs>[^>]*)>(?P<body>.*?)</meeting>",
@@ -271,9 +262,9 @@ def _salvage_meeting_markup(text: str) -> list:
                                  body, re.DOTALL | re.IGNORECASE)
         if participants:
             participant_text = html.unescape(participants.group(1))
-            row["attendee_emails"] = list(dict.fromkeys(
-                re.findall(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
-                           participant_text, re.IGNORECASE)))
+            pairs = re.findall(r"(?:([^,<>()@]*(?:\([^()@]*\)[^,<>()@]*)*)[<(])?\s*([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", participant_text, re.I)
+            names = {e: re.sub(r"\s*\(.*?\)|\s+from\s.*", "", n).strip() for n, e in pairs[::-1]}
+            row["attendees"] = [{"email": e, "name": names[e]} for e in dict.fromkeys(e for _, e in pairs)]
 
         for tag, field in (("notes", "notes"), ("summary", "summary"),
                            ("transcript", "transcript")):
@@ -332,21 +323,18 @@ def _tool_props(tools: list, name: str) -> dict | None:
 
 def _list_args(props: dict | None, days: int = 14, now=None) -> dict:
     """Args for the list call. mcp.granola.ai's list_meetings declares NO `limit` and sets
-    `additionalProperties: false`, so sending one is a schema violation the server rejects — the
-    whole gather then fails empty. Send `limit` only when the tool says it takes one; a server that
-    publishes no schema keeps the historical behavior."""
+    `additionalProperties: false`; send `limit` only when declared (no schema: historical args)."""
     if props is None:
         return {"limit": LIST_LIMIT}
     args = {"limit": LIST_LIMIT} if "limit" in props else {}
-    # Granola's present schema supports a server-side custom range. Use it rather than asking for the
-    # default 30-day window and hoping every returned display timestamp can be filtered locally.
+    # Prefer a server-side window over filtering display timestamps locally.
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if "from_date" in props and "to_date" in props:
+        args = {"from_date": (now - datetime.timedelta(days=days)).date().isoformat(),
+                "to_date": now.date().isoformat(), **args}
     if all(k in props for k in ("time_range", "custom_start", "custom_end")):
-        now = now or datetime.datetime.now(datetime.timezone.utc)
-        args.update({
-            "time_range": "custom",
-            "custom_start": (now - datetime.timedelta(days=days)).date().isoformat(),
-            "custom_end": now.date().isoformat(),
-        })
+        args.update(time_range="custom", custom_start=(now - datetime.timedelta(days=days)).date().isoformat(),
+                    custom_end=now.date().isoformat())
     return args
 
 
@@ -378,14 +366,20 @@ def _fetch_details(client, detail_tool: str, props: dict | None, ids: list, warn
 
 
 def _merge_content(mapped: dict, detail: dict) -> None:
-    """Fold a detail item's notes/summary/attendees into an already-mapped meeting, in place.
-    The list item wins where it already had a value — detail only fills what was missing."""
     filled = map_meeting(detail)
-    for k in ("your_notes", "ai_summary"):
-        if not mapped.get(k) and filled.get(k):
-            mapped[k] = filled[k]
-    if not mapped.get("attendee_emails") and filled.get("attendee_emails"):
-        mapped["attendee_emails"] = filled["attendee_emails"]
+    for key in ("your_notes", "ai_summary", "attendee_emails", "attendees"):
+        mapped[key] = mapped[key] or filled[key]
+    names = {a["email"].casefold(): a["name"] for a in filled["attendees"] if isinstance(a["email"], str)}
+    for a in mapped["attendees"]:
+        if not a["name"] and isinstance(a["email"], str):
+            a["name"] = names.get(a["email"].casefold(), "")
+
+
+def _next_cursor(page) -> str | None:
+    if isinstance(page, dict):
+        return page.get("next_cursor") or None
+    m = re.search(r"<pagination\b[^>]*\bnext_cursor=\"([^\"]+)\"", page) if isinstance(page, str) else None
+    return html.unescape(m.group(1)) if m and 'has_more="false"' not in m.group(0) else None
 
 
 def _make_client(force_refresh: bool = False) -> McpClient:
@@ -406,9 +400,11 @@ def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
         client.initialize()
 
     tools = client.list_tools()
-    list_tool = _pick_tool(tools, LIST_TOOL_EXACT, "meeting", exclude=("transcript", "folder", "account"))
+    listable = [t for t in tools if not (isinstance(t, dict) and {"meeting_ids", "note_ids", "query"}
+                                         & set((t.get("inputSchema") or {}).get("required") or ()))]
+    list_tool = _pick_tool(listable, LIST_TOOL_EXACT, "meeting", exclude=("transcript", "folder", "account"))
     if not list_tool:
-        list_tool = _pick_tool(tools, (), "note", exclude=("transcript", "folder", "account"))
+        list_tool = _pick_tool(listable, (), "note", exclude=("transcript", "folder", "account"))
     if not list_tool:
         raise RuntimeError(f"no meeting-list tool found on the Granola MCP (tools: "
                            f"{[t.get('name') for t in tools]})")
@@ -419,20 +415,26 @@ def gather_mcp(days: int, since_hours: int, client: McpClient | None = None,
         detail_tool = None            # one tool doing both jobs already returned whatever it has
 
     now = now or datetime.datetime.now(datetime.timezone.utc)
-    raw = client.call_tool(list_tool, _list_args(_tool_props(tools, list_tool), days, now), timeout=60)
-    if isinstance(raw, str):                      # prose answer (LLM-facing server) → salvage the data
-        raw = _salvage_tool_result(raw) or raw
-    if isinstance(raw, dict):
-        for k in ("meetings", "notes", "items", "results", "data"):
-            if isinstance(raw.get(k), list):
-                raw = raw[k]
-                break
-    if not isinstance(raw, list):
-        # Carry a preview of what the server actually said — five days of "non-list (str)" with no
-        # content was undiagnosable from the log alone (Aug 2026).
-        warnings.append(f"{list_tool} returned non-list ({type(raw).__name__}); treating as empty. "
-                        f"Preview: {repr(raw)[:200]}")
-        raw = []
+    list_props = _tool_props(tools, list_tool)
+    args, raw, paged = _list_args(list_props, days, now), [], bool(list_props) and "cursor" in list_props
+    for _ in range(LIST_PAGES if paged else 1):
+        page = client.call_tool(list_tool, args, timeout=60)
+        cursor = _next_cursor(page)
+        if isinstance(page, str):                 # prose answer (LLM-facing server) → salvage the data
+            page = _salvage_tool_result(page) or page
+        if isinstance(page, dict):
+            page = next((page[k] for k in ("meetings", "notes", "items", "results", "data")
+                         if isinstance(page.get(k), list)), page)
+        if not isinstance(page, list):
+            warnings.append(f"{list_tool} returned non-list ({type(page).__name__}); treating as empty. "
+                            f"Preview: {repr(page)[:200]}")
+            break
+        raw.extend(page)
+        if not cursor:
+            break
+        args = {**args, "cursor": cursor}
+    if paged and cursor and isinstance(page, list):  # the last allowed page still had more
+        warnings.append(f"{list_tool}: more than {LIST_PAGES} pages in the window; older meetings omitted")
 
     windowed = [m for m in raw if isinstance(m, dict) and _in_window(m, days, now)]
 

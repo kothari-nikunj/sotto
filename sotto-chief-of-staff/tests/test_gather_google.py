@@ -527,7 +527,7 @@ def test_default_max_raised_to_40(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(gg, "_find_google_api", lambda: "/fake/api.py")
     monkeypatch.setattr(gg, "_ensure_google_deps", lambda: True)
-    monkeypatch.setattr(gg, "gather_gmail", lambda api, mx, bodies, days=1: captured.update(max=mx) or [])
+    monkeypatch.setattr(gg, "gather_gmail", lambda api, mx, bodies, **_: captured.update(max=mx) or [])
     monkeypatch.setattr(gg, "gather_calendar", lambda *a, **k: [])
     g, c = tmp_path / "g.json", tmp_path / "c.json"
     monkeypatch.setattr("sys.argv", ["gather_google.py", "--gmail-out", str(g), "--cal-out", str(c)])
@@ -598,13 +598,13 @@ def test_attendee_comms_does_not_attribute_an_introducer_or_similar_address_to_o
          'subject': 'An introduction', 'snippet': 'You two should compare notes.'},
         {'from': 'not-dana@acme.com', 'to': 'dana@acme.com', 'snippet': 'A different sender.'},
     ])
-    _, rows = gg._fetch_attendee_comms('/fake/api.py', 'dana@acme.com')
+    _, rows, _ = gg._fetch_attendee_comms('/fake/api.py', 'dana@acme.com')
     assert all(row['from_me'] is None for row in rows)
     assert rows[0]['sender_name'] == 'Priya' and rows[0]['sender_identifier'] == 'priya@other.com'
 
 
-def test_attendee_comms_fail_empty_when_api_missing(tmp_path, monkeypatch, capsys):
-    # No google_api.py → empty {} + WARNING, exit 0 (the prep still runs, just without threads).
+def test_attendee_comms_records_failure_when_api_missing(tmp_path, monkeypatch, capsys):
+    # No google_api.py → each attendee marked failed + WARNING, exit 0 (never "no email").
     att = tmp_path / "att.json"
     json.dump([{"name": "Dana", "email": "dana@acme.com"}], open(att, "w"))
     monkeypatch.setattr(gg, "_find_google_api", lambda: None)
@@ -612,7 +612,7 @@ def test_attendee_comms_fail_empty_when_api_missing(tmp_path, monkeypatch, capsy
     monkeypatch.setattr("sys.argv", ["gather_google.py", "--attendee-comms", str(att),
                                      "--comms-out", str(out)])
     gg.main()
-    assert json.load(open(out)) == {}
+    assert json.load(open(out)) == {"_search_failed": {"dana@acme.com": "unavailable"}}
     assert "WARNING" in capsys.readouterr().out
 
 
@@ -622,7 +622,7 @@ def test_attendee_comms_one_failed_search_never_fails_the_rest(tmp_path, monkeyp
 
     def fake_run(api, args, timeout=60):
         if "a@x.com" in args[2]:
-            raise RuntimeError("timeout")              # one attendee's search dies — tolerated
+            raise TimeoutError("timeout")              # one attendee's search dies — recorded
         return [{"from": "b@y.com", "subject": "S", "date": "d", "snippet": "sn"}]
 
     monkeypatch.setattr(gg, "_find_google_api", lambda: "/fake/api.py")
@@ -634,9 +634,10 @@ def test_attendee_comms_one_failed_search_never_fails_the_rest(tmp_path, monkeyp
     gg.main()
     comms = json.load(open(out))
     assert "a@x.com" not in comms and comms["b@y.com"][0]["subject"] == "S"
+    assert comms["_search_failed"] == {"a@x.com": "TimeoutError"}
 
 
-def test_attendee_emails_accepts_both_shapes_dedupes_and_caps():
+def test_attendee_emails_keeps_unique_addresses_from_both_shapes():
     # research_in shape [{name,email}] + {"attendees":[…]} envelope
     import json as _json, tempfile, os as _os
     def _emails(data):
@@ -652,9 +653,8 @@ def test_attendee_emails_accepts_both_shapes_dedupes_and_caps():
     # calendar-derived list: events carrying attendees[] (dicts or bare strings)
     assert _emails([{"summary": "Sync", "attendees": [{"email": "c@z.com"}, "d@z.com"]}]) == \
         ["c@z.com", "d@z.com"]
-    # cap at 15 unique emails
     many = [{"email": f"p{i}@x.com"} for i in range(20)]
-    assert len(_emails(many)) == 15
+    assert len(_emails(many)) == len(many)
     # unreadable file → []
     assert gg._attendee_emails_from_file("/nonexistent/path.json") == []
 
@@ -1493,7 +1493,7 @@ def test_focused_attendee_threads_keep_intro_and_latest_correction_for_local_pre
     import compose_meeting_prep as prep
     import research_attendees as research
     response, messages, search, calls, grants, fail, message = attendee_thread
-    email, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    email, rows, _ = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
     assert len(calls) == 1 and calls[0] == {'userId': 'me', 'id': 'thread-1', 'format': 'full'}
     assert len(rows) == 1  # full thread replaces duplicate current search snippets
     assert 'Happy to connect you both' in rows[0]['thread_context']
@@ -1524,7 +1524,7 @@ def test_muted_sender_text_never_enters_thread_background(attendee_thread, monke
     owner_reply['labelIds'] = ['SENT']
     messages[5] = owner_reply
     monkeypatch.setattr(preferences, 'load_explicit', lambda: {'mute_senders': ['@other.com', 'owner@example.com']})
-    email, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    email, rows, _ = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
     context = rows[0]['thread_context']
     assert 'Happy to connect you both' not in context and 'intro@other.com' not in context
     assert 'Correction: 10 on the 14th' in context and 'partial' in context
@@ -1567,7 +1567,7 @@ def test_focused_thread_failure_keeps_only_permitted_partial_search(attendee_thr
             client.execute = revoke
             return client
         monkeypatch.setattr(gg, '_gmail_service', service)
-    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    _, rows, _ = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
     if case in ('denied', 'revoked'):
         assert rows == []
         if case == 'denied':
@@ -1583,7 +1583,7 @@ def test_focused_thread_caps_preserve_opening_latest_and_exclude_non_evidence(at
     response, messages, search, calls, grants, fail, message = attendee_thread
     response['messages'] = [message(i, ('opening ' if i==0 else 'latest ' if i==15 else 'middle ') + 'x'*5000) for i in range(16)]
     response['messages'].append({**message(16, 'DRAFT DO NOT INCLUDE'), 'labelIds': ['DRAFT']})
-    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    _, rows, _ = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
     context = rows[0]['thread_context']
     assert len(context) <= gg.ATTENDEE_THREAD_CHARS
     assert 'opening ' in context and 'latest ' in context and 'DRAFT DO NOT INCLUDE' not in context
@@ -1597,10 +1597,10 @@ def test_focused_thread_read_cap_and_shared_quota_stop(attendee_thread):
     response, messages, search, calls, grants, fail, message = attendee_thread
     search[1] = {**search[0], 'id': 'other', 'threadId': 'thread-2'}
     search[2] = {**search[0], 'id': 'third', 'threadId': 'thread-3'}
-    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    _, rows, _ = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
     assert len(calls) == gg.ATTENDEE_THREAD_CAP
     stop = threading.Event(); stop.set()
-    assert gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True, quota_stop=stop) == ('dana@acme.com', [])
+    assert gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True, quota_stop=stop) == ('dana@acme.com', [], 'rate_limited')
     assert len(calls) == gg.ATTENDEE_THREAD_CAP
 
 
@@ -1608,7 +1608,7 @@ def test_focused_thread_read_cap_and_shared_quota_stop(attendee_thread):
 def test_focused_thread_long_latest_ending_survives(attendee_thread):
     response, messages, search, calls, grants, fail, message = attendee_thread
     messages[-1] = message(8, 'Initial proposal. ' + 'x'*12000 + ' Final correction: do not meet on Friday.')
-    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    _, rows, _ = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
     text = rows[0]['thread_context']
     assert 'Initial proposal.' in text
     assert 'Final correction: do not meet on Friday.' in text
@@ -1649,7 +1649,7 @@ def test_focused_thread_context_has_one_run_budget_across_fifteen_attendees(tmp_
 def test_partial_thread_inventory_does_not_discard_current_search_snippets(attendee_thread):
     response, messages, search, calls, grants, fail, message = attendee_thread
     response['messages'] = messages[:1]
-    _, rows = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
+    _, rows, _ = gg._fetch_attendee_comms('fake', 'dana@acme.com', expand_threads=True)
     assert len(rows) == len(search)
     assert {row['message_id'] for row in rows} == {row['id'] for row in search}
     assert 'partial' in rows[0]['thread_context']
@@ -1752,3 +1752,11 @@ def test_sent_body_cohort_preserves_native_bcc(monkeypatch):
     assert rows[0]['bcc'] == 'introducer@example.test'
     assert rows[0]['isSent'] is True
     assert rows[0]['body'] == 'Thanks for the introduction.'
+
+
+def test_catch_up_days_widens_only_the_daily_query(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gg, "_run", lambda api, args, timeout=60: calls.append(args) or [])
+    gg.gather_gmail("api.py", 40, 0, query_days=3)
+    gg.gather_sent("api.py", 15, 0, query_days=3)
+    assert [c[2] for c in calls] == ["newer_than:3d", "in:sent newer_than:3d"]

@@ -388,7 +388,7 @@ def run_operator_file(path: str | Path) -> None:
             trusted_service_id=service_id, limited_profile=profile,
             restart_epoch=restart_epoch)
         while not stopping:
-            lifecycle.check_replacement()
+            lifecycle.check_replacement(allow_external_exec=profile == fixed_five.PROFILE)
             mounted.check()
             time.sleep(0.2)
         _stop_until_empty(lifecycle)

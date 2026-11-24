@@ -14,6 +14,7 @@ export const usefulnessListSchema = z.object({version:z.literal(1),status:z.lite
     .refine(items=>new Set(items.map(item=>item.reference)).size===items.length)}).strict();
 export type UsefulnessList=z.infer<typeof usefulnessListSchema>;
 const usefulnessRating=z.enum(['useful','not_useful']);
+const notificationDispatchId=z.string().regex(/^(?:[a-f0-9]{16}|[a-f0-9]{32})$/);
 const usefulnessLocator=z.string().max(100).refine(value=>value==='output'||/^excerpt:(?:0|[1-9]\d*):(?:[1-9]\d{0,2}):[a-f0-9]{20}$/.test(value)&&Number(value.split(':')[2])<=320);
 export const priorityNameSchema=value.refine(text=>!/[\u007f-\u009f\u2028\u2029]/u.test(text));
 // A request to edit the current wording is not permission to save an ongoing preference.
@@ -64,6 +65,9 @@ export const ownerPreferenceToolArgsSchema = z.union([
   z.object({operation:z.literal('unsnooze-nudges')}).strict(),
   z.object({operation:z.literal('prioritize'),name:priorityNameSchema}).strict(),
   z.object({operation:z.literal('usefulness'),rating:usefulnessRating,reference:usefulnessReferenceSchema,archive_version:hex,excerpt:usefulnessExcerptSchema,source_revision:hex}).strict(),
+  z.object({operation:z.literal('notification-usefulness'),rating:usefulnessRating,dispatch_id:notificationDispatchId,
+    provider_message_id:z.string().min(1).max(512).refine(id=>!/[\u0000-\u001f\u007f\ud800-\udfff]/u.test(id)),
+    route_digest:hex,payload_hash:hex,source_revision:hex}).strict(),
   z.object({operation:z.literal('propose-procedure'),rule:procedureRuleSchema}).strict(),
   z.object({operation:z.literal('append-procedure'),review:procedureReviewSchema,proposal:z.object({event_id:hex,action_id:hex,args_hash:hex,accepted_dispatch_id:z.string().min(1).max(160),source_revision:z.literal('owner-only-context-v1')}).strict()}).strict(),
   z.object({operation:z.literal('propose-priorities'),text:prioritiesTextSchema}).strict(),
@@ -85,6 +89,8 @@ const outcome = z.union([
  ownerContextReviewSchema.extend({status:z.literal('saved')}).strict(),
  prioritiesReviewSchema.extend({status:z.literal('saved')}).strict(),
  z.object({operation:z.literal('usefulness'),reference:usefulnessReferenceSchema,item_locator:usefulnessLocator,rating:usefulnessRating,status:z.literal('recorded')}).strict(),
+ z.object({operation:z.literal('notification-usefulness'),reference:z.string().regex(/^notification:(?:[a-f0-9]{16}|[a-f0-9]{32})$/),
+   item_locator:z.literal('output'),rating:usefulnessRating,status:z.literal('recorded')}).strict(),
  z.object({operation:z.literal('append-procedure'),section:z.literal('Procedures'),rule:procedureRuleSchema,review_hash:hex,status:z.literal('saved')}).strict(),
   z.object({operation: z.literal('accept-procedure-offer'), offer_id: z.string().regex(/^(?:[a-f0-9]{32}|[a-f0-9]{64})$/),
     section: z.literal('Procedures'), rule: z.string().min(1).max(600).refine(text => Array.from(text).length <= 300 &&
@@ -119,6 +125,7 @@ export function preferenceReceiptMatches(receipt: OwnerPreferenceToolReceipt, ar
     const parts=out.item_locator.split(':');
     return parts[0]==='excerpt'&&Number(parts[2])===Array.from(args.excerpt).length&&parts[3]===createHash('sha256').update(args.excerpt).digest('hex').slice(0,20);
   }
+  if(args.operation==='notification-usefulness')return out.operation==='notification-usefulness'&&out.rating===args.rating&&out.reference===`notification:${args.dispatch_id}`;
   if (out.operation !== args.operation) return false;
   if(args.operation==='append-procedure')return out.operation==='append-procedure'&&out.rule===args.review.rule&&out.review_hash===args.review.review_hash;
   if (args.operation === 'accept-procedure-offer') return out.operation === 'accept-procedure-offer';
@@ -144,6 +151,7 @@ export function preferenceAcknowledgement(receipt: OwnerPreferenceToolReceipt): 
   if(out.operation==='append-context')return `Standing context saved (${out.section}): ${out.text}`;
   if(out.operation==='replace-priorities')return 'Current priorities saved.';
   if(out.operation==='usefulness')return out.rating==='useful'?'Recorded that as useful.':'Recorded that as not useful.';
+  if(out.operation==='notification-usefulness')return out.rating==='useful'?'Recorded this notification as useful.':'Recorded this notification as not useful.';
   if(out.operation==='append-procedure')return `Standing rule saved: ${out.rule}`;
   if (out.operation === 'accept-procedure-offer') return `Standing rule saved: ${out.rule}`;
   if (out.operation === 'nudge-budget') return `Recorded unsolicited nudge limit: ${out.effective} (configured maximum ${out.ceiling}). Scheduled briefs and digests continue.`;

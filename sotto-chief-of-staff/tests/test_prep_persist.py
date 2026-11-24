@@ -96,17 +96,17 @@ def test_filter_fresh_keep_exception_for_the_focused_person(tmp_path, monkeypatc
     # company_deep no earlier sweep run ever produced); everyone else fresh is still skipped.
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     pp.persist(RESEARCH, ATTENDEES_IN)                          # Dana is fresh
-    pp.persist({"attendees": [{"email": "spencer@commenda.io", "title": "CEO",
-                               "company": "Commenda", "summary": "Founder."}]},
-               [{"name": "Spencer Kim", "email": "spencer@commenda.io"}])   # Spencer too
+    pp.persist({"attendees": [{"email": "rowan@larkspur.example", "title": "CEO",
+                               "company": "Larkspur", "summary": "Founder."}]},
+               [{"name": "Rowan Pike", "email": "rowan@larkspur.example"}])   # Rowan too
     attendees = [{"name": "Dana Roe", "email": "dana@acme.com"},
-                 {"name": "Spencer Kim", "email": "spencer@commenda.io"}]
-    kept, skipped = pp.filter_fresh(attendees, keep="spencer")
-    assert [a["email"] for a in kept] == ["spencer@commenda.io"]
+                 {"name": "Rowan Pike", "email": "rowan@larkspur.example"}]
+    kept, skipped = pp.filter_fresh(attendees, keep="rowan")
+    assert [a["email"] for a in kept] == ["rowan@larkspur.example"]
     assert skipped == ["Dana Roe"]
     # Same rule as --focus: an '@' argument is an exact email, and no --keep changes nothing.
     kept, skipped = pp.filter_fresh(attendees, keep="dana@acme.com")
-    assert [a["email"] for a in kept] == ["dana@acme.com"] and skipped == ["Spencer Kim"]
+    assert [a["email"] for a in kept] == ["dana@acme.com"] and skipped == ["Rowan Pike"]
     assert pp.filter_fresh(attendees)[0] == []
 
 
@@ -229,19 +229,19 @@ def test_persist_company_fallback_and_sentinel_suppressed(tmp_path, monkeypatch)
     # never becomes a fact. The company_summary describes the employer: it becomes the company's
     # About, never a fact about the person that resurfaces in later preps.
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    research = {"attendees": [{"email": "nelson@cobalt-research.com", "title": None,
+    research = {"attendees": [{"email": "nelson@cobalt-research.example", "title": None,
                                "company": "Cobalt Research", "summary": "No public profile found.",
                                "company_summary": "Cobalt Research does battery-materials analytics."}]}
-    out = pp.persist(research, [{"name": "Nelson", "email": "nelson@cobalt-research.com"}])
+    out = pp.persist(research, [{"name": "Nelson", "email": "nelson@cobalt-research.example"}])
     assert out["persisted"] == 1
-    path = kg.find_person_file(name="Nelson", identifier="nelson@cobalt-research.com")
+    path = kg.find_person_file(name="Nelson", identifier="nelson@cobalt-research.example")
     with open(path, encoding="utf-8") as f:
         p = kg.parse_person_file(f.read())
     (fact,) = p.facts.values()
     assert fact.text == "Per web search: Cobalt Research"
     assert "No public profile found" not in fact.text
     assert fact.source == "web_research"
-    company = ku.company_knowledge(company_name="Cobalt Research", domain="cobalt-research.com")
+    company = ku.company_knowledge(company_name="Cobalt Research", domain="cobalt-research.example")
     assert company["about"] == "Cobalt Research does battery-materials analytics."
     assert company["updated_by"] == "web_research"
 
@@ -299,36 +299,39 @@ def test_cli_persist_noop_on_missing_input(tmp_path):
 # fact — and knowledge about an ORGANIZATION belongs to the organization, not to whichever human
 # happened to be researched that morning.
 
+_SERIES_A = "Larkspur (larkspur.example) raised a Series A led by Nexus in June 2026."
+
 FOCUS_RESEARCH = {"attendees": [
-    {"email": "spencer@commenda.io", "title": "CEO", "company": "Commenda",
-     "summary": "Founder and CEO of Commenda.",
-     "company_summary": "Commenda handles global tax filing.",
-     "company_deep": {"company": "Commenda",
+    {"email": "rowan@larkspur.example", "title": "CEO", "company": "Larkspur",
+     "summary": "Founder and CEO of Larkspur.",
+     "company_summary": "Larkspur handles global tax filing.",
+     "traction_sources": {"https://tc.com/a": [_SERIES_A]},
+     "company_deep": {"company": "Larkspur",
                       "builds": ["Global tax filing tied to each payment"],
                       "founder_story": "Built after a misfiled quarter in three countries.",
-                      "traction": ["Series A led by Nexus, June 2026 (https://tc.com/a)"],
+                      "traction": [f"{_SERIES_A} (https://tc.com/a)"],
                       "market": "The post-EOR shift; competes with Deel and Remote."}}]}
 
 
-def _company(tmp_path, slug="commenda"):
+def _company(tmp_path, slug="larkspur"):
     return (tmp_path / "knowledge" / "companies" / f"{slug}.md").read_text()
 
 
 def test_company_deep_dive_lands_in_the_company_file(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    out = pp.persist(FOCUS_RESEARCH, [{"name": "Spencer Kim", "email": "spencer@commenda.io"}])
-    assert out["companies"] == ["Commenda"]
+    out = pp.persist(FOCUS_RESEARCH, [{"name": "Rowan Pike", "email": "rowan@larkspur.example"}])
+    assert out["companies"] == ["Larkspur"]
     body = _company(tmp_path)
     # The DURABLE half is the About: what it builds, who founded it, the market.
     assert "## About" in body
     assert "Global tax filing tied to each payment" in body
     assert "misfiled quarter" in body and "post-EOR shift" in body
     # The dated, source-URLed half is News — the writer's own dedupe key.
-    assert "[Series A led by Nexus, June 2026](https://tc.com/a)" in body
+    assert f"[Source reports: {_SERIES_A}](https://tc.com/a)" in body
     # Provenance: the same two stamps a researched PERSON gets.
     assert "updated_by: web_research" in body and "last_researched:" in body
     # The person still carries their own bio fact — the company write is additive, not a move.
-    _, p = _person(tmp_path, "Spencer Kim", "spencer@commenda.io")
+    _, p = _person(tmp_path, "Rowan Pike", "rowan@larkspur.example")
     assert any("Per web search" in f.text for f in p.facts.values())
 
 
@@ -339,7 +342,7 @@ def test_company_deep_dive_is_retained_locally_but_excluded_from_next_provider_p
     known = _company(tmp_path)
     assert "Global tax filing tied to each payment" in known
     assert "Series A led by Nexus" in known           # news rides along as already-known
-    prompt = ra._build_focus_prompt({"name": "Dana", "email": "dana@commenda.io"})
+    prompt = ra._build_focus_prompt({"name": "Dana", "email": "dana@larkspur.example"})
     assert "Stored company context (not current verification)" not in prompt
     assert "About (prior automated web research; unverified)" not in prompt
     assert "Last research recorded:" not in prompt
@@ -350,9 +353,9 @@ def test_company_deep_dive_is_retained_locally_but_excluded_from_next_provider_p
 
 def test_same_research_run_twice_does_not_double_write(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    pp.persist(FOCUS_RESEARCH, [{"name": "Spencer Kim", "email": "spencer@commenda.io"}])
+    pp.persist(FOCUS_RESEARCH, [{"name": "Rowan Pike", "email": "rowan@larkspur.example"}])
     first = _company(tmp_path)
-    pp.persist(FOCUS_RESEARCH, [{"name": "Spencer Kim", "email": "spencer@commenda.io"}])
+    pp.persist(FOCUS_RESEARCH, [{"name": "Rowan Pike", "email": "rowan@larkspur.example"}])
     second = _company(tmp_path)
     assert second.count("Series A led by Nexus") == 1     # news dedupes on its URL
     assert second.count("## About") == 1
@@ -365,18 +368,18 @@ def test_same_research_run_twice_does_not_double_write(tmp_path, monkeypatch):
 def test_two_people_one_company_write_one_file_once(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     research = {"attendees": FOCUS_RESEARCH["attendees"] + [
-        {"email": "dana@commenda.io", "company": "Commenda", "summary": "CFO.",
-         "company_summary": "Commenda, a tax startup."}]}
+        {"email": "dana@larkspur.example", "company": "Larkspur", "summary": "CFO.",
+         "company_summary": "Larkspur, a tax startup."}]}
     out = pp.persist(research, [])
-    assert out["companies"] == ["Commenda"]               # one update, not two
+    assert out["companies"] == ["Larkspur"]               # one update, not two
     assert len(list((tmp_path / "knowledge" / "companies").glob("*.md"))) == 1
 
 
 def test_a_sweep_one_liner_never_clobbers_a_deep_dive(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     pp.persist(FOCUS_RESEARCH, [])
-    pp.persist({"attendees": [{"email": "dana@commenda.io", "company": "Commenda",
-                               "company_summary": "Commenda, a tax startup."}]}, [])
+    pp.persist({"attendees": [{"email": "dana@larkspur.example", "company": "Larkspur",
+                               "company_summary": "Larkspur, a tax startup."}]}, [])
     body = _company(tmp_path)
     assert "misfiled quarter" in body and "a tax startup" not in body
     # …but a company with NOTHING on file gets seeded by the one-liner rather than staying blank.
@@ -391,15 +394,17 @@ def test_user_correction_to_a_company_survives_the_next_research_run(tmp_path, m
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     pp.persist(FOCUS_RESEARCH, [])
     ke = _load("knowledge_edit", "_shared/knowledge/knowledge_edit.py")
-    res = ke.run(["--slug", "commenda", "--op", "company-about",
-                  "--text", "Commenda files taxes for cross-border payroll."])
-    assert res["ok"] and res["about"] == "Commenda files taxes for cross-border payroll."
+    res = ke.run(["--slug", "larkspur", "--op", "company-about",
+                  "--text", "Larkspur files taxes for cross-border payroll."])
+    assert res["ok"] and res["about"] == "Larkspur files taxes for cross-border payroll."
     grown = dict(FOCUS_RESEARCH["attendees"][0])
+    series_b = "Larkspur (larkspur.example) raised a Series B in December 2026."
+    grown["traction_sources"] = {"https://tc.com/b": [series_b]}
     grown["company_deep"] = dict(grown["company_deep"],
-                                 traction=["Series B, Dec 2026 (https://tc.com/b)"])
+                                 traction=[f"{series_b} (https://tc.com/b)"])
     pp.persist({"attendees": [grown]}, [])
     body = _company(tmp_path)
-    assert "Commenda files taxes for cross-border payroll." in body   # the human's words stand
+    assert "Larkspur files taxes for cross-border payroll." in body   # the human's words stand
     assert "misfiled quarter" not in body
     assert "updated_by: user_edit" in body                            # ownership of About sticks
     assert "https://tc.com/b" in body                                 # news still accumulates
@@ -419,7 +424,7 @@ def test_persistence_failure_never_costs_the_run(tmp_path, monkeypatch):
         raise OSError("read-only file system")
 
     monkeypatch.setattr(pp.ku, "apply", boom)
-    out = pp.persist(FOCUS_RESEARCH, [{"name": "Spencer Kim", "email": "spencer@commenda.io"}])
+    out = pp.persist(FOCUS_RESEARCH, [{"name": "Rowan Pike", "email": "rowan@larkspur.example"}])
     assert out["persisted"] == 0 and out["people"] == [] and out["companies"] == []
     assert "read-only file system" in out["error"]
     monkeypatch.setattr(pp.ku, "company_knowledge", boom)
@@ -428,20 +433,25 @@ def test_persistence_failure_never_costs_the_run(tmp_path, monkeypatch):
 
 def test_company_only_writer_preserves_owner_about_and_has_no_person(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    row = {"company_deep": FOCUS_RESEARCH["attendees"][0]["company_deep"], "domain": "commenda.io"}
+    row = {**FOCUS_RESEARCH["attendees"][0], "domain": "larkspur.example"}
     research = {"companies": [row], "attendees": FOCUS_RESEARCH["attendees"]}
-    assert pp.persist_company(research)["companies"] == ["Commenda"]
+    assert pp.persist_company(research)["companies"] == ["Larkspur"]
     assert not list((tmp_path / "knowledge" / "people").glob("*.md"))
     body = _company(tmp_path)
-    assert "Global tax filing" in body and "https://tc.com/a" in body and "commenda.io" in body
+    assert "Global tax filing" in body and "https://tc.com/a" in body and "larkspur.example" in body
     edit = _load("company_only_edit", "_shared/knowledge/knowledge_edit.py")
-    edit.run(["--slug", "commenda", "--op", "company-about", "--text", "Owner corrected description."])
-    new = {**row, "company_deep": {**row["company_deep"], "traction": ["No URL should vanish", "New launch (https://tc.com/new)"]}}
+    edit.run(["--slug", "larkspur", "--op", "company-about", "--text", "Owner corrected description."])
+    launch = "Larkspur (larkspur.example) launched a payroll API."
+    new = {**row, "traction_sources": {"https://tc.com/new": [launch]},
+           "company_deep": {**row["company_deep"], "traction": [
+               "No URL should vanish", "Larkspur is certified. (https://tc.com/bad)",
+               f"{launch} (https://tc.com/new)"]}}
     pp.persist_company({"companies": [new]})
     pp.persist_company({"companies": [new]})
     body = _company(tmp_path)
     assert "Owner corrected description." in body and "misfiled quarter" not in body
     assert body.count("https://tc.com/new") == 1 and "No URL should vanish" not in body
+    assert "https://tc.com/bad" not in body
     assert "updated_by: user_edit" in body
     assert not list((tmp_path / "knowledge" / "people").glob("*.md"))
 
@@ -457,10 +467,69 @@ def test_company_only_empty_failure_and_cli(tmp_path, monkeypatch):
     path.write_text(json.dumps(research))
     result = subprocess.run([sys.executable, pp.__file__, "--company-only", "--research", str(path)],
                             env=dict(os.environ), capture_output=True, text=True)
-    assert result.returncode == 0 and json.loads(result.stdout)["companies"] == ["Commenda"]
+    assert result.returncode == 0 and json.loads(result.stdout)["companies"] == ["Larkspur"]
     assert not list((tmp_path / "knowledge" / "people").glob("*.md"))
     def fail(_):
         raise OSError("read-only fixture")
     monkeypatch.setattr(pp.ku, "apply", fail)
     result = pp.persist_company(research)
     assert result["companies"] == [] and "read-only fixture" in result["error"]
+
+
+def test_same_name_different_domains_keep_separate_company_updates(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    url = "https://certifier.test/cedar"
+    clinic = "Cedar (cedar.example) is certified for clinic scheduling."
+    astronomy = "Cedar (cedar.test) is certified for telescope tracking."
+    sources = {url: [clinic, astronomy]}
+    claims = [f"{clinic} ({url})", f"{astronomy} ({url})"]
+    research = {"attendees": [
+        {"email": "one@cedar.example", "company": "Cedar", "company_summary": "Builds schedules.",
+         "company_deep": {"company": "Cedar", "builds": ["Certified for an unproven standard."],
+                          "traction": claims}, "traction_sources": sources},
+        {"email": "two@cedar.test", "company": "Cedar", "company_summary": "Builds telescopes.",
+         "company_deep": {"company": "Cedar", "traction": claims}, "traction_sources": sources},
+    ]}
+    pp.persist(json.loads(json.dumps(research)))
+    first = ku.company_knowledge("Cedar", domain="cedar.example")
+    second = ku.company_knowledge("Cedar", domain="cedar.test")
+    assert first["about"] == "Builds schedules." and second["about"] == "Builds telescopes."
+    assert first["news"] == [f"[Source reports: {clinic}]({url})"]
+    assert second["news"] == [f"[Source reports: {astronomy}]({url})"]
+
+
+def test_namesake_retry_only_replays_failed_domain_and_batches_aliases(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    research = {"attendees": [
+        {"email": "one@cedar.example", "company_deep": {"company": "Cedar", "builds": ["Schedules"]}},
+        {"email": "two@cedar.example", "company": "Cedar North", "company_summary": "Schedules shifts."},
+        {"email": "three@cedar.test", "company_deep": {"company": "Cedar", "builds": ["Telescopes"]}},
+    ]}
+    apply = ku.apply
+    calls = []
+
+    def interrupted(payload):
+        if payload["company_updates"]:
+            domain = payload["company_updates"][0]["domain"]
+            calls.append(domain)
+            if calls == ["cedar.example", "cedar.test"]:
+                raise OSError("synthetic interruption")
+        return apply(payload)
+
+    monkeypatch.setattr(ku, "apply", interrupted)
+    first = pp.persist(research)
+    assert not first["complete"] and calls == ["cedar.example", "cedar.test"]
+    retry = pp.persist(research, previous_receipt=first)
+    assert retry["complete"] and calls == ["cedar.example", "cedar.test", "cedar.test"]
+    assert [item["domain"] for item in retry["outcomes"]["companies"]] == ["cedar.example", "cedar.test"]
+    assert ku.company_knowledge("Cedar", domain="cedar.test")["about"] == "Builds: Telescopes."
+
+
+def test_person_research_does_not_save_unchecked_certification(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
+    pp.persist({"attendees": [{"email": "dana@acme.com", "title": "CEO", "company": "Acme",
+        "summary": "Dana leads Acme, which is ISO certified.",
+        "recent_activity": [{"what": "Acme received ISO certification.", "source_url": "https://source.test/a"}],
+        "personal": ["Dana shared that Acme is certified. https://source.test/b"]}]})
+    _, person = _person(tmp_path)
+    assert [fact.text for fact in person.facts.values()] == ["Per web search: CEO at Acme"]

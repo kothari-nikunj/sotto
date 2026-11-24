@@ -18,7 +18,7 @@ def test_real_partial_recovery_then_owner_correction_and_fresh_process_read(ask,
     import knowledge_edit as edit
     import jsonstore
     seed(kg)
-    source = {'attendees': [{'email': 'dana@cedar.com', 'title': 'CEO', 'company': 'Cedar',
+    source = {'attendees': [{'email': 'dana@cedar.test', 'title': 'CEO', 'company': 'Cedar',
         'summary': 'Leads the platform team.', 'company_summary': 'Cedar builds team tools.',
         'conversation_hooks': ['Ask about a deal next Tuesday.'],
         'recent_activity': [{'when': '2026-11-01', 'what': 'Published a platform guide.',
@@ -58,7 +58,7 @@ def test_real_partial_recovery_then_owner_correction_and_fresh_process_read(ask,
         invoke(command=command, answer=answer)
     assert receipts[0]['complete'] is False and receipts[0]['persisted'] == 1
     assert receipts[0]['outcomes']['companies'][0]['status'] == 'failed'
-    assert not pp.profile_is_fresh('Dana', 'dana@cedar.com')
+    assert not pp.profile_is_fresh('Dana', 'dana@cedar.test')
     monkeypatch.setattr(ku, '_write_company', company_writer)
     monkeypatch.setattr(jsonstore, 'write_atomic', checkpoint_writer)
     result = invoke(command=command, answer=answer)
@@ -66,7 +66,7 @@ def test_real_partial_recovery_then_owner_correction_and_fresh_process_read(ask,
     assert stages == ['research', 'persist', 'persist'] and len(answers) == 1
     assert invoke(command=command, answer=answer) == result
     assert stages == ['research', 'persist', 'persist']
-    path = Path(kg.find_person_file(name='Dana', identifier='dana@cedar.com'))
+    path = Path(kg.find_person_file(name='Dana', identifier='dana@cedar.test'))
     person = kg.parse_person_file(path.read_text())
     assert len(person.facts) == 2 and all(f.seen == 1 for f in person.facts.values())
     activity = next(f for f in person.facts.values() if 'platform guide' in f.text)
@@ -79,7 +79,7 @@ def test_real_partial_recovery_then_owner_correction_and_fresh_process_read(ask,
     corrected = kg.parse_person_file(path.read_text())
     assert corrected.title is None and corrected.company is None
     assert corrected.identity_support['title']['source'] == 'user_edit'
-    replay = pp.persist(source, [{'name': 'Dana', 'email': 'dana@cedar.com'}])
+    replay = pp.persist(source, [{'name': 'Dana', 'email': 'dana@cedar.test'}])
     assert any(item.get('reason') == 'protected_owner_correction'
                for item in replay['outcomes']['people'][0]['fact_outcomes']['items'])
     corrected = kg.parse_person_file(path.read_text())

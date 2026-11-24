@@ -28,36 +28,36 @@ SNAPSHOT = {
     "window_hours": 1008,
     "source_status": {"imessage": "ok", "whatsapp": "ok"},
     "contacts": [
-        {"name": "Sarah Chen", "phones": ["+1 (415) 555-1234"], "emails": ["sarah@acme.com"]},
-        {"name": "Mom", "phones": ["+1 (415) 555-9999"], "emails": []},
+        {"name": "Sarah Chen", "phones": ["+1 (415) 555-0107"], "emails": ["sarah@acme.com"]},
+        {"name": "Mom", "phones": ["+1 (415) 555-0116"], "emails": []},
     ],
     "imessage": [
-        {"handle": "+14155551234", "is_from_me": True, "timestamp": "2026-06-20 09:00:00",
+        {"handle": "+14155550107", "is_from_me": True, "timestamp": "2026-06-20 09:00:00",
          "text": "Hey Sarah, sounds great — can you send the deck by Friday?", "is_group_chat": False},
-        {"handle": "+14155551234", "is_from_me": False, "timestamp": "2026-06-20 09:05:00",
+        {"handle": "+14155550107", "is_from_me": False, "timestamp": "2026-06-20 09:05:00",
          "text": "Will do, sending it over this afternoon!", "is_group_chat": False},
-        {"handle": "+14155551234", "is_from_me": True, "timestamp": "2026-06-21 10:00:00",
+        {"handle": "+14155550107", "is_from_me": True, "timestamp": "2026-06-21 10:00:00",
          "text": "Thanks for the update, will review tonight and circle back tomorrow.",
          "is_group_chat": False},
         {"handle": "chat123", "is_from_me": True, "timestamp": "2026-06-21 11:00:00",
          "text": "This is a group chat message with no single recipient here.", "is_group_chat": True},
     ],
     "whatsapp": [
-        {"contact_jid": "14155559999@s.whatsapp.net", "partner_name": "Mom", "is_from_me": True,
+        {"contact_jid": "14155550116@s.whatsapp.net", "partner_name": "Mom", "is_from_me": True,
          "timestamp": "2026-06-21 19:00:00", "text": "running a bit late, be there around 7",
          "is_group_chat": False},
-        {"contact_jid": "14155559999@s.whatsapp.net", "partner_name": "Mom", "is_from_me": True,
+        {"contact_jid": "14155550116@s.whatsapp.net", "partner_name": "Mom", "is_from_me": True,
          "timestamp": "2026-06-22 18:30:00", "text": "can you grab milk on the way home",
          "is_group_chat": False},
-        {"contact_jid": "14155559999@s.whatsapp.net", "partner_name": "Mom", "is_from_me": False,
+        {"contact_jid": "14155550116@s.whatsapp.net", "partner_name": "Mom", "is_from_me": False,
          "timestamp": "2026-06-22 18:35:00", "text": "sure thing, see you soon honey",
          "is_group_chat": False},
     ],
 }
 
 
-def test_read_local_snapshot_seeds_nonempty_style(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_read_local_snapshot_seeds_nonempty_style(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     res = se.extract(json.loads(json.dumps(SNAPSHOT)))
     style = json.load(open(os.path.join(str(tmp_path), "style.json")))
     # Only the 4 usable is_from_me 1:1 messages are ingested (inbound + group excluded).
@@ -67,8 +67,8 @@ def test_read_local_snapshot_seeds_nonempty_style(tmp_path):
     assert style["master"]["greetings"] or style["master"]["patterns"]
 
 
-def test_disabled_message_source_cannot_seed_style(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_disabled_message_source_cannot_seed_style(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     payload = json.loads(json.dumps(SNAPSHOT))
     payload["source_status"]["imessage"] = "disabled"
     payload["source_status"]["whatsapp"] = "disabled"
@@ -76,8 +76,8 @@ def test_disabled_message_source_cannot_seed_style(tmp_path):
     assert res["messages_analyzed"] == 0
 
 
-def test_wrapped_disabled_source_cannot_bypass_style_consent(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_wrapped_disabled_source_cannot_bypass_style_consent(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     payload = json.loads(json.dumps(SNAPSHOT))
     payload["source_status"]["imessage"] = "disabled"
     payload["source_status"]["whatsapp"] = "disabled"
@@ -86,8 +86,8 @@ def test_wrapped_disabled_source_cannot_bypass_style_consent(tmp_path):
     assert res["messages_analyzed"] == 0
 
 
-def test_read_local_work_vs_personal_classification(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_read_local_work_vs_personal_classification(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract(json.loads(json.dumps(SNAPSHOT)))
     style = json.load(open(os.path.join(str(tmp_path), "style.json")))
     # Sarah has a non-personal email domain (acme.com) → her texts land in work_message.
@@ -98,8 +98,8 @@ def test_read_local_work_vs_personal_classification(tmp_path):
     assert "grab milk" in personal_texts
 
 
-def test_read_local_seeds_per_person_samples(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_read_local_seeds_per_person_samples(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract(json.loads(json.dumps(SNAPSHOT)))
     style = json.load(open(os.path.join(str(tmp_path), "style.json")))
     names = {p["name"] for p in style["per_person"].values()}
@@ -108,9 +108,9 @@ def test_read_local_seeds_per_person_samples(tmp_path):
     assert all(k.startswith("c_") for k in style["per_person"])
 
 
-def test_sent_messages_payload_still_works(tmp_path):
+def test_sent_messages_payload_still_works(tmp_path, monkeypatch):
     # The legacy cloud/brief shape must behave exactly as before the adapter.
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     res = se.extract({"sent_messages": [
         {"text": "Hey Sarah, sounds great — can you send the deck by Friday?", "channel": "imessage",
          "recipient": "sarah@acme.com", "canonical_id": "c_sarah", "work": True},
@@ -124,7 +124,7 @@ def test_sent_messages_payload_still_works(tmp_path):
 
 
 def test_normalized_sent_messages_obey_source_consent(tmp_path, monkeypatch):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setattr(se, "allowed", lambda source: source not in ("imessage", "gmail"))
     res = se.extract({"sent_messages": [
         {"text": "This iMessage sample must not persist after consent is revoked.",
@@ -140,7 +140,7 @@ def test_normalized_sent_messages_obey_source_consent(tmp_path, monkeypatch):
 
 
 def test_normalized_channel_wins_over_non_source_provenance(tmp_path, monkeypatch):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setattr(se, "allowed", lambda source: source != "imessage")
     res = se.extract({"sent_messages": [{
         "text": "A confirmed label must not disguise an iMessage after revocation.",
@@ -149,8 +149,8 @@ def test_normalized_channel_wins_over_non_source_provenance(tmp_path, monkeypatc
     assert res["messages_analyzed"] == 0
 
 
-def test_unknown_normalized_channel_is_rejected_instead_of_bypassing_consent(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_unknown_normalized_channel_is_rejected_instead_of_bypassing_consent(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     res = se.extract({"sent_messages": [
         {"text": "An unsupported transport must never become an unconsented style sample.",
          "channel": "carrier_pigeon", "recipient": "Alex"},
@@ -165,7 +165,7 @@ def test_unknown_normalized_channel_is_rejected_instead_of_bypassing_consent(tmp
 
 
 def test_unrelated_raw_source_revocation_does_not_block_style(tmp_path, monkeypatch):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     original = se.allowed
     monkeypatch.setattr(se, "allowed", lambda source: False if source == "chrome" else original(source))
     payload = json.loads(json.dumps(SNAPSHOT))
@@ -191,20 +191,20 @@ def test_cli_accepts_snapshot_file_path(tmp_path):
     assert res["people"] == 2
 
 
-def test_wrapped_read_local_snapshot_still_seeds(tmp_path):
+def test_wrapped_read_local_snapshot_still_seeds(tmp_path, monkeypatch):
     # The SKILL saves the read_local tool result AS-IS, which may be the raw MCP wrapper. The
     # adapter must unwrap it — it used to ingest 0 messages while printing the old healthy total.
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     wrapped = {"content": [{"type": "text", "text": json.dumps(SNAPSHOT)}]}
     res = se.extract(wrapped)
     assert res["messages_analyzed"] == 4               # same as the bare-snapshot seed
     assert sum(res["canonical_counts"].values()) == 4
 
 
-def test_gmail_sent_messages_feed_work_email_bucket(tmp_path):
+def test_gmail_sent_messages_feed_work_email_bucket(tmp_path, monkeypatch):
     # Sent Gmail (isSent / SENT label) → work_email canonical samples. Without --gmail the bucket
     # stayed 0 forever and drafts never learned the user's email voice.
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     gmail = {"emails": [
         {"isSent": True, "to": "Sarah Chen <sarah@acme.com>", "date": "2026-06-23",
          "body": "Hi Sarah,\n\nAttached is the revised deck — the pricing slide now reflects "
@@ -223,8 +223,8 @@ def test_gmail_sent_messages_feed_work_email_bucket(tmp_path):
     assert "Looks great" not in json.dumps(style)                      # inbound mail never learned
 
 
-def test_gmail_absent_leaves_extraction_unchanged(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_gmail_absent_leaves_extraction_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     res = se.extract(json.loads(json.dumps(SNAPSHOT)), gmail=None)
     assert res["messages_analyzed"] == 4
     style = json.load(open(os.path.join(str(tmp_path), "style.json")))
@@ -262,8 +262,8 @@ def _some_sample(tmp_path):
     raise AssertionError("the fixture produced no canonical samples")
 
 
-def test_confirm_copies_one_sample_and_floors_its_quality(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_confirm_copies_one_sample_and_floors_its_quality(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract(json.loads(json.dumps(SNAPSHOT)))
     style, sample = _some_sample(tmp_path)
     before = len(style["canonical"][sample["bucket"]])
@@ -277,8 +277,8 @@ def test_confirm_copies_one_sample_and_floors_its_quality(tmp_path):
     assert len(after["canonical"][sample["bucket"]]) == before
 
 
-def test_confirm_is_idempotent_and_reports_unknown_samples(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_confirm_is_idempotent_and_reports_unknown_samples(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract(json.loads(json.dumps(SNAPSHOT)))
     _, sample = _some_sample(tmp_path)
     key = se.sample_hash(sample)
@@ -290,9 +290,9 @@ def test_confirm_is_idempotent_and_reports_unknown_samples(tmp_path):
     assert se.confirm_sample("")["ok"] is False
 
 
-def test_confirm_survives_the_next_extraction_and_reaches_the_drafter(tmp_path):
+def test_confirm_survives_the_next_extraction_and_reaches_the_drafter(tmp_path, monkeypatch):
     """The point of confirming: the sample stops aging out, and style_apply quotes it first."""
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract(json.loads(json.dumps(SNAPSHOT)))
     _, sample = _some_sample(tmp_path)
     se.confirm_sample(se.sample_hash(sample))
@@ -334,7 +334,7 @@ def test_style_examples_quote_exact_duplicates_once_without_dropping_shared_pref
 
 def test_extract_and_confirm_write_only_while_holding_the_shared_lock(tmp_path, monkeypatch):
     import threading
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     original = se.jsonstore.write_atomic
     observed = []
 
@@ -351,12 +351,12 @@ def test_extract_and_confirm_write_only_while_holding_the_shared_lock(tmp_path, 
     assert observed == [1, 1]
 
 
-def test_the_confirmed_bucket_is_capped_newest_first_and_quoted_newest_first(tmp_path):
+def test_the_confirmed_bucket_is_capped_newest_first_and_quoted_newest_first(tmp_path, monkeypatch):
     """The bucket is TTL-immune and, since the draft→outcome matcher, fed automatically on every
     verbatim send — so it is capped where it grows (CONFIRMED_CAP, newest kept), and the drafter
     quotes the NEWEST four rather than the first four ever confirmed (which used to freeze the
     'highest signal' slot on week one, forever)."""
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract(json.loads(json.dumps(SNAPSHOT)))
     path = os.path.join(str(tmp_path), "style.json")
     style = json.load(open(path))
@@ -394,8 +394,8 @@ def test_the_confirmed_bucket_is_capped_newest_first_and_quoted_newest_first(tmp
     assert "Learned preferences" not in guidance                       # the writer-less block is gone
 
 
-def test_confirm_cli_contract(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_confirm_cli_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract(json.loads(json.dumps(SNAPSHOT)))
     _, sample = _some_sample(tmp_path)
     env = {**os.environ, "SOTTO_DATA": str(tmp_path)}

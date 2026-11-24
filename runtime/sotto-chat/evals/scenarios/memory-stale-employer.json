@@ -1,0 +1,166 @@
+{
+  "name": "stale-employer-original-evidence-and-restart",
+  "world": {
+    "savedSourceGrants": [
+      "gmail"
+    ],
+    "knowledge": {
+      "person_updates": [
+        {
+          "person_name": "Mira Example",
+          "identifier": "mira@example.test",
+          "facts": [
+            {
+              "fact": "Mira currently works at Cedar Labs.",
+              "source": "observed_message",
+              "confidence": 0.8,
+              "source_ref": "gmail:memory-employer-old",
+              "evidence_refs": [
+                "gmail:memory-employer-old",
+                "gmail:memory-employer-new"
+              ],
+              "observed_date": "2026-11-06"
+            }
+          ]
+        }
+      ]
+    },
+    "files": {
+      "config/managed-capabilities.json": "{\"tenant_id\": \"eval-tenant\", \"sources\": {\"gmail\": {\"consented\": true, \"connected\": true}}}"
+    },
+    "gmailMessages": {
+      "memory-employer-old": {
+        "id": "memory-employer-old",
+        "threadId": "mira-employer-update",
+        "internalDate": "1790845200000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "I currently work at Cedar Labs.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Mira Example <mira@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "employer update"
+            },
+            {
+              "name": "Date",
+              "value": "Thu, 01 Oct 2026 09:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "SSBjdXJyZW50bHkgd29yayBhdCBDZWRhciBMYWJzLg=="
+          }
+        }
+      },
+      "memory-employer-new": {
+        "id": "memory-employer-new",
+        "threadId": "mira-employer-update",
+        "internalDate": "1793869200000",
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "I left Cedar Labs in October. I now work at Oak Labs.",
+        "payload": {
+          "mimeType": "text/plain",
+          "headers": [
+            {
+              "name": "From",
+              "value": "Mira Example <mira@example.test>"
+            },
+            {
+              "name": "To",
+              "value": "owner@example.test"
+            },
+            {
+              "name": "Subject",
+              "value": "employer update"
+            },
+            {
+              "name": "Date",
+              "value": "Thu, 05 Nov 2026 09:00:00 +0000"
+            }
+          ],
+          "body": {
+            "data": "SSBsZWZ0IENlZGFyIExhYnMgaW4gT2N0b2Jlci4gSSBub3cgd29yayBhdCBPYWsgTGFicy4="
+          }
+        }
+      }
+    }
+  },
+  "turns": [
+    {
+      "text": "What employer is saved for mira@example.test? Only report saved memory; do not check email or change anything.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "contactReads": 0,
+      "bridgeSends": 0,
+      "latencyClass": "evidence",
+      "contains": [
+        "Cedar Labs"
+      ],
+      "containsAny": [
+        [
+          "saved",
+          "on file",
+          "memory"
+        ]
+      ],
+      "googleReads": 0,
+      "knowledgeQueryReads": 1,
+      "returnedEvidenceContains": [
+        "gmail:memory-employer-old",
+        "gmail:memory-employer-new",
+        "source_timestamp",
+        "first_observed_date"
+      ]
+    },
+    {
+      "text": "Where does Mira work now? Verify against her original emails; the saved wording may be stale. Do not change anything.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "contactReads": 0,
+      "bridgeSends": 0,
+      "latencyClass": "evidence",
+      "contains": [
+        "Oak Labs"
+      ],
+      "containsAny": [
+        [
+          "November 5",
+          "Nov 5",
+          "Nov. 5",
+          "2026-11-05"
+        ]
+      ]
+    },
+    {
+      "text": "Verify the original job-change email again. What did Mira say she left, and where did she say she works now? Do not change anything.",
+      "canonicalUnchanged": true,
+      "publicReads": 0,
+      "contactReads": 0,
+      "bridgeSends": 0,
+      "latencyClass": "evidence",
+      "restartBefore": true,
+      "contains": [
+        "Cedar Labs",
+        "Oak Labs"
+      ],
+      "containsAny": [
+        [
+          "left",
+          "leaving"
+        ]
+      ]
+    }
+  ]
+}

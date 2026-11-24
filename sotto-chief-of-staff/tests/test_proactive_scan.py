@@ -56,18 +56,18 @@ def test_the_prep_nudge_carries_who_they_are_and_what_you_owe_them(tmp_path, mon
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     people = tmp_path / "knowledge" / "people"
     people.mkdir(parents=True)
-    (people / "spencer-kim.md").write_text(
-        "---\nschema: 2\ncanonical_id: c_spencer\nname: Spencer Kim\ntitle: VP Eng\ncompany: Acme\n"
-        "identifiers:\n  - spencer@acme.com\n---\n")
+    (people / "rowan-pike.md").write_text(
+        "---\nschema: 2\ncanonical_id: c_rowan\nname: Rowan Pike\ntitle: VP Eng\ncompany: Acme\n"
+        "identifiers:\n  - rowan@acme.com\n---\n")
     now = _at(10)
     soon = (now + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S%z")
     cal = [{"id": "ev1", "summary": "Pitch", "start": soon,
             "attendees": [{"email": "me@x.com", "self": True},
-                          {"email": "spencer@acme.com", "displayName": "Spencer Kim"}]}]
-    cont = [{"id": "c1", "title": "Spencer Kim — the intro to Priya you promised", "name": "Spencer Kim",
-             "identifier": "spencer@acme.com", "deadline": (now + timedelta(days=3)).strftime("%Y-%m-%d")}]
+                          {"email": "rowan@acme.com", "displayName": "Rowan Pike"}]}]
+    cont = [{"id": "c1", "title": "Rowan Pike — the intro to Priya you promised", "name": "Rowan Pike",
+             "identifier": "rowan@acme.com", "deadline": (now + timedelta(days=3)).strftime("%Y-%m-%d")}]
     n, = ps.scan(cal, cont, {}, "me@x.com", now)["nudges"]
-    assert n["kind"] == "meeting_prep" and n["person"] == "Spencer Kim"
+    assert n["kind"] == "meeting_prep" and n["person"] == "Rowan Pike"
     assert n["who"] == "VP Eng at Acme" and n["open_loop"] == "the intro to Priya you promised"
     assert "VP Eng at Acme" in n["detail"] and "open with them: the intro to Priya" in n["detail"]
     # an unknown attendee carries nothing invented
@@ -148,27 +148,22 @@ def test_dedup_marks_and_skips(tmp_path, monkeypatch):
     assert "bday:jordan" in ps._load_state(date)
 
 
-def _touch_brief_marker(tmp_path, date, kind, mtime=None):
-    briefs = tmp_path / "briefs"
-    briefs.mkdir(parents=True, exist_ok=True)
-    p = briefs / f"{date}.{kind}.delivered"
-    p.write_text("")
-    if mtime is not None:
-        os.utime(p, (mtime, mtime))
-    return p
+def _accept_brief(date, kind, accepted_at, keys=()):
+    from delivery_effects import finalize
+    assert finalize([{"kind": "brief_named", "day": date, "edition": kind,
+                      "anchor_keys": list(keys), "loop_versions": {}}], {"accepted_at": accepted_at})
 
 
 def test_recent_brief_marker_detection(tmp_path, monkeypatch):
-    """Sprint 0 §6: brief_marker.py claim files under $SOTTO_DATA/briefs mark delivery — a fresh
-    mtime within 2h means the brief just covered the loop pile."""
+    """A brief counts as recent from its provider acceptance time."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     now = datetime.now(timezone.utc)
     assert ps._recent_brief_delivered(now) is False              # no markers at all
-    p = _touch_brief_marker(tmp_path, now.strftime("%Y-%m-%d"), "morning")
-    assert ps._recent_brief_delivered(now) is True               # fresh marker → suppress window
-    old = (now - timedelta(hours=3)).timestamp()
-    os.utime(p, (old, old))
-    assert ps._recent_brief_delivered(now) is False              # 3h old → window over
+    day = now.date().isoformat()
+    _accept_brief(day, "morning", (now - timedelta(hours=3)).timestamp())
+    assert ps._recent_brief_delivered(now) is False
+    _accept_brief(day, "morning", now.timestamp())
+    assert ps._recent_brief_delivered(now) is True
 
 
 def test_yesterdays_late_evening_brief_still_counts(tmp_path, monkeypatch):
@@ -177,7 +172,7 @@ def test_yesterdays_late_evening_brief_still_counts(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     now = datetime.now(timezone.utc)
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    _touch_brief_marker(tmp_path, yesterday, "evening", mtime=(now - timedelta(hours=1)).timestamp())
+    _accept_brief(yesterday, "evening", (now - timedelta(hours=1)).timestamp())
     assert ps._recent_brief_delivered(now) is True
 
 
@@ -290,14 +285,16 @@ def test_the_day_of_birthday_is_dedupd_by_a_delivered_brief_not_delayed(tmp_path
     delayed it into the same morning."""
     import json
     _quiet_never(monkeypatch, tmp_path)
-    now = ps._now_local("+00:00")
+    now = ps._now_local("+00:00").replace(hour=8)
+    monkeypatch.setattr(ps, "_now_local", lambda _: now)
     local_path = tmp_path / "local.json"
     local_path.write_text(json.dumps({"contacts": [{"name": "Jordan",
                                                     "birthday": now.strftime("%m-%d")}]}))
-    marker = _touch_brief_marker(tmp_path, now.strftime("%Y-%m-%d"), "morning")
+    day = now.date().isoformat()
+    accepted_at = now.timestamp()
+    _accept_brief(day, "morning", accepted_at)
     assert _run_main(monkeypatch, capsys, "--local", str(local_path))["nudges"] == []
-    old = (now - timedelta(hours=3)).timestamp()
-    os.utime(marker, (old, old))                                 # 2h window over — still nothing
+    monkeypatch.setattr(ps, "_now_local", lambda _: now + timedelta(hours=3))
     assert _run_main(monkeypatch, capsys, "--local", str(local_path))["nudges"] == []
 
 
@@ -308,14 +305,16 @@ def test_the_lead_birthday_keeps_the_two_hour_delay(tmp_path, monkeypatch, capsy
     _quiet_never(monkeypatch, tmp_path)
     monkeypatch.setattr(ps, "_birthday_importance", lambda *a: {"jordan": {"tier": "vip"}})
     monkeypatch.setenv("SOTTO_BIRTHDAY_LEAD_DAYS", "3")
-    now = ps._now_local("+00:00")
+    now = ps._now_local("+00:00").replace(hour=8)
+    monkeypatch.setattr(ps, "_now_local", lambda _: now)
     local_path = tmp_path / "local.json"
     local_path.write_text(json.dumps({"contacts": [
         {"name": "Jordan", "birthday": (now + timedelta(days=3)).strftime("%m-%d")}]}))
-    marker = _touch_brief_marker(tmp_path, now.strftime("%Y-%m-%d"), "morning")
+    day = now.date().isoformat()
+    accepted_at = now.timestamp()
+    _accept_brief(day, "morning", accepted_at)
     assert _run_main(monkeypatch, capsys, "--local", str(local_path))["nudges"] == []
-    old = (now - timedelta(hours=3)).timestamp()
-    os.utime(marker, (old, old))
+    monkeypatch.setattr(ps, "_now_local", lambda _: now + timedelta(hours=3))
     assert [n["lead_days"] for n in
             _run_main(monkeypatch, capsys, "--local", str(local_path))["nudges"]] == [3]
 
@@ -651,18 +650,13 @@ def test_held_intention_remains_due_then_waits_for_delivery_ack(tmp_path, monkey
     assert schedule_wakeup.current()[0]['status'] == 'fired'
 
 
-def test_chase_waits_out_a_freshly_delivered_brief(tmp_path, monkeypatch, capsys):
-    """The chase stamp is written in the brief's OWN Learn step, so without this guard the chase
-    fires minutes after the brief that just listed the item — the same 2h window its two siblings
-    already respect, applied to the one case where the collision is guaranteed."""
+def test_main_holds_a_first_chase_named_by_an_accepted_brief(tmp_path, monkeypatch, capsys):
+    """The watcher reads the provable named record when deciding whether a chase repeats it."""
     _quiet_never(monkeypatch, tmp_path)
     monkeypatch.setattr(ps, "_chase_candidates", lambda date: [_chase()])
     now = ps._now_local("+00:00")
-    marker = _touch_brief_marker(tmp_path, now.strftime("%Y-%m-%d"), "morning")
+    _accept_brief(now.date().isoformat(), "morning", now.timestamp(), [_chase()["anchor_key"]])
     assert _run_main(monkeypatch, capsys)["nudges"] == []
-    old = (now - timedelta(hours=3)).timestamp()
-    os.utime(marker, (old, old))
-    assert [n["kind"] for n in _run_main(monkeypatch, capsys)["nudges"]] == ["chase"]
 
 
 # ── The hand-off: chased twice, no answer, so Sotto asks in plain words ───────────────────────────
@@ -828,21 +822,13 @@ def test_a_chase_counts_only_once_it_has_actually_gone_out(tmp_path, monkeypatch
 # nudge over a collision that could not happen. compose_brief writes down what it named; the lane
 # checks membership, and falls back to the window only when there is no such record.
 
-def _named_record(tmp_path, date, kind, keys):
-    import json
-    briefs = tmp_path / "briefs"
-    briefs.mkdir(parents=True, exist_ok=True)
-    (briefs / f"{date}.{kind}.named.json").write_text(json.dumps({"anchor_keys": keys}))
-
-
 def test_a_loop_the_brief_named_is_not_chased_at_all_today(tmp_path, monkeypatch):
     """Not "held for two hours" — held, full stop. The brief already told the user about this loop;
     a nudge at 08:45 is the same tell, just later."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     now, c = _at(8) + timedelta(minutes=45), _chase()
     date = now.strftime("%Y-%m-%d")
-    _touch_brief_marker(tmp_path, date, "morning", mtime=(now - timedelta(hours=2, minutes=15)).timestamp())
-    _named_record(tmp_path, date, "morning", [c["anchor_key"]])
+    _accept_brief(date, "morning", (now - timedelta(hours=2, minutes=15)).timestamp(), [c["anchor_key"]])
     assert ps._recent_brief_delivered(now) is False        # the old guard has already lapsed
     assert ps._brief_named_keys(now) == {c["anchor_key"]}
     out = ps.scan([], [], {}, "me@x.com", now, chase_candidates=[c],
@@ -856,30 +842,12 @@ def test_a_loop_the_brief_never_mentioned_is_chased_immediately(tmp_path, monkey
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     now, c = _at(7), _chase()
     date = now.strftime("%Y-%m-%d")
-    _touch_brief_marker(tmp_path, date, "morning", mtime=(now - timedelta(minutes=20)).timestamp())
-    _named_record(tmp_path, date, "morning", ["email:waiting_on:id:someone-else"])
+    _accept_brief(date, "morning", (now - timedelta(minutes=20)).timestamp(), ["email:waiting_on:id:someone-else"])
     assert ps._recent_brief_delivered(now) is True         # the old guard would have delayed it
     out = ps.scan([], [], {}, "me@x.com", now, brief_recent=True, chase_candidates=[c],
                   brief_named=ps._brief_named_keys(now))
     assert [n["kind"] for n in out["nudges"]] == ["chase"]
 
-
-def test_a_delivered_brief_with_no_record_falls_back_to_the_time_window(tmp_path, monkeypatch):
-    """A brief from an older build, or a failed write: we cannot tell what it said, so the blunt
-    window stands rather than a guess in either direction. No brief at all = nothing to collide."""
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    now = _at(8)
-    date = now.strftime("%Y-%m-%d")
-    assert ps._brief_named_keys(now) == set()              # no delivered brief → nothing was said
-    _touch_brief_marker(tmp_path, date, "morning", mtime=(now - timedelta(minutes=30)).timestamp())
-    assert ps._brief_named_keys(now) is None               # delivered, but silent about what it said
-    kinds = lambda recent: [n["kind"] for n in ps.scan(
-        [], [], {}, "me@x.com", now, brief_recent=recent, chase_candidates=[_chase()],
-        brief_named=ps._brief_named_keys(now))["nudges"]]
-    assert kinds(True) == [] and kinds(False) == ["chase"]
-
-
-# ── the hand-off is asked ONCE, and the asking is stamped on delivery ─────────────────────────────
 
 def test_the_hand_off_question_is_not_repeated_once_it_was_asked(monkeypatch):
     """Nothing on the row used to record that the question had ever been put to the user, so it
@@ -924,15 +892,15 @@ def test_the_nudge_carries_the_thread_id_so_an_email_offer_can_thread(monkeypatc
     now = _at(10)
     today = now.strftime("%Y-%m-%d")
     monkeypatch.setattr(lq, "query", lambda: {
-        "you_owe": [{"name": "Pegah", "what": "SAFE allocation call", "deadline": today,
-                     "channel": "email", "identifier": "pegah@example.com", "thread_id": "T7"},
+        "you_owe": [{"name": "Odile", "what": "SAFE allocation call", "deadline": today,
+                     "channel": "email", "identifier": "odile@example.com", "thread_id": "T7"},
                     {"name": "Dhruv", "what": "ping back", "deadline": today,
                      "channel": "imessage", "identifier": "+15551234567", "thread_id": ""}],
         "waiting_on_them": [{"name": "Acme", "what": "the contract", "channel": "email",
                              "identifier": "ops@acme.com", "thread_id": "T9",
                              "anchor_key": "email:waiting_on:id:acme", "chase_pending": today}]})
     loops = {l["name"]: l for l in ps._open_loops()}
-    assert loops["Pegah"]["thread_id"] == "T7" and loops["Dhruv"]["thread_id"] == ""
+    assert loops["Odile"]["thread_id"] == "T7" and loops["Dhruv"]["thread_id"] == ""
     chases = ps._chase_candidates(today)
     assert chases and chases[0]["thread_id"] == "T9"
 
@@ -952,8 +920,7 @@ def test_a_second_chase_is_not_blocked_by_the_brief_naming_the_loop(tmp_path, mo
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     now, c = _at(8) + timedelta(minutes=45), dict(_chase(), chased_count=1)
     date = now.strftime("%Y-%m-%d")
-    _touch_brief_marker(tmp_path, date, "morning", mtime=(now - timedelta(hours=2, minutes=15)).timestamp())
-    _named_record(tmp_path, date, "morning", [c["anchor_key"]])
+    _accept_brief(date, "morning", (now - timedelta(hours=2, minutes=15)).timestamp(), [c["anchor_key"]])
     out = ps.scan([], [], {}, "me@x.com", now, chase_candidates=[c],
                   brief_named=ps._brief_named_keys(now))
     assert [n["kind"] for n in out["nudges"]] == ["chase"]

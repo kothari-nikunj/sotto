@@ -43,7 +43,7 @@ Two jobs, both deterministic:
      graph profile is already FRESH — `last_researched` (stamped by persist below) < 30 days old —
      so step 2 of the SKILL skips re-researching them.
 
-       persist_prep.py --filter-fresh /tmp/sotto_research_in.json [--keep "Spencer"]
+       persist_prep.py --filter-fresh /tmp/sotto_research_in.json [--keep "Rowan"]
 
      `--keep <name-or-email>` is the focused-prep exception: the person the user named survives the
      filter even when fresh, because the focus pass (research_attendees.py --focus) produces a
@@ -68,7 +68,6 @@ sys.path.insert(0, os.path.join(_HERE, "..", "..", "_shared", "knowledge"))
 from textutil import _s  # noqa: E402  (the shared string coercion, not a private copy)
 import knowledge as kg  # noqa: E402
 import knowledge_update as ku  # noqa: E402
-from textutil import FREEMAIL_DOMAINS  # noqa: E402
 import research_contract as ra  # noqa: E402
 
 FRESH_DAYS = 30                 # matches the Mac attendee-cache TTL
@@ -79,7 +78,6 @@ FACT_SOURCE = "web_research"    # provenance label for ALL research writes (grou
                                 # NOT knowledge_update's default "brief_extraction" label)
 MAX_RECENT_PERSISTED = ra.MAX_RECENT_ACTIVITY
 MAX_PERSONAL_PERSISTED = ra.MAX_PERSONAL
-MAX_TRACTION_PERSISTED = ra.MAX_TRACTION
 
 
 def _find_profile(name: str, email: str):
@@ -133,15 +131,6 @@ def filter_fresh(attendees: list, now: datetime | None = None,
     return kept, skipped
 
 
-def _domain_of(email: str) -> str:
-    """The attendee's corporate domain, or "" for freemail/none. It is the company file's second
-    resolution key (knowledge_update.resolve_company_path consults alias-slug THEN domain), which
-    is what stops "Commenda" and "Commenda Inc." forking two files."""
-    email = _s(email).strip().lower()
-    dom = email.split("@")[1] if "@" in email else ""
-    return "" if not dom or dom in FREEMAIL_DOMAINS else dom
-
-
 def _about_from_deep(cd: dict) -> str:
     """company_deep → the company's durable identity paragraph. Only the three DURABLE fields:
     what it builds, who founded it and why, and the market it sits in. Traction is dated and
@@ -149,35 +138,20 @@ def _about_from_deep(cd: dict) -> str:
     if not isinstance(cd, dict):
         return ""
     parts = []
-    builds = [_s(b).strip() for b in (cd.get("builds") or []) if _s(b).strip()]
+    builds = list(filter(None, map(ra.company_description, cd.get("builds") or [])))
     if builds:
         parts.append("Builds: " + "; ".join(builds) + ".")
-    story = _s(cd.get("founder_story")).strip()
+    story = ra.company_description(cd.get("founder_story"))
     if story:
         parts.append(story)
-    market = _s(cd.get("market")).strip()
+    market = ra.company_description(cd.get("market"))
     if market:
         parts.append(market)
     return "\n\n".join(parts)
 
 
-def _news_from_traction(cd: dict) -> list:
-    """company_deep.traction → knowledge_update `news` items. Each traction string already ends
-    with its source URL (research_attendees._postfilter_focus drops any that doesn't); split it out
-    so the company writer's URL dedupe works and a re-run of the same research adds nothing."""
-    if not isinstance(cd, dict):
-        return []
-    out = []
-    for t in (cd.get("traction") or [])[:MAX_TRACTION_PERSISTED]:
-        t = _s(t).strip()
-        m = re.search(r"https?://\S+", t)
-        if not t or not m:
-            continue   # no source → not a fact we keep, same bar as `personal`
-        url = m.group(0).rstrip(").,")
-        text = t.replace(m.group(0), "").strip().strip("()").strip(" —-·").strip()
-        if text:
-            out.append({"text": text, "url": url})
-    return out
+def _company_key(name, domain):
+    return ("domain", domain) if domain else ("name", kg.company_slug(name))
 
 
 def company_updates(research: dict, today: str, *, companies_only: bool = False) -> list:
@@ -195,9 +169,9 @@ def company_updates(research: dict, today: str, *, companies_only: bool = False)
         name = _s(cd.get("company")).strip() or _s(a.get("company")).strip()
         if not name:
             continue    # no company identified — nothing to key a file by, and none is invented
-        domain = ra.company_domain(_s(a.get("domain"))) if companies_only else _domain_of(a.get("email"))
-        key = kg.company_slug(name) or domain
-        if not key:
+        domain = ra.company_domain(_s(a.get("domain"))) if companies_only else ra.attendee_company_domain(a.get("email"))
+        key = _company_key(name, domain)
+        if not key[1]:
             continue
         upd = by_key.setdefault(key, {"company_name": name, "news": []})
         if domain and not upd.get("domain"):
@@ -205,12 +179,12 @@ def company_updates(research: dict, today: str, *, companies_only: bool = False)
         deep_about = _about_from_deep(cd)
         if deep_about:
             upd["_deep_about"] = deep_about
-        summary = _s(a.get("company_summary")).strip()
+        summary = ra.company_description(a.get("company_summary"))
         if summary and not upd.get("_thin_about"):
             upd["_thin_about"] = summary
-        for item in _news_from_traction(cd):
-            if not any(n["url"] == item["url"] for n in upd["news"]):
-                upd["news"].append(item)
+        for claim, url in list(ra.grounded_traction(a, domain))[:ra.MAX_TRACTION]:
+            if not any(n["url"] == url for n in upd["news"]):
+                upd["news"].append({"text": f"Source reports: {claim}", "url": url})
 
     out = []
     for upd in by_key.values():
@@ -224,6 +198,7 @@ def company_updates(research: dict, today: str, *, companies_only: bool = False)
             about = deep_about or (thin_about if not _s(known.get("about")).strip() else "")
             if about:
                 upd["about"] = about
+                upd["about_if_empty"] = not deep_about
         if not (upd.get("about") or upd["news"]):
             continue    # nothing new to say about this company — no empty rewrite
         upd["updated_by"] = FACT_SOURCE
@@ -249,7 +224,7 @@ def research_bio(a: dict) -> str:
 
 
 def _profile_summary(a: dict) -> str:
-    summary = _s(a.get("summary")).strip()
+    summary = ra.company_description(a.get("summary"))
     return "" if summary.lower() == "no public profile found." else summary
 
 
@@ -310,7 +285,7 @@ def persist(research: dict, attendees_in: list | None = None, now: datetime | No
         for it in (a.get("recent_activity") or [])[:MAX_RECENT_PERSISTED]:
             if not isinstance(it, dict):
                 continue
-            what = _s(it.get("what")).strip()
+            what = ra.company_description(it.get("what"))
             url = _s(it.get("source_url")).strip()
             when = _s(it.get("when")).strip()
             if not what or not url.lower().startswith(("http://", "https://")):
@@ -319,7 +294,7 @@ def persist(research: dict, attendees_in: list | None = None, now: datetime | No
                           "confidence": RECENT_CONFIDENCE, "memory_type": "context",
                           "source": FACT_SOURCE, "source_ref": url})
         for p in (a.get("personal") or [])[:MAX_PERSONAL_PERSISTED]:
-            p = _s(p).strip()
+            p = ra.company_description(p)
             m = re.search(r"https?://\S+", p)
             if not p or not m:
                 continue   # a personal item without an explicit public source is never persisted
@@ -357,7 +332,8 @@ def _persist_updates(research: dict, today: str, updates: list, *, companies_onl
     errors = []
     previous = ((previous_receipt or {}).get('outcomes', {})
                 if (previous_receipt or {}).get('input_digest') == digest else {})
-    prior_companies = {item.get('name'): item for item in previous.get('companies', [])
+    prior_companies = {_company_key(item.get('name', ''), item.get('domain', '')): item
+                       for item in previous.get('companies', [])
                        if item.get('status') == 'applied'}
     prior_people = {(item.get('identifier') or item.get('name')): item
                     for item in previous.get('people', [])
@@ -371,10 +347,10 @@ def _persist_updates(research: dict, today: str, updates: list, *, companies_onl
         errors.append(f"{type(error).__name__}: {str(error)[:200]}")
         out['outcomes']['companies'].append({'status': 'failed', 'error': errors[-1]})
     for company in companies:
-        item = {'name': company['company_name']}
-        if company['company_name'] in prior_companies:
+        item = {'name': company['company_name'], 'domain': company.get('domain', '')}
+        if prior := prior_companies.get(_company_key(item['name'], item['domain'])):
             out['companies'].append(company['company_name'])
-            out['outcomes']['companies'].append(prior_companies[company['company_name']])
+            out['outcomes']['companies'].append(prior)
             continue
         try:
             result = ku.apply({'person_updates': [], 'company_updates': [company]})
@@ -424,10 +400,11 @@ def persist_company(research: dict, now: datetime | None = None, *,
     rows = research.get("companies", []) if isinstance(research, dict) else []
     if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
         return out
-    filtered = ra.postfilter_company(rows[0])
+    domain = ra.company_domain(_s(rows[0].get("domain")))
+    filtered = ra.postfilter_company(rows[0], domain=domain)
     if not filtered or not _s(filtered["company_deep"].get("company")).strip():
         return out
-    row = {**filtered, "domain": ra.company_domain(_s(rows[0].get("domain")))}
+    row = {**filtered, "domain": domain}
     return _persist_updates({"companies": [row]},
                             (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d"),
                             [], companies_only=True, previous_receipt=previous_receipt)

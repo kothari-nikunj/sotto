@@ -3,7 +3,7 @@ import socket
 import re
 from urllib.parse import urlsplit
 
-from runtime_read_admission import read_cancelled, owner_read_request, contextual_read_request
+from runtime_read_admission import read_cancelled, owner_read_request
 
 from owner_tool_admission import validate_tool_admission, UnavailableError
 
@@ -47,7 +47,7 @@ def validate_args(args, text):
         if (type(reply_target) is not dict
                 or set(reply_target) != {'accepted_dispatch_id', 'provider_message_id', 'text', 'source_revision'}
                 or revision is None or reply_target.get('source_revision') != revision or tokens
-                or not (contextual_read_request(text) or owner_read_request(text))):
+                or not owner_read_request(text)):
             raise ValueError('web reply target invalid')
         for key in ('accepted_dispatch_id', 'provider_message_id'):
             value = reply_target[key]

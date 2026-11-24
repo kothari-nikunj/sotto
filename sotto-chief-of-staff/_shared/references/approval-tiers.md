@@ -25,13 +25,13 @@ acceptance relaxes that rule. Log it with `action_type: "decline"` so its outcom
 **Attention is not a decision.** An unanswered invitation, pitch, funding request or favor does
 not tell you whether the user wants to accept or decline. A relevance score, a due date, or a
 pattern of previous passes does not choose this answer. When the direction is still open, ask
-which way they want to go; if supplying drafts, label both alternatives as `Accept:` and `Decline:`
-as specified in `sotto-draft-reply`. Never present an unsolicited pass as the selected reply or
+which way they want to go; if supplying drafts, label both alternatives `Draft to accept:` and
+`Draft to decline:`, each quoted and in its own paragraph, as specified in `sotto-draft-reply`. Never present an unsolicited pass as the selected reply or
 invent a reason such as "not investing in this space." A single directional draft requires the
 user's instruction or a clear commitment in the supplied conversation; factual replies remain
 grounded in their evidence. This applies equally to briefs, digests, nudges and attended chat.
 
-**Alternative drafts must also be factual.** Labeling a reply `Accept:` or `Decline:` does not
+**Alternative drafts must also be factual.** Labeling a reply `Draft to accept:` or `Draft to decline:` does not
 permit invented past actions, internal discussions, investment conclusions, or reasons. Do not
 write "we debriefed with the team" or "we reviewed the memo" unless the supplied evidence says
 that happened. Offer a future direction the user can choose, such as "I'd like to continue the

@@ -99,9 +99,9 @@ time anything touches the graph.
 ```yaml
 ---
 schema: 1
-normalized: commenda           # the slug; the file's own name
-aliases: ["Commenda", "Commenda Inc."]   # every name form seen — the anti-fork key
-domain: commenda.io            # optional; the second resolution key
+normalized: larkspur           # the slug; the file's own name
+aliases: ["Larkspur", "Larkspur Inc."]   # every name form seen — the anti-fork key
+domain: larkspur.example            # optional; the second resolution key
 updated_at: 2026-08-11T07:00:00Z
 updated_by: web_research       # who owns the ABOUT — brief_extraction | web_research | user_edit
 last_news_update: 2026-08-11   # optional
@@ -195,7 +195,7 @@ per-message arrays** — the consumer groups them into threads. `granola_meeting
   // --- calls ---
   "calls": [
     { "phone": "+15551234567", "timestamp": "2026-06-23 14:00:00", "is_outgoing": true,
-      "is_answered": true, "call_type": "phone", "duration_seconds": 2700 }
+      "is_answered": false, "call_type": "phone", "duration_seconds": 2700 }
   ],
   "whatsapp_calls": [
     { "jid": "15551234567@s.whatsapp.net", "timestamp": "2026-06-23 13:00:00", "is_outgoing": false, "is_missed": true }

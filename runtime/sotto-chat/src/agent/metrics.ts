@@ -78,6 +78,7 @@ export class RunMetrics {
   private readonly completed = new Set<number>();
   private readonly toolStarts = new WeakMap<object,number>();
   private readonly toolNames = new Set<string>();
+  toolStarted = false;
   readonly value:ModelMetrics;
 
   constructor(mode:ModelMetrics['mode']) {
@@ -136,7 +137,10 @@ export class RunMetrics {
       processorRetries:timing?.retries??0});
   }
   readonly hooks:ToolHooks = {
-    beforeToolCall:({context})=>{if(context&&typeof context==='object')this.toolStarts.set(context,performance.now());},
+    beforeToolCall:({context})=>{
+      this.toolStarted = true;
+      if(context&&typeof context==='object')this.toolStarts.set(context,performance.now());
+    },
     afterToolCall:({context,toolName,error})=>{
       if(!context||typeof context!=='object'||!this.toolNames.has(toolName)||this.value.tools.length>=256)return;
       const at=this.toolStarts.get(context);this.toolStarts.delete(context);

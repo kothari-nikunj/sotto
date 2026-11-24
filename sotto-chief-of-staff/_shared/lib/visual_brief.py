@@ -106,15 +106,15 @@ def build(text, kind='brief', preview=False, *, edition=None):
                 if agenda_day and target['title'] == 'Your day':
                     block['day'] = agenda_day
                 target['blocks'].append(block)
-            elif kind == 'brief':
-                return None  # never hide an action merely because it is hard to fit
+            else:
+                return None  # never hide a paragraph merely because it is hard to fit
         elif kind == 'brief' and index > 0 and not filtered:
             preamble.append(_display_text(line))
     if kind == 'prep':
         groups = [('Your relationship', ('Your relationship', 'The founder')),
+                  ('Questions to ask', ('Questions to ask',)),
                   ('The business', ('The business',)),
-                  ('Signals & context', ('Signals', 'Context')),
-                  ('Questions to ask', ('Questions to ask',))]
+                  ('Signals & context', ('Signals', 'Context'))]
         sections = [{'title': title, 'blocks': [dict(b, section=part['title'])
                     for part in sections if part['title'] in titles for b in part['blocks']]}
                     for title, titles in groups]
@@ -129,13 +129,12 @@ def build(text, kind='brief', preview=False, *, edition=None):
     cards = []
     for section in sections:
         blocks, words = [], 0
-        required = kind == 'brief'
         limit = MAX_PREP_WORDS if kind == 'prep' and section['title'] != 'Your relationship' else MAX_WORDS
         for block in section['blocks']:
             count = len(block['text'].split())
             if words + count > limit:
-                if not required:
-                    break  # prep/schedule cards explicitly present selected highlights
+                if kind == 'prep':
+                    return None
                 cards.append({'title': section['title'], 'blocks': blocks})
                 blocks, words = [], 0
             blocks.append(block)
@@ -153,6 +152,8 @@ def build(text, kind='brief', preview=False, *, edition=None):
     selected = {b['line'] for c in cards for b in c['blocks']}
     omitted = any(line.strip() and i not in selected and i > 0 and not _heading(line.strip(), kind)
                   for i, line in enumerate(lines))
+    if kind == 'prep' and omitted:
+        return None  # even an unsectioned introduction can contain a material qualification
     deck = {'version': VERSION, 'kind': kind, 'title': title, 'preview': bool(preview),
             'full_text': plain, 'cards': cards, 'excerpt': omitted}
     if kind == 'brief' and edition is not None:
@@ -303,7 +304,7 @@ def _content_top(top, height, canvas_height=HEIGHT):
     return top
 
 
-def _render_pages(deck, *, measure_only=False):
+def _render_pages(deck, *, measure_only=False, visible_lines=None):
     """One layout path for fit checks and PNG delivery; never shrink text to fit."""
     from PIL import Image, ImageDraw, ImageFont
     canvas_height = deck.get('canvas_height', HEIGHT)
@@ -396,6 +397,8 @@ def _render_pages(deck, *, measure_only=False):
                              location_lines, padding, label))
             y = _content_top(y, sum(row[2] for row in rows), canvas_height)
             for time, lines, height, location_lines, padding, label in rows:
+                if visible_lines is not None:
+                    visible_lines.append(' '.join(filter(None, (label, time, *lines, *location_lines))))
                 y += padding
                 height -= padding
                 if label:
@@ -414,6 +417,8 @@ def _render_pages(deck, *, measure_only=False):
 
         else:
             blocks = [_display_text(block, deck['kind']) for block in blocks]
+            if visible_lines is not None:
+                visible_lines.extend(blocks)
             emphasis = [max(_emphasis_end(block, deck['kind']), source.get('emphasis_end', 0))
                         for block, source in zip(blocks, card['blocks'])]
             bullets = [deck['kind'] == 'prep' and len(blocks) > 1 and not end for end in emphasis]
@@ -577,7 +582,7 @@ def fits(deck, *, allow_tall=True):
         return False
 
 
-def render(deck, destination, *, retained_source_revision=None, candidate_route_digest=None):
+def render(deck, destination, *, retained_source_revision=None, candidate_route_digest=None, visible_lines=None):
     """Write bounded PNGs plus an immutable manifest; private files, no network or HTML execution."""
     deck = _packed(deck)
     retained = retained_source_revision is not None and candidate_route_digest is not None
@@ -589,7 +594,7 @@ def render(deck, destination, *, retained_source_revision=None, candidate_route_
     destination.mkdir(parents=True, exist_ok=not retained, mode=0o700)
     pages = []
     image_hashes = []
-    for index, image in enumerate(_render_pages(deck), 1):
+    for index, image in enumerate(_render_pages(deck, visible_lines=visible_lines), 1):
         path = destination / f'{index:02d}.png'
         fd, name = tempfile.mkstemp(dir=destination, suffix='.tmp')
         tmp = Path(name)

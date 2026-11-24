@@ -87,8 +87,8 @@ def test_dispatch_identity_and_attempt_are_forwarded_without_fallback(monkeypatc
             calls.append(('send', args, kwargs))
             return True, '', {'acceptance': 'accepted', 'message_id': 'provider'}
 
-        def send_gallery_bytes(self, *args):
-            calls.append(('gallery', args))
+        def send_gallery_bytes(self, *args, **kwargs):
+            calls.append(('gallery', args, kwargs))
             return True, '', {'acceptance': 'accepted', 'message_id': 'parent'}
 
         def receipt(self, dispatch_id):
@@ -98,13 +98,13 @@ def test_dispatch_identity_and_attempt_are_forwarded_without_fallback(monkeypatc
     monkeypatch.setattr(api, '_client', lambda timeout=60: FakeClient())
     assert api.send_receipt('body', 'owner')[2]['acceptance'] == 'not_attempted'
     assert not calls
-    assert api.send_receipt('body', 'owner', 30, 'stable-id', 3)[0]
-    assert api.send_gallery({'images': paths, 'summary': 'summary'}, 'owner', 'gallery-id')[0]
+    assert api.send_receipt('body', 'owner', 30, 'stable-id', 3, valid_until_ms=123456)[0]
+    assert api.send_gallery({'images': paths, 'summary': 'summary'}, 'owner', 'gallery-id', valid_until_ms=123456)[0]
     assert api.gallery_receipt('gallery-id') == {'acceptance': 'unknown'}
     assert calls == [
-        ('send', ('body', 'owner', 'stable-id'), {'attempt': 3}),
+        ('send', ('body', 'owner', 'stable-id'), {'attempt': 3, 'valid_until_ms': 123456}),
         ('gallery', ([{'name': f'{index:02d}.png', 'bytes': b'\x89PNG\r\n\x1a\nfixture'}
-                     for index in range(1, 5)], 'summary', 'owner', 'gallery-id')),
+                     for index in range(1, 5)], 'summary', 'owner', 'gallery-id'), {'valid_until_ms': 123456}),
         ('receipt', 'gallery-id'),
     ]
 
@@ -391,14 +391,15 @@ def test_archive_sessions_uses_runtime_rotation_count_and_fail_closed(monkeypatc
     calls = []
     class Client:
         def __init__(self, response): self.response = response
-        def sessions(self, action): calls.append(action); return self.response
+        def sessions(self, action, *, before): calls.append((action, before)); return self.response
     monkeypatch.setattr(api, '_client', lambda timeout=30: Client({'count': 3}))
-    assert api.archive_sessions() == 3 and calls == ['rotate']
+    cutoff = '2026-09-02T03:30:00Z'
+    assert api.archive_sessions(cutoff) == 3 and calls == [('rotate', cutoff)]
     for invalid in ({'count': True}, {'count': -1}, {'rotated': True}, None):
         monkeypatch.setattr(api, '_client', lambda timeout=30: Client(invalid))
-        assert api.archive_sessions() is None
+        assert api.archive_sessions(cutoff) is None
     monkeypatch.setattr(api, '_client', lambda timeout=30: (_ for _ in ()).throw(OSError('offline')))
-    assert api.archive_sessions() is None
+    assert api.archive_sessions(cutoff) is None
 
 
 def test_feedback_status_closed_projection_and_bounded_health(monkeypatch):

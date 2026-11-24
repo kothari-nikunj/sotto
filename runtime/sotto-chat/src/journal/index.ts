@@ -1,10 +1,10 @@
 import {resolveResearchSelection} from '../tools/research-selection.js';
 import {ownerCleanupProposalCurrent,freezeCleanupRepairSelection,markCleanupSelectionRepair} from './owner-task-selection.js';
-import {freezeQuotedBackground, acceptedBackgroundMessage} from '../background-context.js';
+import {freezeQuotedBackground, acceptedBackgroundMessage, deliveredTaskDispatch} from '../background-context.js';
 import {PREP_OFFER_MAX_AGE_MS} from '../channels/policy.js';
 import {ownerBridgeSendKind,bridgeSendArgsSchema,bridgeSendReceiptSchema,bridgeSendRejectionSchema,bridgeSendPreviewSchema,bridgeSendReceiptMatches,bridgeSendReviewText,validBridgeSendReview,bridgeSendPreviewMatches,type BridgeSendArgs,type BridgeSendReceipt,type BridgeSendRejection,type BridgeSendPreview} from '../tools/owner-bridge-send-contract.js';
 import type {OwnerBridgeSendRequest} from '../tools/owner-bridge-send-client.js';
-import {READ_CONTEXT_WINDOW_MS, readCancelled, ownerReadRequest, contextualReadRequest, subjectMention, validResearchSubject, ownerSubjectMention, researchTargetAnswer, explicitReadReference} from '../tools/read-admission.js';
+import {READ_CONTEXT_WINDOW_MS, readCancelled, ownerReadRequest, subjectMention, validResearchSubject, ownerSubjectMention, researchTargetAnswer, explicitReadReference} from '../tools/read-admission.js';
 import {ownerBriefIntent} from '../tools/requested-brief-classifier.js';
 import {OWNER_ONLY_CONTEXT_PROOF} from '../agent/source-authority.js';
 import { DELAYED_ACTION_KINDS } from '../delayed-outcome-policy.js';
@@ -20,7 +20,7 @@ import {ownerMeetingPrepOfferArgsSchema,ownerMeetingPrepOfferKind,ownerMeetingPr
 import type {OwnerMeetingPrepOfferRequest} from '../tools/owner-meeting-prep-offer-client.js';
 import type {Inbound} from '../channels/types.js';
 import { discoveryIdentity, discoveryRoute } from '../activation.js';
-import {ownerBriefRequestArgsSchema, ownerBriefRequestKind, ownerBriefRequestReceiptSchema, type OwnerBriefRequestArgs, type OwnerBriefRequest, type OwnerBriefRequestReceipt} from '../tools/owner-brief-request-client.js';
+import {ownerBriefRequestArgsSchema, ownerBriefRequestKind, ownerBriefRequestReceiptSchema, ownerBriefRequestRejectionSchema, type OwnerBriefRequestRejection, type OwnerBriefRequestArgs, type OwnerBriefRequest, type OwnerBriefRequestReceipt} from '../tools/owner-brief-request-client.js';
 import {gmailAcceptedDeliverySchema,type GmailAcceptedDelivery, ownerGmailDraftKind, followupEmailFromOwnerText, gmailDraftArgsSchema, gmailDraftReceiptSchema, gmailDraftRejectionSchema, gmailDraftPreviewSchema, gmailDraftReceiptMatches, gmailDraftReviewText, clearGmailSendYes, validGmailDraftReview, gmailDraftPreviewMatches, type GmailDraftArgs, type GmailDraftReceipt, type GmailDraftRejection, type GmailDraftPreview } from '../tools/owner-gmail-draft-contract.js';
 import type { OwnerGmailDraftRequest } from '../tools/owner-gmail-draft-client.js';
 import {ownerRoutineToolArgsSchema,ownerRoutineToolKind,ownerRoutineToolReceiptSchema,ownerRoutineToolRejectionSchema,routineReceiptMatches,routinePreviewSchema, routinePreviewMatches,routineProposalText,clearRoutineYes,
@@ -33,8 +33,8 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { isQuietUntil } from '../quiet-until.js';
 import { stableActionIdentity } from '../tools/action-gate.js';
-import { ownerReminderToolArgsSchema, ownerReminderToolKind, ownerReminderToolReceiptSchema, reminderReceiptMatches,
-  type OwnerReminderToolArgs, type OwnerReminderToolReceipt } from '../tools/owner-reminder-tool-contract.js';
+import { ownerReminderToolArgsSchema, ownerReminderToolKind, ownerReminderToolReceiptSchema, ownerReminderRejectionSchema, reminderReceiptMatches,
+  type OwnerReminderRejection, type OwnerReminderToolArgs, type OwnerReminderToolReceipt } from '../tools/owner-reminder-tool-contract.js';
 import { ownerTaskToolArgsSchema, ownerTaskToolKind, ownerTaskToolReceiptSchema, ownerTaskToolRejectionSchema, taskReceiptMatches,
   taskPreviewSchema,taskPreviewMatches,taskReviewText,cleanupSelectionsMatch,cleanupRequestMatches,cleanupSelectionItems,cleanupSelectionSchema,cleanupItemsSchema,cleanupListHash,OwnerTaskListUnavailable,resolveManyOwnerTextMatches,type TaskPreview,validRelationReview,type OwnerTaskToolArgs, type OwnerTaskToolReceipt, type OwnerTaskToolRejection } from '../tools/owner-task-tool-contract.js';
 import { ownerPreferenceToolArgsSchema, ownerPreferenceToolKind, ownerPreferenceToolReceiptSchema, ownerPreferenceToolRejectionSchema, preferenceReceiptMatches,priorityCtaMatches,oneOffToneRequest,oneOffShorteningRequest,ownerQuietCommand,
@@ -51,7 +51,7 @@ export type DurableActivationAdmission = { status: 'absent' } | {
 };
 
 export type DispatchKind = 'interactive' | 'gallery' | 'scheduled_text';
-export type DispatchOutcome = 'accepted' | 'rejected' | 'unknown';
+export type DispatchOutcome = 'accepted' | 'rejected' | 'unknown' | 'not_attempted';
 export type ActionOutcome = 'succeeded' | 'rejected' | 'unknown';
 
 export interface InboundInput {
@@ -65,13 +65,15 @@ export interface InboundInput {
   payload: string;
   /** Trusted gateway candidate; bound atomically with the first admitted owner event. */
   activation?: ActivationIdentity;
+  ingress?: {gatewayCallbackAtMs: number; providerSentAtMs?: number};
   continuation?: {routeDigest: string; providerSentAtMs: number};
 }
 
 export interface RunInput { runId: string; eventId: string }
 export interface ReplyInput {
+  replacesUnsent?: string;
   /** Trusted coordinator metadata; never derived from model output. */
-  purpose?: 'outcome_pending' | 'acknowledgement_unavailable' | 'owner_control' | 'model_failure';
+  purpose?: 'outcome_pending' | 'acknowledgement_unavailable' | 'owner_control' | 'model_failure' | 'source_withheld' | 'reply_unconfirmed';
   replyId: string;
   runId: string;
   eventId: string;
@@ -163,6 +165,9 @@ const PROPOSAL_KINDS_SQL = [ownerRoutineToolKind, ownerGmailDraftKind, ownerCale
 const OWNER_TOOL_KINDS_SQL = ['owner_reminder_tool', 'owner_loop_tool', 'owner_preference_tool', 'owner_routine_tool',
   'owner_gmail_draft_tool', 'owner_calendar_tool', 'owner_contacts_tool','owner_bridge_send_tool', 'owner_brief_request', 'owner_meeting_prep_request','owner_meeting_prep_offer',
   'owner_offer_reply', 'owner_skill_request', 'owner_web_read'].map(kind => `'${kind}'`).join(',');
+/** External or owner-data writes: once executing, only /stop may abandon one (owner URL reads stay cancellable). */
+const PROTECTED_WRITE_KINDS_SQL = [ownerReminderToolKind, ownerTaskToolKind, ownerPreferenceToolKind, ownerRoutineToolKind,
+  ownerGmailDraftKind, ownerCalendarKind, ownerContactsKind, ownerBridgeSendKind].map(kind => `'${kind}'`).join(',');
 const PROPOSAL_OPERATIONS = ['propose','propose_adjust','propose_offer','propose_followup','propose_send','propose_new_send','propose_pair','propose_typed','propose_send_typed','propose_move','propose_move_update','propose_rsvp','propose_create','propose_update','propose_delete','propose-procedure','propose-priorities','propose-context','propose_relation','propose_identifier','propose_fact','propose_cleanup','propose_docsend'];
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 export const SCHEDULED_TEXT_MAX_ATTEMPTS = 96;
@@ -203,6 +208,7 @@ function required(value: string, name: string): void {
 export class OperationalJournal {
   readonly db: DatabaseSync;
   private activationIdentity: ActivationIdentity | undefined;
+  private readonly settleWaiters = new Map<string, () => void>();
 
   constructor(path: string) {
     required(path, 'database path');
@@ -287,11 +293,14 @@ export class OperationalJournal {
     if (!this.db.prepare('PRAGMA table_info(dispatches)').all().some(column => column.name === 'route_digest')) {
       this.db.exec('ALTER TABLE dispatches ADD COLUMN route_digest TEXT');
     }
-    if (!this.db.prepare('PRAGMA table_info(inbound_events)').all().some(column => column.name === 'continuation_json'))
+    const inboundColumns = new Set(this.db.prepare('PRAGMA table_info(inbound_events)').all().map(column => column.name));
+    if (!inboundColumns.has('provider_occurred_at_ms')) this.db.exec('ALTER TABLE inbound_events ADD COLUMN provider_occurred_at_ms INTEGER');
+    if (!inboundColumns.has('gateway_callback_at_ms')) this.db.exec('ALTER TABLE inbound_events ADD COLUMN gateway_callback_at_ms INTEGER');
+    if (!inboundColumns.has('continuation_json'))
       this.db.exec('ALTER TABLE inbound_events ADD COLUMN continuation_json TEXT');
     // Additive schema-7 bookkeeping: cancellation and this marker commit together,
     // so replay never selects a different request after the original target closes.
-    if (!this.db.prepare('PRAGMA table_info(inbound_events)').all().some(column => column.name === 'stop_applied'))
+    if (!inboundColumns.has('stop_applied'))
       this.db.exec('ALTER TABLE inbound_events ADD COLUMN stop_applied INTEGER CHECK(stop_applied=1)');
     if (!this.db.prepare('PRAGMA table_info(dispatches)').all().some(column => column.name === 'provider_sent_at_ms'))
       this.db.exec('ALTER TABLE dispatches ADD COLUMN provider_sent_at_ms INTEGER');
@@ -332,6 +341,7 @@ export class OperationalJournal {
     try {
       const result = body();
       this.db.exec('COMMIT');
+      if (this.settleWaiters.size) this.releaseSettledWrites();
       return result;
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -554,15 +564,17 @@ export class OperationalJournal {
           this.db.prepare('UPDATE actions SET result_json=? WHERE id=?').run(JSON.stringify({
             ...metadata,
             next_event_id: id,
-            next_event_accepted: proposalReply?.dispatch_status === 'accepted',
+            // A review is confirmable only while it is the latest text Sotto sent on that route.
+            next_event_accepted: proposalReply?.dispatch_status === 'accepted' && !this.sentAfter(String(proposalReply.dispatch_id)),
           }), proposalAction.id as string);
         }
         freezeCleanupRepairSelection(this,proposalAction,id);
         checked.run(proposalAction.id as string);
       }
       const continuation = this.freezeContinuation(input, scopedThreadKey);
-      this.db.prepare('INSERT INTO inbound_events(id,source_id,account_key,line_key,thread_key,channel,sender,payload_hash,payload,received_at,continuation_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-        .run(id, input.eventId, input.accountKey, input.lineKey, scopedThreadKey, input.channel, input.sender, payloadHash, input.payload, now(), continuation);
+      this.db.prepare('INSERT INTO inbound_events(id,source_id,account_key,line_key,thread_key,channel,sender,payload_hash,payload,received_at,continuation_json,provider_occurred_at_ms,gateway_callback_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(id, input.eventId, input.accountKey, input.lineKey, scopedThreadKey, input.channel, input.sender, payloadHash, input.payload, now(), continuation,
+          input.ingress?.providerSentAtMs ?? null, input.ingress?.gatewayCallbackAtMs ?? null);
       if (identity && input.channel === 'photon' && input.accountKey === identity.account_id &&
           input.lineKey === identity.line_key && input.threadKey === identity.provider_thread_id &&
           input.sender === identity.owner_id) {
@@ -595,27 +607,21 @@ export class OperationalJournal {
     const inbound = JSON.parse(input.payload).inbound as Inbound;
     if (inbound.replyBound) return freezeQuotedBackground(this, inbound, routeDigest, providerSentAtMs);
     const sameRoute = "(d.route_digest=? OR d.id IN (SELECT p.dispatch_id FROM prepared_replies p JOIN runs r ON r.id=p.run_id WHERE r.thread_key=?))";
-    const rows = this.db.prepare(`SELECT d.id,d.updated_at,d.route_digest,d.provider_message_ids,d.provider_message_id,d.provider_sent_at_ms,d.current_attempt FROM dispatches d WHERE ${sameRoute} AND d.status='accepted' ORDER BY d.updated_at DESC,d.id DESC LIMIT 2`).all(routeDigest, threadKey) as Row[];
+    const rows = this.db.prepare(`SELECT d.id,d.kind,d.updated_at,d.route_digest,d.provider_message_ids,d.provider_message_id,d.provider_sent_at_ms,d.current_attempt FROM dispatches d WHERE ${sameRoute} AND d.status='accepted' ORDER BY d.updated_at DESC,d.id DESC LIMIT 2`).all(routeDigest, threadKey) as Row[];
     const latest = rows[0];
     if (!latest || rows[1]?.updated_at === latest.updated_at) return ineligible;
     const ids = JSON.parse(String(latest.provider_message_ids ?? '[]'));
     if (latest.route_digest !== routeDigest || ids.length !== 1 || ids[0] !== latest.provider_message_id || !Number.isSafeInteger(latest.provider_sent_at_ms)
         || Number(latest.provider_sent_at_ms) >= providerSentAtMs || this.hasUnresolvedDispatchAttempt(String(latest.id))) return ineligible;
-    // Local ordering is only a barrier, never compared to the provider clock.
-    if (this.one('SELECT id FROM inbound_events WHERE thread_key=? AND received_at>=? LIMIT 1', threadKey, Number(latest.updated_at))
-        || this.one(`SELECT d.id FROM dispatches d WHERE ${sameRoute} AND d.id<>? AND (d.status IN ('prepared','dispatching','unknown') OR d.created_at>=?) LIMIT 1`, routeDigest, threadKey, String(latest.id), Number(latest.updated_at))) return ineligible;
     const contact = this.one("SELECT started_at,finished_at FROM dispatch_attempts WHERE dispatch_id=? AND number=? AND status='accepted'", String(latest.id), Number(latest.current_attempt));
-    if (!contact || contact.finished_at === null || this.one(`SELECT a.dispatch_id FROM dispatch_attempts a JOIN dispatches d ON d.id=a.dispatch_id WHERE ${sameRoute} AND d.id<>? AND a.started_at<=? AND (a.finished_at IS NULL OR a.finished_at>=?) LIMIT 1`,
+    // An owner turn during an unsettled send also breaks continuation.
+    if (!contact || contact.finished_at === null || this.one('SELECT id FROM inbound_events WHERE thread_key=? AND received_at>=? LIMIT 1', threadKey, Number(contact.started_at))
+        || this.one(`SELECT d.id FROM dispatches d WHERE ${sameRoute} AND d.id<>? AND (d.status IN ('prepared','dispatching','unknown') OR d.created_at>=?) LIMIT 1`, routeDigest, threadKey, String(latest.id), Number(latest.updated_at))) return ineligible;
+    if (this.one(`SELECT a.dispatch_id FROM dispatch_attempts a JOIN dispatches d ON d.id=a.dispatch_id WHERE ${sameRoute} AND d.id<>? AND a.started_at<=? AND (a.finished_at IS NULL OR a.finished_at>=?) LIMIT 1`,
         routeDigest, threadKey, String(latest.id), Number(contact.finished_at), Number(contact.started_at))) return ineligible;
-    return JSON.stringify({version: 1, eligible: true, dispatch_id: latest.id,
+    return JSON.stringify({version: latest.kind === 'gallery' ? 2 : 1, eligible: true, dispatch_id: latest.id,
       provider_message_id: ids[0], route_digest: routeDigest,
       inbound_provider_sent_at_ms: providerSentAtMs, provider_sent_at_ms: latest.provider_sent_at_ms});
-  }
-
-  /** Avoid a provider read for ordinary chat or a pending local proposal. */
-  hasPrepContinuationCandidate(eventId: string, routeDigest: string,
-      offerAuthority?:Omit<ExplicitOwnerLoopAuthority,'runId'>): boolean {
-    return this.prepContinuationCandidate(eventId, routeDigest,offerAuthority) !== null;
   }
 
   /** Native candidate time narrows the single provider window; it grants no authority. */
@@ -629,7 +635,7 @@ export class OperationalJournal {
       routeDigest, String(event.thread_key));
     if (!row || row.route_digest !== routeDigest || Number(event.received_at) - Number(row.updated_at) >= PREP_OFFER_MAX_AGE_MS)
       return null;
-    if(row.kind==='scheduled_text')return Number.isSafeInteger(row.provider_sent_at_ms)&&Number(row.provider_sent_at_ms)>0
+    if(row.kind==='scheduled_text'||row.kind==='gallery')return Number.isSafeInteger(row.provider_sent_at_ms)&&Number(row.provider_sent_at_ms)>0
       ? {providerSentAtMs:Number(row.provider_sent_at_ms)} : {};
     if(row.kind!=='interactive'||!offerAuthority||!Number.isSafeInteger(row.provider_sent_at_ms)||Number(row.provider_sent_at_ms)<1)return null;
     const thread=String(event.thread_key);
@@ -686,8 +692,8 @@ export class OperationalJournal {
         if(!ownerOffer)return;
         const candidate=this.prepContinuationCandidate(eventId,routeDigest,ownerOffer.authority);
         if(candidate?.ownerMeetingPrepOfferActionId!==ownerOffer.actionId||candidate.providerSentAtMs!==proof.sentAtMs)return;
-      }else if(ownerOffer||dispatch.kind!=='scheduled_text')return;
-      this.db.prepare('UPDATE inbound_events SET continuation_json=? WHERE id=?').run(JSON.stringify({version: 1,
+      }else if(ownerOffer||!['scheduled_text','gallery'].includes(String(dispatch.kind)))return;
+      this.db.prepare('UPDATE inbound_events SET continuation_json=? WHERE id=?').run(JSON.stringify({version: dispatch.kind === 'gallery' ? 2 : 1,
         eligible: true, dispatch_id: dispatch.id, provider_message_id: proof.messageId, route_digest: routeDigest,
         inbound_provider_sent_at_ms: inboundAtMs, provider_sent_at_ms: proof.sentAtMs}), eventId);
     });
@@ -715,8 +721,8 @@ export class OperationalJournal {
   }
 
   /** Original accepted output for the existing native history projection; never provider-returned prose. */
-  acceptedBackgroundMessage(eventId: string, sessionStartedAt: number): {dispatchId:string;providerMessageId:string;text:string;sourceRevision:string;acceptedAt:number;routeDigest:string}|undefined {
-    return acceptedBackgroundMessage(this, eventId, sessionStartedAt);
+  acceptedBackgroundMessage(eventId: string, sessionStartedAt: number, maxAgeMs?: number): {dispatchId:string;providerMessageId:string;text:string;sourceRevision:string;acceptedAt:number;routeDigest:string}|undefined {
+    return acceptedBackgroundMessage(this, eventId, sessionStartedAt, maxAgeMs);
   }
 
   getInbound(eventId: string): Row | undefined { return this.one('SELECT * FROM inbound_events WHERE id=?', eventId); }
@@ -753,6 +759,21 @@ export class OperationalJournal {
       this.one('SELECT generation FROM thread_generations WHERE thread_key=?', run.thread_key as string)?.generation === run.generation;
   }
 
+  /** Cancel a run for newer owner input. Its turn aborts now, or (unless `now`, i.e. /stop) right
+   * after an executing protected write settles, so the write finishes but nothing else in the turn runs. */
+  cancelAfterWrite(runId: string, abort: () => void, now = false): void {
+    if (!now && this.one(`SELECT id FROM actions WHERE run_id=? AND status='executing' AND kind IN (${PROTECTED_WRITE_KINDS_SQL}) LIMIT 1`, runId)) {
+      this.cancelRun(runId);
+      this.settleWaiters.set(runId, abort);
+      return;
+    }
+    abort();
+    this.cancelRun(runId);
+  }
+  private releaseSettledWrites(): void {
+    for (const [runId, abort] of this.settleWaiters)
+      if (!this.one("SELECT id FROM actions WHERE run_id=? AND status='executing' LIMIT 1", runId)) { this.settleWaiters.delete(runId); abort(); }
+  }
   isRunCurrent(runId: string): boolean {
     const run = this.getRun(runId);
     return !!run && run.status === 'running' && this.isRunGenerationCurrent(runId);
@@ -855,7 +876,7 @@ export class OperationalJournal {
   prepareReply(input: ReplyInput): Row {
     for (const key of ['replyId', 'runId', 'eventId', 'dispatchId', 'destination', 'payload'] as const) required(input[key], key);
     if (!['interactive', 'gallery', 'scheduled_text'].includes(input.kind)) throw new Error('invalid dispatch kind');
-    if (input.purpose !== undefined && !['outcome_pending', 'acknowledgement_unavailable', 'owner_control', 'model_failure'].includes(input.purpose)) throw new Error('invalid reply purpose');
+    if (input.purpose !== undefined && !['outcome_pending', 'acknowledgement_unavailable', 'owner_control', 'model_failure', 'source_withheld', 'reply_unconfirmed'].includes(input.purpose)) throw new Error('invalid reply purpose');
     if (input.sourceRevision !== undefined && !/^[A-Za-z0-9_-]{1,160}$/.test(input.sourceRevision)) throw new Error('invalid source revision');
     return this.transaction(() => {
       if (!this.isRunCurrent(input.runId) || this.getRun(input.runId)?.event_id !== input.eventId) throw new Error('run is stale');
@@ -867,6 +888,20 @@ export class OperationalJournal {
       const existing = this.getPreparedReply(input.replyId);
       if (existing) throw new Error('reply id already used');
       if (this.getDispatch(input.dispatchId)) throw new Error('dispatch id already used');
+      if (input.replacesUnsent || input.purpose === 'source_withheld') {
+        // Cancel and bind its replacement atomically, before any provider contact, on the original route.
+        const retired = input.replacesUnsent && input.kind === 'interactive' && input.purpose === 'source_withheld' && input.sourceRevision === OWNER_ONLY_CONTEXT_PROOF
+          && input.routeDigest && this.db.prepare(`UPDATE dispatches SET status='cancelled',updated_at=? WHERE id=?
+            AND status='prepared' AND current_attempt=0 AND kind='interactive' AND destination=? AND route_digest=?
+            AND NOT EXISTS (SELECT 1 FROM dispatch_attempts WHERE dispatch_id=dispatches.id)
+            AND EXISTS (SELECT 1 FROM prepared_replies p WHERE p.dispatch_id=dispatches.id AND p.purpose IS NULL
+              AND p.run_id=? AND p.event_id=? AND p.covered_event_ids=?)
+            AND NOT EXISTS (SELECT 1 FROM actions a JOIN runs r ON r.id=a.run_id WHERE a.status NOT IN ('succeeded','rejected') AND (a.run_id=?
+              OR a.source_event_id IN (SELECT value FROM json_each(?)) OR r.event_id IN (SELECT value FROM json_each(?))))`)
+            .run(now(),input.replacesUnsent,input.destination,input.routeDigest,input.runId,input.eventId,JSON.stringify(covered),
+              input.runId,JSON.stringify(covered),JSON.stringify(covered)).changes;
+        if (!retired) throw new Error('Prepared answer cannot be retired');
+      }
       const timestamp = now();
       this.insertDispatch({...input, sourceRevision: undefined});
       this.db.prepare('INSERT INTO prepared_replies(id,event_id,run_id,dispatch_id,payload,covered_event_ids,prepared_at,source_revision,purpose) VALUES(?,?,?,?,?,?,?,?,?)')
@@ -976,7 +1011,7 @@ export class OperationalJournal {
 
   readOwnerReminderToolAction(actionId: string, authority: Omit<ExplicitOwnerLoopAuthority, 'runId'>): {
     request: OwnerReminderToolRequest; status: string; receipt: OwnerReminderToolReceipt | null;
-    rejection: 'event_conflict' | 'due_unavailable' | 'target_unavailable' | 'target_not_owner' | 'owner_span_unavailable' | 'target_changed' | 'source_unavailable' | null;
+    rejection: OwnerReminderRejection | null;
   } {
     const action = this.getAction(actionId);
     if (!action || action.kind !== ownerReminderToolKind || typeof action.source_event_id !== 'string')
@@ -996,21 +1031,19 @@ export class OperationalJournal {
         receipt.payload_hash !== admission.payloadHash || receipt.args_hash !== binding.payloadHash ||
         !reminderReceiptMatches(args, receipt)))
       throw new Error('Owner reminder receipt is invalid');
-    const rejection = action.status === 'rejected' ? metadata.rejection : null;
-    if (rejection !== null && rejection !== 'event_conflict' && !['due_unavailable', 'target_unavailable', 'target_not_owner', 'owner_span_unavailable', 'target_changed', 'source_unavailable'].includes(rejection as string))
-      throw new Error('Owner reminder rejection is invalid');
-    return {request: {...admission, actionId, args}, status: action.status as string, receipt,
-      rejection: rejection as 'event_conflict' | 'due_unavailable' | 'target_unavailable' | 'target_not_owner' | 'owner_span_unavailable' | 'target_changed' | 'source_unavailable' | null};
+    const rejection = ownerReminderRejectionSchema.nullable().safeParse(action.status === 'rejected' ? metadata.rejection : null);
+    if (!rejection.success) throw new Error('Owner reminder rejection is invalid');
+    return {request: {...admission, actionId, args}, status: action.status as string, receipt, rejection: rejection.data};
   }
 
   settleOwnerReminderToolAction(actionId: string, authority: Omit<ExplicitOwnerLoopAuthority, 'runId'>,
-                               result: OwnerReminderToolReceipt | 'event_conflict' | 'due_unavailable' | 'target_unavailable' | 'target_not_owner' | 'owner_span_unavailable' | 'target_changed' | 'source_unavailable', reconciled = false): void {
+                               result: OwnerReminderToolReceipt | OwnerReminderRejection, reconciled = false): void {
     this.transaction(() => {
       const saved = this.readOwnerReminderToolAction(actionId, authority);
       if (saved.status !== (reconciled ? 'unknown' : 'executing')) throw new Error('Owner reminder action is not eligible');
       const metadata = {args: saved.request.args, scope_hash: authority.scopeHash};
       if (typeof result === 'string') {
-        if (reconciled || !['event_conflict', 'due_unavailable', 'target_unavailable', 'target_not_owner', 'owner_span_unavailable', 'target_changed', 'source_unavailable'].includes(result)) throw new Error('Owner reminder rejection is invalid');
+        if (reconciled || !ownerReminderRejectionSchema.safeParse(result).success) throw new Error('Owner reminder rejection is invalid');
         this.db.prepare("UPDATE actions SET status='rejected',result_json=?,updated_at=? WHERE id=?")
           .run(JSON.stringify({...metadata, rejection: result}), now(), actionId);
       } else {
@@ -1068,7 +1101,7 @@ export class OperationalJournal {
 
   readOwnerBriefRequestAction(actionId: string, authority: Omit<ExplicitOwnerLoopAuthority, 'runId'>): {
     request: OwnerBriefRequest; status: string; receipt: OwnerBriefRequestReceipt | null;
-    rejection: string | null;
+    rejection: OwnerBriefRequestRejection | null;
   } {
     const action = this.getAction(actionId);
     if (!action || action.kind !== ownerBriefRequestKind || typeof action.source_event_id !== 'string')
@@ -1090,20 +1123,19 @@ export class OperationalJournal {
         receipt.payload_hash !== admission.payloadHash || receipt.args_hash !== binding.payloadHash ||
          receipt.outcome.refresh !== args.refresh || (args.kind !== 'auto' && receipt.outcome.kind !== args.kind)))
       throw new Error('Requested brief receipt is invalid');
-    const rejection = action.status === 'rejected' ? String(metadata.rejection) : null;
-    if (rejection !== null && !['event_conflict','pending_delivery','needs_context','unavailable'].includes(rejection))
-      throw new Error('Requested brief rejection is invalid');
-    return {request: {...admission, actionId, args}, status: action.status as string, receipt, rejection};
+    const rejection = ownerBriefRequestRejectionSchema.nullable().safeParse(action.status === 'rejected' ? String(metadata.rejection) : null);
+    if (!rejection.success) throw new Error('Requested brief rejection is invalid');
+    return {request: {...admission, actionId, args}, status: action.status as string, receipt, rejection: rejection.data};
   }
 
   settleOwnerBriefRequestAction(actionId: string, authority: Omit<ExplicitOwnerLoopAuthority, 'runId'>,
-                               result: OwnerBriefRequestReceipt | string, reconciled = false): void {
+                               result: OwnerBriefRequestReceipt | OwnerBriefRequestRejection, reconciled = false): void {
     this.transaction(() => {
       const saved = this.readOwnerBriefRequestAction(actionId, authority);
       if (saved.status !== (reconciled ? 'unknown' : 'executing')) throw new Error('Requested brief action is not eligible');
       const metadata = {args: saved.request.args, scope_hash: authority.scopeHash};
       if (typeof result === 'string') {
-        if (reconciled || !['event_conflict','pending_delivery','needs_context','unavailable'].includes(result)) throw new Error('Requested brief rejection is invalid');
+        if (reconciled || !ownerBriefRequestRejectionSchema.safeParse(result).success) throw new Error('Requested brief rejection is invalid');
         this.db.prepare("UPDATE actions SET status='rejected',result_json=?,updated_at=? WHERE id=?")
           .run(JSON.stringify({...metadata, rejection: result}), now(), actionId);
       } else {
@@ -1492,6 +1524,10 @@ export class OperationalJournal {
         throw new Error('Owner message already has another private mutation');
       if(args.operation==='cleanup'){if(!cleanupRequestMatches(args,admitted.text)||JSON.stringify(args)!==JSON.stringify(this.selectOwnerCleanupProposal(authority,eventId,args.list.source_revision,args.selection?{selection:args.selection}:args.items)))throw new Error('Cleanup selection unavailable');}
       if(args.operation==='close'&&args.correction&&!resolveManyOwnerTextMatches([{name:args.correction,correction:args.correction}],admitted.text,'owner_tasks'))throw new Error('Exact single-task closure unavailable');
+      if(args.operation==='resolve_many'&&args.selection_mode==='delivered'){
+        const proof=deliveredTaskDispatch(this,eventId);
+        if(!proof||!args.delivery||Object.keys(args.delivery).length!==Object.keys(proof).length||Object.entries(proof).some(([k,v])=>args.delivery![k as keyof typeof proof]!==v))throw new Error('Delivered task reference unavailable');
+      }
       if(args.operation==='resolve_many'&&!resolveManyOwnerTextMatches(args.items,admitted.text,args.selection_mode))throw new Error('Exact multi-loop closure unavailable');
       if(args.operation==='propose_identifier'&&!admitted.text.includes(args.identifier))throw new Error('Identifier is not an exact owner span');
       if(args.operation==='add')for(const value of [args.contact,args.identifier])if(value!==undefined&&!admitted.text.includes(value))throw new Error('Task detail is not an exact owner span');
@@ -1839,7 +1875,7 @@ export class OperationalJournal {
       if (args.skill==='ask-research' && (!previous || previous.status==='pending') &&
           (!validResearchSubject(selector!,args.selection.mode) ||
            !(args.prior_request ? researchTargetAnswer(admitted.text,selector!,args.selection.mode) :
-             (args.prior_selection || args.prior_prep) ? contextualReadRequest(admitted.text) : ownerReadRequest(admitted.text)) ||
+             ownerReadRequest(admitted.text)) ||
            !args.prior_selection && !args.prior_request && !args.prior_prep && !ownerSubjectMention(admitted.text,selector!)))
         throw new Error('Research requires an affirmative owner request and exact owner span');
       // Meeting prep is a source read: the model resolves its subject from conversation.
@@ -1942,7 +1978,7 @@ export class OperationalJournal {
       return webReadReplyTargetSchema.parse({accepted_dispatch_id:quoted.acceptedDispatchId,provider_message_id:quoted.messageId,text:quoted.text,source_revision:quoted.sourceRevision});
     }
     for (const context of this.acceptedReadContexts(eventId, sourceRevision)) {
-      if (!contextualReadRequest(inbound.text) || !ownerUrlTokens(context.text).includes(url) ||
+      if (!ownerReadRequest(inbound.text) || !ownerUrlTokens(context.text).includes(url) ||
           new Set(ownerUrlTokens(context.text)).size!==1) continue;
       if (!explicitReadReference(inbound.text)) {
         const immediate=this.one('SELECT id FROM inbound_events WHERE thread_key=(SELECT thread_key FROM inbound_events WHERE id=?) AND rowid<(SELECT rowid FROM inbound_events WHERE id=?) ORDER BY rowid DESC LIMIT 1',eventId,eventId);
@@ -2408,7 +2444,7 @@ export class OperationalJournal {
   }
 
   listPendingGmailOfferedPairs(): Row[] {
-    return this.db.prepare("SELECT a.*,r.thread_key FROM actions a JOIN runs r ON r.id=a.run_id WHERE a.kind=? AND a.status='succeeded' AND json_extract(a.result_json,'$.args.operation')='propose_pair' AND json_extract(a.result_json,'$.preview.offer_receipt') IS NULL AND EXISTS (SELECT 1 FROM prepared_replies p JOIN dispatches d ON d.id=p.dispatch_id WHERE p.event_id=a.source_event_id AND d.status='accepted') ORDER BY a.created_at,a.id LIMIT 100").all(ownerGmailDraftKind) as Row[];
+    return this.db.prepare("SELECT a.*,r.thread_key FROM actions a JOIN runs r ON r.id=a.run_id WHERE a.kind=? AND a.status='succeeded' AND json_extract(a.result_json,'$.args.operation')='propose_pair' AND json_extract(a.result_json,'$.preview.offer_receipt') IS NULL AND EXISTS (SELECT 1 FROM prepared_replies p JOIN dispatches d ON d.id=p.dispatch_id WHERE p.event_id=a.source_event_id AND p.purpose IS NULL AND d.status='accepted') ORDER BY a.created_at,a.id LIMIT 100").all(ownerGmailDraftKind) as Row[];
   }
 
   acceptedGmailOfferedPair(actionId:string,authority:Omit<ExplicitOwnerLoopAuthority,'runId'>):{request:OwnerGmailDraftRequest;acceptedDelivery:GmailAcceptedDelivery}|null {
@@ -2477,7 +2513,7 @@ export class OperationalJournal {
         throw new Error('Draft review already consumed');
     }
     if ('kind' in saved.preview.review && (saved.preview.review.kind==='reply_send'||saved.preview.review.kind==='new_send')) return {operation:'send',review:saved.preview.review,proposal:{event_id:prior.id as string,action_id:action.id as string,args_hash:action.payload_hash as string,accepted_dispatch_id:reply.dispatch_id as string,source_revision:sourceRevision}};
-    return { operation: 'save', review: saved.preview.review, proposal: { event_id: prior.id as string, action_id: action.id as string, args_hash: action.payload_hash as string, accepted_dispatch_id: reply.dispatch_id as string, source_revision: sourceRevision, ...(saved.request.args.operation === 'propose_offer' ? {origin:{selection:saved.request.args.selection,offer_id:saved.preview.offer_id!}} : saved.request.args.operation === 'propose_followup' ? {origin:{kind:'followup' as const,offer_id:saved.request.args.offer_id,...(saved.request.args.to === undefined ? {} : {to:saved.request.args.to})}} : {}) } };
+    return { operation: 'save', review: saved.preview.review, proposal: { event_id: prior.id as string, action_id: action.id as string, args_hash: action.payload_hash as string, accepted_dispatch_id: reply.dispatch_id as string, source_revision: sourceRevision, ...(saved.request.args.operation === 'propose_offer' ? {origin:{selection:saved.request.args.selection,offer_id:saved.preview.offer_id!}} : saved.request.args.operation === 'propose_followup' ? {origin:{kind:'followup' as const,offer_id:saved.request.args.offer_id,...(saved.request.args.to === undefined ? {} : {to:saved.request.args.to}),...(saved.request.args.message_id ? {message_id:saved.request.args.message_id}: {})}} : {}) } };
   }
 
   prepareOwnerCalendarAction(authority: ExplicitOwnerLoopAuthority, eventId: string, input: CalendarArgs, sourceRevision?: string): OwnerCalendarRequest {
@@ -2890,6 +2926,12 @@ export class OperationalJournal {
     return ownerWebReadArgsSchema.parse({operation:'confirm_docsend',review:saved.preview.review,proposal:{event_id:prior.id as string,action_id:action.id as string,args_hash:action.payload_hash as string,accepted_dispatch_id:reply.dispatch_id as string,source_revision:sourceRevision}});
   }
 
+  /** Any accepted or possibly-delivered send to the same destination that began or changed after this dispatch was prepared. */
+  sentAfter(dispatchId: string): boolean {
+    const review = this.getDispatch(dispatchId);
+    return !review || this.one("SELECT id FROM dispatches WHERE destination=? AND id<>? AND status IN ('accepted','dispatching','unknown') AND (updated_at>=? OR created_at>=?) LIMIT 1",
+      String(review.destination), dispatchId, Number(review.created_at), Number(review.created_at)) !== undefined;
+  }
   getReplyForEvent(eventId: string): Row | undefined {
     return this.one("SELECT p.*,d.status AS dispatch_status FROM prepared_replies p JOIN dispatches d ON d.id=p.dispatch_id WHERE p.event_id=? ORDER BY p.prepared_at DESC,p.id DESC LIMIT 1", eventId);
   }
@@ -3016,7 +3058,8 @@ export class OperationalJournal {
   }
 
   settleDispatch(dispatchId: string, attemptNo: number, outcome: DispatchOutcome, messageId?: string, messageIds?: string[], providerSentAtMs?: number): Row {
-    if (!['accepted', 'rejected', 'unknown'].includes(outcome)) throw new Error('invalid dispatch outcome');
+    if (!['accepted', 'rejected', 'unknown','not_attempted'].includes(outcome)) throw new Error('invalid dispatch outcome');
+    const attemptOutcome = outcome === 'not_attempted' ? 'rejected' : outcome;
     if (outcome === 'accepted') required(messageId!, 'provider message id');
     if (messageIds !== undefined && (!Array.isArray(messageIds) || messageIds.some(id => typeof id !== 'string' || !id))) {
       throw new Error('invalid provider message ids');
@@ -3025,14 +3068,14 @@ export class OperationalJournal {
       const dispatch = this.getDispatch(dispatchId);
       const attempt = this.one('SELECT * FROM dispatch_attempts WHERE dispatch_id=? AND number=?', dispatchId, attemptNo);
       if (!dispatch || !attempt) throw new Error('dispatch attempt missing');
-      if (attempt.status === outcome && (outcome !== 'accepted' || attempt.provider_message_id === messageId)) return dispatch;
+      if (attempt.status === attemptOutcome && (outcome !== 'accepted' || attempt.provider_message_id === messageId)) return dispatch;
       if (attempt.status !== 'dispatching' && !(attempt.status === 'unknown' && outcome === 'accepted')) {
         throw new Error('dispatch attempt already settled');
       }
       if (dispatch.status === 'accepted' && outcome !== 'accepted') throw new Error('accepted dispatch cannot be changed');
       const timestamp = now();
       this.db.prepare('UPDATE dispatch_attempts SET status=?,provider_message_id=?,finished_at=? WHERE dispatch_id=? AND number=?')
-        .run(outcome, outcome === 'accepted' ? messageId! : null, timestamp, dispatchId, attemptNo);
+        .run(attemptOutcome, outcome === 'accepted' ? messageId! : null, timestamp, dispatchId, attemptNo);
       if (dispatch.status === 'accepted') return this.getDispatch(dispatchId)!;
       // Late proof for an old uncertain attempt may settle the whole operation after a text retry.
       if (outcome === 'accepted' || dispatch.current_attempt === attemptNo) {
@@ -3043,7 +3086,7 @@ export class OperationalJournal {
             .run(timestamp, dispatchId);
         }
         this.db.prepare('UPDATE dispatches SET status=?,provider_message_id=?,provider_message_ids=?,updated_at=? WHERE id=?')
-          .run(outcome, outcome === 'accepted' ? messageId! : null,
+          .run(outcome === 'not_attempted' ? 'cancelled' : outcome, outcome === 'accepted' ? messageId! : null,
             outcome === 'accepted' ? JSON.stringify(messageIds ?? [messageId!])
               : outcome === 'unknown' && messageIds?.length ? JSON.stringify(messageIds) : null, timestamp, dispatchId);
       }

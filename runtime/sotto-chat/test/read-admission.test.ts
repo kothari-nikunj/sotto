@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import test from 'node:test';
-import {ownerReadRequest, contextualReadRequest, subjectMention, validResearchSubject} from '../src/tools/read-admission.js';
+import {ownerReadRequest, subjectMention, validResearchSubject} from '../src/tools/read-admission.js';
 
 test('runtime and receiver share the read policy, including whole Unicode names and sentence punctuation',()=>{
  const vectors=[
@@ -37,9 +37,9 @@ test('runtime and receiver share the read policy, including whole Unicode names 
  assert.deepEqual(actual,vectors.map(v=>v[3]));
  const result=spawnSync(process.env.SOTTO_PYTHON??'python3',['-c',`import sys,json;sys.path.insert(0,sys.argv[1]);from runtime_read_admission import owner_read_request,subject_mention,valid_research_subject;print(json.dumps([owner_read_request(t) and subject_mention(t,s) and valid_research_subject(s,m) for t,s,m,_ in json.load(sys.stdin)]))`,fileURLToPath(new URL('../../trigger-receiver',import.meta.url))],{input:JSON.stringify(vectors),encoding:'utf8'});
  assert.equal(result.status,0,result.stderr);assert.deepEqual(JSON.parse(result.stdout),actual);
- assert.equal(contextualReadRequest('Any competitors to know?'),true);
- assert.equal(contextualReadRequest('yes'),false);
- assert.equal(contextualReadRequest('yes pls'),false);
- assert.equal(contextualReadRequest('check their website'),true);
- assert.equal(contextualReadRequest('ok thanks'),false);
+ assert.equal(ownerReadRequest('Any competitors to know?'),true);
+ assert.equal(ownerReadRequest('yes'),false);
+ assert.equal(ownerReadRequest('yes pls'),false);
+ assert.equal(ownerReadRequest('check their website'),true);
+ assert.equal(ownerReadRequest('ok thanks'),false);
 });

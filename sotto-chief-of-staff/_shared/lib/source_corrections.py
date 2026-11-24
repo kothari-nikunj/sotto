@@ -44,7 +44,7 @@ def validate(candidate):
     evidence = candidate['source_revision_evidence']
     if (not isinstance(evidence, dict) or set(evidence) != {'kind', 'marker', 'value'}
             or (evidence.get('kind'), evidence.get('marker')) not in {
-                ('edit', 'date_edited'), ('unsend', 'date_retracted')}
+                ('edit', 'date_edited'), ('unsend', 'date_retracted'), ('unsend', 'date_edited')}
             or not isinstance(evidence.get('value'), str)
             or not re.fullmatch(r'[1-9][0-9]{0,18}', evidence['value'])
             or int(evidence['value']) > 2**63 - 1):

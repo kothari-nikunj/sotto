@@ -329,12 +329,12 @@
     {
       "id": "model_deadline_no_action",
       "surface": "current_photon",
-      "claim": "A model deadline without an owner action produces one durable fixed reply when delivery is accepted.",
+      "claim": "A model deadline without an owner action produces one durable timeout notice when delivery is accepted.",
       "implementation": "present",
       "local_evidence": "contract_test",
       "test": {
         "file": "runtime/sotto-chat/test/conversation.test.ts",
-        "name": "own model deadline without an action gives one durable fixed reply"
+        "name": "own model deadline without an action gives one durable timeout reply"
       },
       "live_evidence": "not_recorded_here"
     },
@@ -598,7 +598,7 @@
       "local_evidence": "contract_test",
       "test": {
         "file": "sotto-chief-of-staff/tests/test_continuity_evidence.py",
-        "name": "test_rendered_connected_call_review_closes_only_named_callback"
+        "name": "test_native_call_closes_only_reviewed_callback"
       },
       "live_evidence": "not_recorded_here"
     },

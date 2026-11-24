@@ -4,11 +4,16 @@ import json
 import time
 
 import pytest
-from test_runtime_owner_meeting_prep_request import context as context, rec as rec, setup, call, request, route_proof  # noqa: PLC0414 — explicit pytest fixture re-exports
+from test_runtime_owner_meeting_prep_request import WHEN, context as context, rec as rec, setup, call, request, route_proof  # noqa: PLC0414 — explicit pytest fixture re-exports
 from test_request_feedback import _finish, _rows, _original, HERE
 
 # Re-export the imported fixtures for pytest's name-based injection.
 __all__ = ['context', 'rec']
+
+
+@pytest.fixture(autouse=True)
+def meeting_clock(monkeypatch):
+    monkeypatch.setattr(time, 'time', WHEN.timestamp)
 
 
 @pytest.mark.parametrize('terminal', ['failed', 'expired'])
@@ -20,7 +25,7 @@ def test_offered_prep_failure_is_content_free_once_across_restart(context, rec, 
     job = rec.WORK_QUEUE.get(rec.DATA, job_id)
     assert json.loads(job['feedback']) == {'label': job['payload']['label'],
         'owner': body['identity']['owner_id'], 'chat_id': 'iMessage;-;owner',
-        'target': 'photon', 'route_digest': 'b'*64}
+        'target': 'photon', 'route_digest': 'b'*64, 'prep_meeting_start': WHEN.timestamp() + 3600}
     rec._requested_brief_feedback()
     assert not _rows(rec)
     if terminal == 'expired':
@@ -40,10 +45,10 @@ def test_offered_prep_failure_is_content_free_once_across_restart(context, rec, 
     monkeypatch.setattr(rec, '_retained_proof_current', lambda _: False)
     assert rec._delivery_valid(payload)
     sent = []
-    monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send', lambda *args: sent.append(args) or
+    monkeypatch.setitem(rec.OUTBOX.HOOKS, 'send', lambda *args, valid_until_ms: sent.append(valid_until_ms) or
         (True, '', {'message_id': 'notice-ack'}))
     rec.OUTBOX.drain()
-    assert len(sent) == 1 and _rows(rec)[0]['status'] == 'delivered'
+    assert sent == [int((WHEN.timestamp() + 3600) * 1000)] and _rows(rec)[0]['status'] == 'delivered'
     spec = importlib.util.spec_from_file_location('restarted_offered_prep_receiver', HERE / 'receiver.py')
     restarted = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(restarted)

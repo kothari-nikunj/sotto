@@ -36,10 +36,11 @@ export const gmailSendProposalSchema = gmailDraftProposalSchema.extend({operatio
 const proposalProof = z.object({event_id:hex,action_id:hex,args_hash:hex,accepted_dispatch_id:z.string().min(1).max(160),source_revision:hex}).strict();
 export const gmailTypedProposalSchema = z.object({operation:z.enum(['propose_typed','propose_send_typed']),message_id:gmailDraftProposalSchema.shape.message_id,body:gmailDraftProposalSchema.shape.body,action_type:z.enum(['reply','decline']),baseline:proposalProof.optional()}).strict();
 const offerId = z.string().regex(/^(?:[a-f0-9]{32}|[a-f0-9]{64})$/);
+const briefMessageId = header(512).optional();
 export const gmailDraftOfferProposalSchema = z.object({operation:z.literal('propose_offer'), selection:ownerMeetingPrepArgsSchema}).strict();
 const replyOfferOrigin = z.object({selection:ownerMeetingPrepArgsSchema,offer_id:z.string().regex(/^(?:[a-f0-9]{32}|[a-f0-9]{64})$/)}).strict();
-const offerOrigin = z.union([replyOfferOrigin,z.object({kind:z.literal('followup'),offer_id:offerId,to:header(254).optional()}).strict()]);
-export const gmailDraftArgsSchema = z.union([gmailDraftPairProposalSchema,gmailDraftProposalSchema, gmailSendProposalSchema, gmailNewSendProposalSchema, gmailTypedProposalSchema, z.object({operation:z.literal('send'),review:z.union([sendReviewSchema,newSendReviewSchema]),proposal:proposalProof}).strict(), gmailDraftOfferProposalSchema, z.object({operation:z.literal('list_followup')}).strict(), z.object({operation:z.literal('propose_followup'),offer_id:offerId,to:header(254).optional()}).strict(), z.object({
+const offerOrigin = z.union([replyOfferOrigin,z.object({kind:z.literal('followup'),offer_id:offerId,to:header(254).optional(),message_id:briefMessageId}).strict()]);
+export const gmailDraftArgsSchema = z.union([gmailDraftPairProposalSchema,gmailDraftProposalSchema, gmailSendProposalSchema, gmailNewSendProposalSchema, gmailTypedProposalSchema, z.object({operation:z.literal('send'),review:z.union([sendReviewSchema,newSendReviewSchema]),proposal:proposalProof}).strict(), gmailDraftOfferProposalSchema, z.object({operation:z.literal('list_followup'),message_id:briefMessageId}).strict(), z.object({operation:z.literal('propose_followup'),offer_id:offerId,to:header(254).optional(),message_id:briefMessageId}).strict(), z.object({
   operation: z.literal('save'), review: draftReviewSchema,
   proposal: z.object({ event_id: hex, action_id: hex, args_hash: hex,
     accepted_dispatch_id: z.string().min(1).max(160), source_revision: hex, origin:offerOrigin.optional() }).strict(),

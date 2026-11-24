@@ -1,3 +1,4 @@
+import {clearRoutineYes} from './owner-routine-tool-contract.js';
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import type { OperationalJournal, ExplicitOwnerLoopAuthority } from '../journal/index.js';
@@ -5,7 +6,7 @@ import { readAuthority, SourceAuthorityChanged, type SourceAuthorityReader } fro
 import { ActionHeldError, stableActionIdentity } from './action-gate.js';
 import { calendarProposalSchema, calendarProposalInputSchema, calendarRsvpProposalSchema, calendarRsvpInputSchema, calendarCreateInputSchema, calendarMoveUpdateInputSchema,calendarMoveUpdateProposalSchema,calendarUpdateProposalSchema,calendarIdSchema,calendarReviewText, ownerCalendarKind, type CalendarArgs } from './owner-calendar-contract.js';
 import type { OwnerCalendarClient } from './owner-calendar-client.js';
-export function createOwnerCalendarTools(options: {
+export function createOwnerCalendarExecution(options: {
     client: OwnerCalendarClient;
     journal(): OperationalJournal | undefined;
     sourceAuthority: SourceAuthorityReader;
@@ -32,6 +33,8 @@ export function createOwnerCalendarTools(options: {
     const proposed=(preview:Parameters<typeof calendarReviewText>[0])=>({status:'proposed',review_text:calendarReviewText(preview),needs_owner_confirmation:true,instruction:'Finish this turn normally with review_text exactly. The runtime delivers the canonical review. Wait for a distinct later owner yes; do not apply now.'});
     const execute = async (args: CalendarArgs, ctx: Context) => {
         const { journal, authority, eventId } = trusted(ctx);
+        if (args.operation === 'create' && JSON.parse(journal.getInbound(eventId)!.payload as string).inbound.media?.length)
+            throw new Error('Confirm the Calendar invite in a separate text-only reply');
         await sourceCurrent(ctx);
         const revision = ctx.requestContext?.get('sourceRevision') as string;
         if (args.operation === 'propose_move' || args.operation === 'propose_rsvp' || args.operation === 'propose_create' || args.operation==='propose_update'||args.operation==='propose_move_update') {
@@ -79,7 +82,22 @@ export function createOwnerCalendarTools(options: {
         if(selected.operation!==operation)throw new Error('Accepted Calendar review unavailable');
         return execute(selected,ctx);
     };
-    return {
+    const confirmReviewedInvite = async (text: string, ctx: Context): Promise<boolean> => {
+        if (!clearRoutineYes(text)) return false;
+        const {journal, authority, eventId} = trusted(ctx);
+        const revision = ctx.requestContext?.get('sourceRevision');
+        if (typeof revision !== 'string') return false;
+        let selected: CalendarArgs;
+        try {
+            selected = journal.selectOwnerCalendarProposal(authority, eventId, revision);
+        } catch {
+            return false;
+        }
+        if (selected.operation !== 'create') return false;
+        await execute(selected, ctx);
+        return true;
+    };
+    const tools = {
         calendar_move_update_review:createTool({id:'calendar_move_update_review',description:'Review a combined explicit-offset time and selected title/location/agenda edit for one exact timed event on primary or an explicitly known calendar or recurring occurrence. Full before/after review and distinct later yes; no all-day or series move, guests or recurrence change.',inputSchema:calendarMoveUpdateInputSchema.omit({operation:true}),execute:async(input,ctx)=>execute(calendarMoveUpdateProposalSchema.parse({operation:'propose_move_update',...calendarMoveUpdateInputSchema.omit({operation:true}).parse(input)}),ctx)}),
         calendar_move_update_confirm:createTool({id:'calendar_move_update_confirm',description:'Apply only the exact accepted combined time/details review after a distinct owner yes. Empty input.',inputSchema:z.object({}).strict(),execute:async(input,ctx)=>confirm(input,ctx,'move_update')}),
         calendar_update_review:createTool({id:'calendar_update_review',description:'Review exact title, location or agenda edits on one Calendar event on primary or an explicitly known calendar, timed or all-day, single/occurrence or explicitly entire recurring series. Resolve with current calendar_list/get. Omitted fields unchanged; empty string clears selected field. Full old/new details before distinct yes; no time/guest/recurrence edits.',inputSchema:calendarUpdateProposalSchema.omit({operation:true}),execute:async(input,ctx)=>execute({operation:'propose_update',...calendarUpdateProposalSchema.omit({operation:true}).parse(input)},ctx)}),
@@ -91,8 +109,12 @@ export function createOwnerCalendarTools(options: {
         calendar_rsvp_review:createTool({id:'calendar_rsvp_review',description:'Review an exact Calendar invitation on primary or an explicitly known calendar response. Resolve event ID with actual Calendar list/get. Supports timed/all-day, occurrence and exact entire series; discover master ID from provider recurringEventId. Accepted, declined or tentative with optional own-attendee comment. Full review before distinct later yes.',inputSchema:calendarRsvpInputSchema.omit({operation:true}),execute:async(input,ctx)=>execute(calendarRsvpProposalSchema.parse({operation:'propose_rsvp',...input}),ctx)}),
         calendar_rsvp_confirm:createTool({id:'calendar_rsvp_confirm',description:'Apply only the exact accepted RSVP review after a distinct owner yes. Empty input; never invent approval or change the invitation/response.',inputSchema:z.object({}).strict(),execute:async(input,ctx)=>confirm(input,ctx,'rsvp')})
     };
+    return {tools, confirmReviewedInvite};
 }
-export const CALENDAR_EXECUTION_GUIDE = 'For original Schedule creation: use current calendar_list to check busy events, clarify exact guest addresses and unresolved venues, then calendar_create_review with the full event details. Stop after full review; distinct later yes permits only calendar_create_confirm with empty input. No conflict-free guarantee or automatic venue lookup. For existing events: calendar_list reads the configured calendar selection and reports per-calendar coverage; calendar_get accepts an explicitly known calendar_id within that selection. Treat owner_participates=false as shared-calendar context, not an owner commitment or busy time. Keep useful titles/times visible with that label, including timed events. Use plain language such as Other calendars; never print internal field names or boolean values in the reply. A missing participation flag does not prove attendance. Do not claim unselected, hidden or unavailable calendars were covered. Omit calendar_id for primary, supply the exact same non-primary ID to all review tools; do not infer or normalize it. Use current calendar_get/list to resolve one exact timed occurrence, retaining its exact known calendar_id when non-primary; calendar_move_review presents the complete trusted old/new time review. Stop after the review. Only a distinct subsequent clear yes permits calendar_move_confirm with empty input. Edits need a new review. For title, location or agenda edits use calendar_update_review with event_id and selected fields. Omitted fields remain unchanged, empty strings explicitly clear; resolve timed/all-day event or explicit entire-series master with original reads. Finish normally with review_text exactly, then distinct later yes permits only calendar_update_confirm. Original google-action calendar-update with only start/end dateTime objects uses the existing move review; after a distinct yes use empty calendar-move-confirm. When any details are supplied, use the combined review and calendar-move-update-confirm. For combined time and details use calendar_move_update_review with both explicit-offset start/end and nonempty selected fields on one timed single event or exact recurring occurrence. Finish normally with review_text exactly; distinct later yes permits only calendar_move_update_confirm. Never split mixed time/detail requests into separate effects. Original google-action calendar-rsvp supports exact --event-id, --response and optional known --calendar; calendar-rsvp-confirm is empty after distinct yes. Optional --comment is reviewed exactly as your own attendee comment; empty leaves it unchanged. For RSVP use calendar_rsvp_review and distinct later yes via calendar_rsvp_confirm. Resolve exact provider invitation; an occurrence recurringEventId can identify its master via calendar_get. Entire-series RSVP must be explicitly reviewed, never inferred from an occurrence. No series/all-day moves, attendee edits or conflict-free claim. Unknown outcomes remain held and are inspected, never retried.';
+export function createOwnerCalendarTools(options: Parameters<typeof createOwnerCalendarExecution>[0]) {
+    return createOwnerCalendarExecution(options).tools;
+}
+export const CALENDAR_EXECUTION_GUIDE = 'For original Schedule creation: use current calendar_list to check busy events, use the Schedule title rule, confirm exact guest addresses and clarify only a requested unresolved venue (omit an unspecified location), then calendar_create_review with the full event details. Stop after full review; distinct later yes permits only calendar_create_confirm with empty input. No conflict-free guarantee or automatic venue lookup. For existing events: calendar_list reads the configured calendar selection and reports per-calendar coverage; calendar_get accepts an explicitly known calendar_id within that selection. Treat owner_participates=false as shared-calendar context, not an owner commitment or busy time. Keep useful titles/times visible with that label, including timed events. Use plain language such as Other calendars; never print internal field names or boolean values in the reply. A missing participation flag does not prove attendance. Do not claim unselected, hidden or unavailable calendars were covered. Omit calendar_id for primary, supply the exact same non-primary ID to all review tools; do not infer or normalize it. Use current calendar_get/list to resolve one exact timed occurrence, retaining its exact known calendar_id when non-primary; calendar_move_review presents the complete trusted old/new time review. Stop after the review. Only a distinct subsequent clear yes permits calendar_move_confirm with empty input. Edits need a new review. For title, location or agenda edits use calendar_update_review with event_id and selected fields. Omitted fields remain unchanged, empty strings explicitly clear; resolve timed/all-day event or explicit entire-series master with original reads. Finish normally with review_text exactly, then distinct later yes permits only calendar_update_confirm. Original google-action calendar-update with only start/end dateTime objects uses the existing move review; after a distinct yes use empty calendar-move-confirm. When any details are supplied, use the combined review and calendar-move-update-confirm. For combined time and details use calendar_move_update_review with both explicit-offset start/end and nonempty selected fields on one timed single event or exact recurring occurrence. Finish normally with review_text exactly; distinct later yes permits only calendar_move_update_confirm. Never split mixed time/detail requests into separate effects. Original google-action calendar-rsvp supports exact --event-id, --response and optional known --calendar; calendar-rsvp-confirm is empty after distinct yes. Optional --comment is reviewed exactly as your own attendee comment; empty leaves it unchanged. For RSVP use calendar_rsvp_review and distinct later yes via calendar_rsvp_confirm. Resolve exact provider invitation; an occurrence recurringEventId can identify its master via calendar_get. Entire-series RSVP must be explicitly reviewed, never inferred from an occurrence. No series/all-day moves, attendee edits or conflict-free claim. Unknown outcomes remain held and are inspected, never retried.';
 
 export function createCalendarCommand(options:Parameters<typeof createOwnerCalendarTools>[0]) {
  const tools=createOwnerCalendarTools(options);

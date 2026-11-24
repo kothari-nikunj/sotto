@@ -35,6 +35,7 @@ owns the tokens.
 hostile-OAuth + no-MCP + no-key services by holding tokens in *their* cloud — which breaks the
 "nobody in the loop" principle. Use only if a must-have service fits no other lane, knowingly.
 
+
 ## Worked example: Granola (lane 2)
 
 1. Open your `/setup` wizard → **Connected services** → **Connect** next to *Granola (meeting
@@ -52,8 +53,7 @@ provider's error, so the first click is also the diagnosis.
 **Break-glass fallback (lane 1):** Granola's official REST API at
 `https://public-api.granola.ai/v1` (Bearer keys prefixed `grn_`, minted on Business/Enterprise
 plans). Set `GRANOLA_API_KEY` in your deploy's variables and the gather uses REST instead of the
-connector. There is also a legacy `GRANOLA_MCP_CMD` path for registering your own stdio MCP
-server — see [RAILWAY.md](RAILWAY.md).
+connector.
 
 ## Worked example: Exa + Parallel — web research (lane 1)
 
@@ -94,8 +94,8 @@ research reads as a day with no research — never as "nobody worth researching"
   there and the page stays read-only. It renders *whether* a key is set, never the key.
 - One registry, two kinds. `connectors.py` holds both: `SERVICES` (lane 2 — an OAuth server exists,
   so there is a Connect button) and `KEY_PROVIDERS` (lane 1 — no OAuth server exists, so there is a
-  variable). The receiver image cannot import the skills tree, so its copy of the ladder is
-  duplicated exactly once and guarded — `tests/test_docs_drift.py` fails the suite if the page's
+  variable). The receiver loads the ladder from `_shared/lib/research_providers.py`, the same list
+  `web_research.py` imports, and the pair is guarded — `tests/test_docs_drift.py` fails the suite if the page's
   providers or their precedence ever disagree with `web_research.py`, because a page that names a
   provider the ladder wouldn't use is worse than no page.
 
@@ -127,8 +127,6 @@ SERVICES = {
         "mcp_url": "https://mcp.granola.ai/mcp",
         "auth_fallback": "https://mcp-auth.granola.ai",
     },
-    # "linear": {"label": "Linear (issues)", "mcp_url": "https://mcp.linear.app/mcp",
-    #            "auth_fallback": "https://mcp.linear.app"},
 }
 ```
 
@@ -136,8 +134,6 @@ That's it — the `/setup` tile, the OAuth flow, token storage, and status all d
 entry. Then write the service's gather script (copy `gather_granola.py`) and wire it into the
 skills that need it. If a provider pins redirect hosts and rejects DCR, that service falls back
 to lane 1 (a key tile) — document it and move on.
-
-## What we'd connect next, and why
 
 ## X — person-centered connectivity (Phase 1)
 
@@ -179,6 +175,8 @@ Previously learned public-profile facts remain editable. A protected attendee is
 permission failure, not a broken token. A lookup rate limit leaves already-linked attendees usable;
 a timeline rate limit stops further timeline calls while preserving other available context.
 
+## What we'd connect next, and why
+
 Ranked by **what Sotto cannot see or do today**, not by what has a shiny MCP. Every row has to
 survive one question — *what would Sotto do differently tomorrow morning because this is
 connected?* If the answer is "show you more data", it is a rejection, not a roadmap item, and the
@@ -193,7 +191,7 @@ rejections are listed under the table with their reasons.
 | 5 | **Telegram** (3 — the Bridge, same lane as iMessage) | The second communication channel this user's world actually runs on | …see the founder who pinged you on Telegram on Sunday and never got an answer | Another Mac-resident store behind its own consent toggle, another identity to unify onto the same person. Desktop-app storage formats change without notice; iMessage's `attributedBody` lesson applies |
 | 6 | **Notion** (2 — remote MCP, OAuth) | Where commitments and docs live for many users | …put the task assigned to you in Notion into the same open-loops ledger as the promise you made over email | Notion is a swamp: unfenced, it floods the ledger. Needs a "which database" choice — a genuine user choice, so a genuine setting — plus a mapping from a Notion task to a ledger anchor |
 | 7 | **Fathom / Fireflies** (1 — key) | Meeting notes without a single-vendor dependency | …say "last time you met you promised the term sheet" for people who don't run Granola | Coverage, not new capability: each is another gather script and another notes shape. Worth building when a real user's notes live there, not before. Transcript access sits behind paid tiers on both |
-| 8 | **Linear** (2 — remote MCP; the registry entry is already written, commented out) | The work you owe, with due dates attached | …surface the issue you own that's due today and hasn't moved, next to the email chasing it | Nearly free — one line in `SERVICES` plus a gather. Pays off only for engineering-led users; a fund owner has no Linear, so ship it on request rather than on spec |
+| 8 | **Linear** (2 — remote MCP; one registry entry to add) | The work you owe, with due dates attached | …surface the issue you own that's due today and hasn't moved, next to the email chasing it | Nearly free — one line in `SERVICES` plus a gather. Pays off only for engineering-led users; a fund owner has no Linear, so ship it on request rather than on spec |
 | 9 | **Apple Notes / Reminders** (3 — the Bridge) | Your own written commitments, in the place you wrote them | …notice that your own note says "send Dana the memo" and that you haven't | Same Bridge consent mechanics as iMessage. Low signal-to-noise: notes are half grocery lists, so it needs a real extraction gate before anything reaches the ledger |
 | 10 | **Microsoft 365** (Outlook + Teams) (2/1) | Not a feature — an audience: everyone Sotto cannot serve at all today | …exist for a user whose mail and calendar aren't Google's | A second full gather path and a second OAuth verification story. Only worth it as a deliberate market decision, never as an integration |
 

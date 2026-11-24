@@ -79,8 +79,14 @@ export class AcceptedConversationMemory {
   }
 
   /** Called with session rotation; old or late-accepted replies cannot enter the new session. */
-  rotate(providerThread: string, throughEventId?: string): void {
+  rotate(providerThread: string, throughEventId?: string, before?: number): void {
     const db = this.options.journal.db;
+    if (before !== undefined) {
+      db.prepare(`INSERT OR IGNORE INTO conversation_memory_excluded
+        SELECT ?,id FROM inbound_events WHERE thread_key=? AND received_at<?`)
+        .run(providerThread, this.options.scopeThread(providerThread), before);
+      return;
+    }
     const row = throughEventId
       ? db.prepare('SELECT rowid AS n FROM inbound_events WHERE id=? AND thread_key=?').get(throughEventId, this.options.scopeThread(providerThread))
       : db.prepare('SELECT MAX(rowid) AS n FROM inbound_events WHERE thread_key=?').get(this.options.scopeThread(providerThread));

@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { RequestContext } from '@mastra/core/request-context';
+import { executeTool } from './helpers/execute-tool.js';
 import { MockLanguageModelV4 } from 'ai/test';
 import { OperationalJournal } from '../src/journal/index.js';
 import { ConversationCoordinator, type ModelRequest } from '../src/conversation.js';
@@ -20,7 +20,8 @@ const ownerPolicy = {channel: 'photon' as const, accountId: 'account', ownerId: 
 const context = {threadId: 'thread', destination: 'owner', lineKey: 'line'};
 const inbound = (eventId: string, text: string) => ({channel: 'photon' as const, accountId: 'account', senderId: 'owner',
   isDirect: true, eventId, text});
-const args = {due: new Date(Date.now() + 3600000).toISOString(), action: 'Review the cedar packet 🌲'};
+const reminderYear = new Date().getUTCFullYear() + 1;
+const args = {due: `${reminderYear}-11-18T21:30:00-07:00`, action: 'Review the cedar packet 🌲'};
 const authority = {version: 2 as const, complete: true, revision: 'd'.repeat(64), bridge_sources: [], google_sources: []};
 const reply = (value: unknown, status = 200) => new Response(JSON.stringify(value), {status});
 const usage = {inputTokens: {total: 5, noCache: 5, cacheRead: 0, cacheWrite: 0}, outputTokens: {total: 2, text: 2, reasoning: 0}};
@@ -43,7 +44,7 @@ function fixture(folder: string) {
       const binding = stableActionIdentity(body.event_id, ownerReminderToolKind, body.args);
       const receipt = {version: 1, status: 'committed', action_id: body.action_id, event_id: body.event_id,
         payload_hash: body.payload_hash, args_hash: binding.payloadHash, reminder_id: `int_${'b'.repeat(32)}`,
-        reminder_status: 'scheduled', due: body.args.due, action: body.args.action,
+        reminder_status: 'scheduled', due: new Date(body.args.due).toISOString(), action: body.args.action,
         ...(body.args.operation === 'conditional' ? {operation: 'conditional', anchor_key: body.args.anchor_key} : {})};
       receipts.set(body.action_id, receipt); if (loseCreate) throw new Error('lost after commit'); return reply(receipt);
     }});
@@ -53,10 +54,8 @@ function fixture(folder: string) {
       coverage: 'currently_permitted_canonical_loops'} as never;
   }});
   const callTool = async (name: keyof typeof tools, input: unknown, request: ModelRequest, overrides: Record<string, unknown> = {}) => {
-    const requestContext = new RequestContext();
-    for (const [key, value] of Object.entries({mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey,
-      sourceRevision: state.revision, allowOwnerReminder: request.allowOwnerReminder, ...overrides})) requestContext.set(key, value);
-    return tools[name].execute!(input as never, {requestContext, abortSignal: request.signal} as never);
+    return executeTool(tools[name], input, request.signal, {mode: 'chat', runId: request.runId, ownerRequestKey: request.ownerRequestKey,
+      sourceRevision: state.revision, allowOwnerReminder: request.allowOwnerReminder, ...overrides});
   };
   return {get journal() {return journal;}, client, calls, tools, sourceAuthority, callTool, loop,
     get loopReads() {return loopReads;}, clearLoops() {waiting = [];},
@@ -66,7 +65,7 @@ function fixture(folder: string) {
     reopen() {journal.close(); journal = new OperationalJournal(join(folder, 'operations.sqlite')); journal.recoverInterrupted();}};
 }
 
-test('real Mastra tool turn binds owner request; minimal receipt ACK survives source revocation and restart without replay', async () => {
+test('receipt gives local due time after source revocation and does not replay on restart', async () => {
   const folder = mkdtempSync(join(tmpdir(), 'sotto-natural-reminder-')), f = fixture(folder); let step = 0; const sent: string[] = [];
   const model = new MockLanguageModelV4({doGenerate: async () => {
     step++;
@@ -83,8 +82,7 @@ test('real Mastra tool turn binds owner request; minimal receipt ACK survives so
   try {
     await coordinator.receive(inbound('natural', 'Remind me in an hour to review the cedar packet.'), context);
     assert.equal(step, 3); assert.deepEqual(f.calls.map(row => row.operation), ['context', 'create']);
-    assert.equal(sent.length, 1); assert.match(sent[0]!, /Reminder set\./);
-    assert.ok(!sent[0]!.includes(args.action)); assert.ok(!sent[0]!.includes('source-derived'));
+    assert.deepEqual(sent, [`Reminder set for November 18, ${reminderYear} at 9:30 PM UTC-07:00.`]);
     const action = f.journal.db.prepare("SELECT * FROM actions WHERE kind='owner_reminder_tool'").get()!;
     assert.equal(action.status, 'succeeded'); assert.equal(action.source_event_id, f.calls[1]!.event_id);
     assert.deepEqual(JSON.parse(action.result_json as string).args, args);
@@ -122,7 +120,7 @@ test('lost receipt partitions only its owner event; restart and safe chat inspec
     assert.equal((await second.recover())[0]?.status, 'accepted'); assert.equal(f.journal.getAction(action.id as string)?.status, 'succeeded');
     assert.equal(f.calls.filter(row => row.operation === 'create').length, 1);
     for (const request of f.calls.filter(row => row.operation === 'inspect')) assert.deepEqual(request.args, args);
-    assert.match(sent[2]!, /Reminder set\./);
+    assert.match(sent[2]!, /Reminder set for /);
   } finally {f.journal.close(); rmSync(folder, {recursive: true, force: true});}
 });
 
@@ -199,7 +197,7 @@ test('an unrelated single owner reminder can proceed beside an unknown prior rem
     assert.equal(sent.length, 2);
     assert.match(sent[0]!, /^I couldn’t confirm whether the reminder change happened\./,
       'the original uncertain request is acknowledged before another owner turn');
-    assert.match(sent[1]!, /Reminder set\./);
+    assert.match(sent[1]!, /Reminder set for /);
     const actions = f.journal.db.prepare("SELECT status FROM actions WHERE kind='owner_reminder_tool' ORDER BY created_at,id").all();
     assert.deepEqual(actions.map(row => row.status), ['unknown', 'succeeded']);
   } finally {await coordinator.close(); f.journal.close(); rmSync(folder, {recursive: true, force: true});}
@@ -300,7 +298,7 @@ test('conditional reminder selects exact waiting-on proof; original succeeded ac
    await f.callTool('owner_reminder_conditional', args, request);
    assert.equal(f.loopReads, reads, 'immutable receipt is not hidden by a terminalized loop');
    assert.equal(f.calls.length, 1); return 'not guessed acknowledgment';
-  }}, postPrepared: async request => {assert.match(request.text, /Conditional reminder set\./); return {acceptance: 'accepted', messageId: 'conditional-ack'};}});
+  }}, postPrepared: async request => {assert.match(request.text, /Conditional reminder set for /); return {acceptance: 'accepted', messageId: 'conditional-ack'};}});
  try {
   await coordinator.receive(inbound('conditional-proof', 'Remind me tomorrow if Dana has not replied'), context);
   assert.equal(generated, 1);

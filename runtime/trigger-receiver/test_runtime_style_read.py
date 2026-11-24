@@ -140,26 +140,22 @@ def test_closed_grammar(specification):
 
 def test_feedback_uses_captured_grants_even_when_persisted_policy_allows(seeded):
     from datetime import datetime, timezone
+    from test_owner_usefulness import _seed_accepted
+    import usefulness_feedback
+
     root, _, policy = seeded
     policy({'gmail', 'imessage'})
-    now = datetime.now(timezone.utc)
-    day = now.date().isoformat()
-    briefs = root / 'briefs'
-    briefs.mkdir()
-    records = []
+    day = datetime.now(timezone.utc).date().isoformat()
     for kind, source, text in [('morning', 'imessage', 'LOCAL FEEDBACK SECRET'), ('evening', 'gmail', 'EMAIL FEEDBACK EXAMPLE')]:
         reference = day + '_' + kind
-        (briefs / (reference + '.json')).write_text(json.dumps({'_source_permissions': [source], 'brief_text': text}))
-        (briefs / (day + '.' + kind + '.delivered')).write_text('delivered')
-        records.append({'source': 'user_feedback', 'outcome': 'useful', 'reference': reference,
-                        'item_locator': 'output', 'ts': now.isoformat()})
-    (root / 'outcomes.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in records))
+        _seed_accepted(root, reference, text, [source])
+        usefulness_feedback.record(reference, 'useful')
     result = call(root)
     assert day + '_evening' in result['guidance']
     assert day + '_morning' not in result['guidance']
-    # Original default consumer still sees both permitted managed archives.
+    # The default consumer has both permissions and sees both accepted versions.
     from personal_context import feedback
-    assert {row['reference'] for row in feedback(now)} == {day + '_morning', day + '_evening'}
+    assert {row['reference'] for row in feedback()} == {day + '_morning', day + '_evening'}
 
 
 def test_absent_style_honest_and_no_created_files(seeded):

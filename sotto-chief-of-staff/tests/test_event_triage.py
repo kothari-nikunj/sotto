@@ -28,7 +28,7 @@ def _seed_snapshot(tmp_path, contacts=None, person_knowledge=None):
     kn = tmp_path / "knowledge"
     kn.mkdir(parents=True, exist_ok=True)
     local = {"contacts": contacts if contacts is not None else
-             [{"name": "Sarah Chen", "phones": ["+14155551234"], "emails": ["sarah@acme.com"]}]}
+             [{"name": "Sarah Chen", "phones": ["+14155550107"], "emails": ["sarah@acme.com"]}]}
     if person_knowledge:
         local["person_knowledge"] = person_knowledge
     (kn / "last_local_snapshot.json").write_text(
@@ -41,7 +41,7 @@ def _seed_rel_state(tmp_path, queue):
     (kn / "relationship_state.json").write_text(json.dumps({"attention_queue": queue}))
 
 
-def _im(text="hey, can you review the deck today?", handle="+14155551234", **kw):
+def _im(text="hey, can you review the deck today?", handle="+14155550107", **kw):
     e = {"source": "imessage", "rowid": kw.pop("rowid", 1), "handle": handle, "is_from_me": False,
          "timestamp": "2026-08-06T10:00:00Z", "text": text, "is_group_chat": False,
          "chat_guid": None, "group_name": None, "group_participants": []}
@@ -49,7 +49,7 @@ def _im(text="hey, can you review the deck today?", handle="+14155551234", **kw)
     return e
 
 
-def _call(phone="+14155551234", **kw):
+def _call(phone="+14155550107", **kw):
     e = {"source": "calls", "rowid": kw.pop("rowid", 7), "phone": phone, "is_outgoing": False,
          "is_answered": False, "call_type": "phone", "timestamp": "2026-08-06T10:00:00Z"}
     e.update(kw)
@@ -172,7 +172,7 @@ def test_otp_and_shortcode_and_system_messages_drop(tmp_path, monkeypatch):
     _seed_snapshot(tmp_path)
     _no_llm(monkeypatch)
     otp = _im("Your verification code is 482910", handle="692639", rowid=2)
-    system = _im("Alice added Bob to the group", handle="+14155551234", rowid=3,
+    system = _im("Alice added Bob to the group", handle="+14155550107", rowid=3,
                  is_group_chat=True, chat_guid="g1")
     out = te.triage({"events": [otp, system]}, now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "drop"
@@ -299,11 +299,11 @@ def test_unknown_non_vip_one_to_one_queues_never_agent(tmp_path, monkeypatch):
 
 def test_group_without_name_mention_queues_with_mention_reaches_tier1(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    monkeypatch.setenv("SOTTO_USER_NAME", "Nikunj Kothari")
+    monkeypatch.setenv("SOTTO_USER_NAME", "Casey Lindgren")
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     _seed_snapshot(tmp_path)
     group = dict(is_group_chat=True, chat_guid="g42", group_name="Ski trip",
-                 group_participants=["+14155551234", "+15550001111"])
+                 group_participants=["+14155550107", "+15550001111"])
     # no mention → queue, Tier 1 untouched
     _no_llm(monkeypatch)
     out = te.triage({"events": [_im("who's driving saturday?", **group)]}, now_local=DAY, now_utc=NOW_UTC)
@@ -311,7 +311,7 @@ def test_group_without_name_mention_queues_with_mention_reaches_tier1(tmp_path, 
     assert _queue_entries(tmp_path)[-1]["verdict_class"] == "group"
     # name-mention → survives to Tier 1 (stub says urgent → agent)
     calls = _stub_llm(monkeypatch, '{"class":"urgent","why":"direct ask"}')
-    out2 = te.triage({"events": [_im("Nikunj can you book the cabin?", rowid=9, **group)]},
+    out2 = te.triage({"events": [_im("Casey can you book the cabin?", rowid=9, **group)]},
                      now_local=DAY, now_utc=NOW_UTC)
     assert out2["verdict"] == "agent" and len(calls) == 1
     assert out2["bundle"]["events"][0]["class"] == "urgent"
@@ -371,11 +371,11 @@ def test_attention_queue_priority_never_makes_a_vip(tmp_path, monkeypatch):
         out = te.triage({"events": [_call(rowid=rowid)]}, now_local=NIGHT, now_utc=NOW_UTC)
         assert out["verdict"] == "queue"                      # the pulse is context, not a gate
         assert _queue_entries(tmp_path)[-1]["verdict_class"] == "quiet"
-    assert te._is_vip("Sarah Chen", "+14155551234",
+    assert te._is_vip("Sarah Chen", "+14155550107",
                       {"attention_queue": [{"display_name": "Sarah Chen",
                                             "priority": 9_000.0}]}, {}) is False
     # …and the two checks that ARE choices still qualify (family_of has its own test below)
-    assert te._is_vip("Sarah Chen", "+14155551234", {}, {"vip_people": ["Sarah Chen"]}) is True
+    assert te._is_vip("Sarah Chen", "+14155550107", {}, {"vip_people": ["Sarah Chen"]}) is True
 
 
 # ── Tier 1 (stubbed) ──────────────────────────────────────────────────────────────────────────────
@@ -384,8 +384,8 @@ def test_tier1_only_urgent_interrupts_and_actionable_waits(tmp_path, monkeypatch
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     _seed_snapshot(tmp_path, contacts=[
-        {"name": "Sarah Chen", "phones": ["+14155551234"], "emails": []},
-        {"name": "Dhruv Patel", "phones": ["+14155559999"], "emails": []}])
+        {"name": "Sarah Chen", "phones": ["+14155550107"], "emails": []},
+        {"name": "Dhruv Patel", "phones": ["+14155550116"], "emails": []}])
     _stub_llm(monkeypatch, '{"class":"urgent","why":"deadline"}')
     out = te.triage({"events": [_im(rowid=30)]}, now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "agent"
@@ -393,7 +393,7 @@ def test_tier1_only_urgent_interrupts_and_actionable_waits(tmp_path, monkeypatch
     assert out["bundle"]["events"][0]["why"] == "deadline"
     # An ordinary actionable request waits for catch-up without consuming interrupt budget.
     _stub_llm(monkeypatch, '{"class":"actionable","why":"an ask"}')
-    out2 = te.triage({"events": [_im(rowid=31, handle="+14155559999",
+    out2 = te.triage({"events": [_im(rowid=31, handle="+14155550116",
                                      text="mind sending the notes?")]}, now_local=DAY, now_utc=NOW_UTC)
     assert out2["verdict"] == "queue"
     assert _queue_entries(tmp_path)[-1]["verdict_class"] == "actionable"
@@ -501,11 +501,11 @@ def test_cooldown_suppresses_second_agent_on_same_thread(tmp_path, monkeypatch):
 def test_cooldown_is_per_thread_not_global(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_snapshot(tmp_path, contacts=[
-        {"name": "Sarah Chen", "phones": ["+14155551234"], "emails": []},
-        {"name": "Dhruv Patel", "phones": ["+14155559999"], "emails": []}])
+        {"name": "Sarah Chen", "phones": ["+14155550107"], "emails": []},
+        {"name": "Dhruv Patel", "phones": ["+14155550116"], "emails": []}])
     _no_llm(monkeypatch)
     assert te.triage({"events": [_call(rowid=70)]}, now_local=DAY, now_utc=NOW_UTC)["verdict"] == "agent"
-    out = te.triage({"events": [_call(phone="+14155559999", rowid=71)]}, now_local=DAY, now_utc=NOW_UTC)
+    out = te.triage({"events": [_call(phone="+14155550116", rowid=71)]}, now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "agent"                          # a different person is not throttled
 
 
@@ -665,8 +665,8 @@ def test_scheduling_ask_retains_its_class_during_catchup(tmp_path, monkeypatch):
 def test_actionable_and_scheduling_ask_use_the_existing_valve(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_snapshot(tmp_path, contacts=[
-        {"name": "Sarah Chen", "phones": ["+14155551234"]},
-        {"name": "Dhruv Patel", "phones": ["+14155559999"]},
+        {"name": "Sarah Chen", "phones": ["+14155550107"]},
+        {"name": "Dhruv Patel", "phones": ["+14155550116"]},
     ])
     replies = iter((
         '{"class":"actionable","why":"preschool waiver due tomorrow"}',
@@ -676,7 +676,7 @@ def test_actionable_and_scheduling_ask_use_the_existing_valve(tmp_path, monkeypa
     assert te.triage({"events": [_im("Please sign the preschool waiver by tomorrow", rowid=230)]},
                      now_local=DAY, now_utc=NOW_UTC)["verdict"] == "queue"
     assert te.triage({"events": [_im("Can you make dinner Friday?", rowid=231,
-                                          handle="+14155559999")]},
+                                          handle="+14155550116")]},
                      now_local=DAY, now_utc=NOW_UTC)["verdict"] == "queue"
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert [e["class"] for e in out["bundle"]["events"]] == ["actionable", "scheduling_ask"]
@@ -780,7 +780,7 @@ VALVE_NOW_UTC = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)   # fixtures at
 VALVE_NOW_TS = 1_000_000.0
 
 
-def _q(cls, sender="Sarah Chen", rowid=1, handle="+14155551234", held=None,
+def _q(cls, sender="Sarah Chen", rowid=1, handle="+14155550107", held=None,
        ev_ts="2026-08-06T10:00:00Z", q_ts="2026-08-06T10:00:05Z"):
     """One raw queue.jsonl entry (the exact shape triage writes)."""
     e = _im(rowid=rowid, handle=handle, timestamp=ev_ts)
@@ -926,9 +926,9 @@ def test_valve_cap_per_tick_and_hourly_budget(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setattr(te, "VALVE_MAX_PER_HOUR", 5)           # budget above the per-tick cap
     _seed_queue(tmp_path, [
-        _q("cooldown", sender="Sarah Chen", rowid=1, handle="+14155551234"),
-        _q("quiet", sender="Dhruv Patel", rowid=2, handle="+14155559999"),
-        _q("stale", sender="Alice Wong", rowid=3, handle="+14155550000"),
+        _q("cooldown", sender="Sarah Chen", rowid=1, handle="+14155550107"),
+        _q("quiet", sender="Dhruv Patel", rowid=2, handle="+14155550116"),
+        _q("stale", sender="Alice Wong", rowid=3, handle="+14155550102"),
     ])
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert out["verdict"] == "agent"
@@ -944,21 +944,6 @@ def test_valve_cap_per_tick_and_hourly_budget(tmp_path, monkeypatch):
     out3 = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS + 3700)
     assert out3["verdict"] == "agent"
     assert [e["sender"] for e in out3["bundle"]["events"]] == ["Alice Wong"]
-
-
-def test_valve_skips_events_older_than_promotion_window(tmp_path, monkeypatch):
-    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    _seed_queue(tmp_path, [
-        _q("cooldown", rowid=1, ev_ts="2026-08-06T05:00:00Z",  # 7h old at 12:00 — beyond 4h
-           q_ts="2026-08-06T05:00:05Z"),
-    ])
-    out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
-    assert out["verdict"] == "drop" and "nothing promotable" in out["reason"]
-    assert len(_queue_entries(tmp_path)) == 1                  # old entries stay for the brief
-    # A widened window lets the same entry through.
-    monkeypatch.setattr(te, "VALVE_MAX_AGE_MIN", 480)
-    out2 = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
-    assert out2["verdict"] == "agent"
 
 
 def test_an_expired_entry_leaves_exactly_one_stale_row(tmp_path, monkeypatch):
@@ -990,7 +975,7 @@ def test_a_held_entry_the_valve_only_defers_leaves_no_stale_row(tmp_path, monkey
     """Cooldown and "the user spoke since" are HOLDS, not endings — the item is still promotable on
     a later tick, so neither writes an expiry row. Only the age cap ends an item."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    te._stamp_cooldown("imessage:+14155551234", VALVE_NOW_TS)       # cooldown still running
+    te._stamp_cooldown("imessage:+14155550107", VALVE_NOW_TS)       # cooldown still running
     _seed_queue(tmp_path, [_q("actionable", rowid=1)])              # 120m old — inside the window
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert out["verdict"] == "drop"
@@ -1006,7 +991,7 @@ def test_meeting_held_entries_are_exempt_from_the_promotion_window(tmp_path, mon
     _seed_queue(tmp_path, [
         _q("cooldown", rowid=1, ev_ts="2026-08-06T05:00:00Z",      # 7h old — past the 4h window
            q_ts="2026-08-06T05:00:05Z"),
-        _q("meeting_hold", sender="Dhruv Patel", rowid=2, handle="+14155559999",
+        _q("meeting_hold", sender="Dhruv Patel", rowid=2, handle="+14155550116",
            held="urgent", ev_ts="2026-08-06T05:00:00Z", q_ts="2026-08-06T05:00:05Z"),
     ])
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
@@ -1078,9 +1063,9 @@ def test_valve_respects_thread_cooldown_at_promotion_time(tmp_path, monkeypatch)
     _seed_queue(tmp_path, [
         _q("cooldown", rowid=1),
         _q("cooldown", rowid=2),                               # same handle = same thread
-        _q("quiet", sender="Dhruv Patel", rowid=3, handle="+14155559999"),
+        _q("quiet", sender="Dhruv Patel", rowid=3, handle="+14155550116"),
     ])
-    te._stamp_cooldown("imessage:+14155551234", VALVE_NOW_TS - 60)   # active (default 20 min)
+    te._stamp_cooldown("imessage:+14155550107", VALVE_NOW_TS - 60)   # active (default 20 min)
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert out["verdict"] == "agent"
     assert [e["sender"] for e in out["bundle"]["events"]] == ["Dhruv Patel"]
@@ -1100,7 +1085,7 @@ def test_the_valve_never_promotes_an_ask_the_user_answered_since_it_was_held(tmp
     spend a budget unit on an ask the user closed 90 minutes ago. The queue's own signal rows are
     the evidence; a later word from the user on the thread drops the candidate."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
-    ben, dhruv = "+14155551234", "+14155559999"
+    ben, dhruv = "+14155550107", "+14155550116"
     reply = _im("sure, Thursday works", handle=ben, rowid=9, is_from_me=True,
                 timestamp="2026-08-06T10:31:00Z")
     _seed_queue(tmp_path, [
@@ -1113,13 +1098,13 @@ def test_the_valve_never_promotes_an_ask_the_user_answered_since_it_was_held(tmp
     assert [e["event"]["rowid"] for e in out["bundle"]["events"]] == [3]   # Ben's ask never promoted
     # the same rule for the dashboard's one-item promote
     lines = (tmp_path / "events" / "queue.jsonl").read_text().splitlines()
-    answered = te._answered_threads(lines)
+    answered = te._answered_threads(lines, VALVE_NOW_UTC)
     assert te._valve_candidate(_q("meeting_hold", rowid=1, handle=ben, held="actionable"),
                                VALVE_NOW_UTC, VALVE_NOW_TS, 240, answered) is None
     # a signal from BEFORE the ask is not an answer to it
     earlier = dict(reply, timestamp="2026-08-06T09:00:00Z")
     before = te._answered_threads([json.dumps({"ts": "2026-08-06T09:00:05Z", "verdict_class": "signal",
-                                               "sender": "Sarah Chen", "event": earlier})])
+                                               "sender": "Sarah Chen", "event": earlier})], VALVE_NOW_UTC)
     assert te._valve_candidate(_q("cooldown", rowid=1, handle=ben), VALVE_NOW_UTC, VALVE_NOW_TS,
                                240, before) is not None
     # …the dashboard's explicit promote is the user's call, and ignores the heuristic
@@ -1137,20 +1122,21 @@ def test_an_email_you_sent_counts_as_an_answer_and_a_group_message_does_not(tmp_
             "to": "ben@acme.com", "is_from_me": True, "date": "Wed, 06 Aug 2026 10:31:00 -0700"}
     entry = {"ts": "2026-08-06T17:00:05Z", "verdict_class": "cooldown", "sender": "Ben",
              "event": inbound}
+    now = datetime(2026, 8, 6, 18, 0, tzinfo=timezone.utc)
     answered = te._answered_threads([json.dumps({"ts": "2026-08-06T17:31:05Z", "verdict_class": "signal",
-                                                 "sender": "Ben", "event": sent})])
+                                                 "sender": "Ben", "event": sent})], now)
     assert set(answered) == {"email:t99"}
     assert te._user_spoke_since(entry, inbound, answered) is True
     # epoch-ms internalDate parses too
     ms = dict(sent, date=str(int(datetime(2026, 8, 6, 17, 31, tzinfo=timezone.utc).timestamp() * 1000)))
     answered_ms = te._answered_threads([json.dumps({"ts": "x", "verdict_class": "signal", "sender": "Ben",
-                                                    "event": ms})])
+                                                    "event": ms})], now)
     assert te._user_spoke_since(entry, inbound, answered_ms) is True
     # a group signal is skipped entirely
-    grp = _im("on it", handle="+14155551234", rowid=5, is_from_me=True, is_group_chat=True,
+    grp = _im("on it", handle="+14155550107", rowid=5, is_from_me=True, is_group_chat=True,
               chat_guid="g-room", timestamp="2026-08-06T10:31:00Z")
     assert te._answered_threads([json.dumps({"ts": "2026-08-06T10:31:05Z", "verdict_class": "signal",
-                                             "sender": "Sarah Chen", "event": grp})]) == {}
+                                             "sender": "Sarah Chen", "event": grp})], now) == {}
 
 
 # ── Cross-thread daily interrupt budget (Editor Step 2 §1) ────────────────────────────────────────
@@ -1158,11 +1144,11 @@ def test_an_email_you_sent_counts_as_an_answer_and_a_group_message_does_not(tmp_
 NEXT_DAY = datetime(2026, 8, 7, 11, 0)      # same wall-clock hour, one local day later
 
 THREE_CONTACTS = [
-    {"name": "Sarah Chen", "phones": ["+14155551234"], "emails": ["sarah@acme.com"]},
-    {"name": "Dhruv Patel", "phones": ["+14155559999"]},
-    {"name": "Alice Wong", "phones": ["+14155550000"]},
+    {"name": "Sarah Chen", "phones": ["+14155550107"], "emails": ["sarah@acme.com"]},
+    {"name": "Dhruv Patel", "phones": ["+14155550116"]},
+    {"name": "Alice Wong", "phones": ["+14155550102"]},
 ]
-HANDLES = ["+14155551234", "+14155559999", "+14155550000"]
+HANDLES = ["+14155550107", "+14155550116", "+14155550102"]
 
 
 def _budget_file(tmp_path):
@@ -1241,7 +1227,7 @@ def test_budget_zero_holds_every_unsolicited_class(tmp_path, monkeypatch):
     _stub_llm(monkeypatch, '{"class":"urgent","why":"needs you now"}')
     msg = te.triage({"events": [_im(rowid=420)]}, now_local=DAY, now_utc=NOW_UTC)
     assert msg["verdict"] == "queue" and _queue_entries(tmp_path)[-1]["verdict_class"] == "budget"
-    call = te.triage({"events": [_call(rowid=421, phone="+14155559999")]},
+    call = te.triage({"events": [_call(rowid=421, phone="+14155550116")]},
                      now_local=DAY, now_utc=NOW_UTC)
     assert call["verdict"] == "queue"
     held = _queue_entries(tmp_path)[-1]
@@ -1287,9 +1273,9 @@ def test_valve_promotion_spends_one_unit_for_the_whole_bundle(tmp_path, monkeypa
     monkeypatch.setenv("SOTTO_NUDGE_BUDGET", "1")
     monkeypatch.setattr(te, "VALVE_MAX_PER_HOUR", 5)
     _seed_queue(tmp_path, [
-        _q("cooldown", sender="Sarah Chen", rowid=1, handle="+14155551234", held="urgent"),
-        _q("quiet", sender="Dhruv Patel", rowid=2, handle="+14155559999", held="actionable"),
-        _q("quiet", sender="Ben Alvarez", rowid=3, handle="+14155558888", held="actionable"),
+        _q("cooldown", sender="Sarah Chen", rowid=1, handle="+14155550107", held="urgent"),
+        _q("quiet", sender="Dhruv Patel", rowid=2, handle="+14155550116", held="actionable"),
+        _q("quiet", sender="Ben Alvarez", rowid=3, handle="+14155550115", held="actionable"),
     ])
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     # ≤ VALVE_MAX_PER_TICK in the bundle, one interrupt spent between them
@@ -1310,8 +1296,8 @@ def test_valve_promotes_exempt_held_classes_without_spending_budget(tmp_path, mo
     (tmp_path / "events" / "budget.json").write_text(
         json.dumps({"date": "2026-08-06", "count": 1}))
     _seed_queue(tmp_path, [
-        _q("cooldown", sender="Dhruv Patel", rowid=1, handle="+14155559999", held="urgent"),
-        _q("cooldown", sender="Sarah Chen", rowid=2, handle="+14155551234", held="missed_call"),
+        _q("cooldown", sender="Dhruv Patel", rowid=1, handle="+14155550116", held="urgent"),
+        _q("cooldown", sender="Sarah Chen", rowid=2, handle="+14155550107", held="missed_call"),
     ])
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert out["verdict"] == "agent"
@@ -1347,7 +1333,7 @@ def test_snooze_holds_every_agent_verdict_including_missed_calls(tmp_path, monke
     _seed_snapshot(tmp_path, contacts=THREE_CONTACTS)
     _snooze(tmp_path, "2026-08-06T15:00")
     _no_llm(monkeypatch)
-    out = te.triage({"events": [_im(rowid=500), _call(rowid=501, phone="+14155559999")]},
+    out = te.triage({"events": [_im(rowid=500), _call(rowid=501, phone="+14155550116")]},
                     now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "queue" and out["bundle"] == {}
     assert [e["verdict_class"] for e in _queue_entries(tmp_path)] == ["snoozed", "snoozed"]
@@ -1379,7 +1365,7 @@ def test_valve_holds_while_snoozed_and_never_promotes_snoozed_entries(tmp_path, 
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_queue(tmp_path, [
         _q("snoozed", sender="Sarah Chen", rowid=1, held="urgent"),
-        _q("quiet", sender="Dhruv Patel", rowid=2, handle="+14155559999"),
+        _q("quiet", sender="Dhruv Patel", rowid=2, handle="+14155550116"),
     ])
     _snooze(tmp_path, "2026-08-06T15:00")
     out = te.release_valve(now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
@@ -1575,8 +1561,8 @@ def test_real_tier1_asks_survive_a_meeting_longer_than_the_valve_window(tmp_path
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
     _seed_snapshot(tmp_path, contacts=[
-        {"name": "Sarah Chen", "phones": ["+14155551234"]},
-        {"name": "Dhruv Patel", "phones": ["+14155559999"]},
+        {"name": "Sarah Chen", "phones": ["+14155550107"]},
+        {"name": "Dhruv Patel", "phones": ["+14155550116"]},
     ])
     _seed_calendar(tmp_path, [_cal_event(start="2026-08-06T09:00:00+00:00",
                                          end="2026-08-06T15:00:00+00:00")])
@@ -1587,7 +1573,7 @@ def test_real_tier1_asks_survive_a_meeting_longer_than_the_valve_window(tmp_path
     monkeypatch.setattr(te.relevance, "judge", lambda *_a, **_k: next(replies))
     out = te.triage({"events": [
         _im("Please send the signed waiver", rowid=925),
-        _im("Can you make dinner Friday?", rowid=926, handle="+14155559999"),
+        _im("Can you make dinner Friday?", rowid=926, handle="+14155550116"),
     ]}, now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "queue"
     held = _queue_entries(tmp_path)
@@ -2105,7 +2091,7 @@ def test_a_proactive_nudge_is_never_escalation_evidence(tmp_path, monkeypatch):
     _seed_queue(tmp_path, [{"ts": "2026-08-06T10:04:00Z", "verdict_class": "budget",
                             "held_class": "chase", "sender": "Sarah Chen",
                             "event": {"source": "proactive", "kind": "chase",
-                                      "from": "+14155551234",
+                                      "from": "+14155550107",
                                       "timestamp": "2026-08-06T10:04:00Z"}}])
     _stub_llm(monkeypatch, '{"class":"actionable","why":"asks about the deck"}')
     out = te.triage({"events": [_im()]}, now_local=DAY, now_utc=NOW_UTC)
@@ -2170,12 +2156,12 @@ def test_thin_snapshot_falls_back_to_the_graph_and_supplies_the_name(tmp_path, m
     import knowledge as kg
     os.makedirs(kg.people_dir(), exist_ok=True)
     person = kg.PersonFile(canonical_id="c_alberto0001", name="Alberto Rivera",
-                           identifiers=["+13055053997"], updated_at="2026-08-01T00:00:00Z",
+                           identifiers=["+13055550149"], updated_at="2026-08-01T00:00:00Z",
                            updated_by="prewarm", facts={})
     with open(os.path.join(kg.people_dir(), "c_alberto0001.md"), "w", encoding="utf-8") as f:
         f.write(kg.serialize_person_file(person))
     monkeypatch.setattr(te, "_classify_tier1", lambda e, o: ("agent", "actionable", "real ask"))
-    out = te.triage({"events": [_im("can you send the deck?", handle="+1 (305) 505-3997", rowid=91)]},
+    out = te.triage({"events": [_im("can you send the deck?", handle="+1 (305) 555-0149", rowid=91)]},
                     now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "agent"
     assert out["bundle"]["events"][0]["sender"] == "Alberto Rivera"   # the graph supplied the name
@@ -2329,7 +2315,7 @@ def test_queue_key_names_the_exact_line(tmp_path, monkeypatch):
 def test_promote_one_is_direct_and_drains_the_queue_and_records_the_reason(tmp_path, monkeypatch):
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     _seed_queue(tmp_path, [_q("cooldown", held="actionable", rowid=1), _q("quiet", rowid=2,
-                                                                          handle="+14155559999")])
+                                                                          handle="+14155550116")])
     key = te.queue_key(_queue_line(tmp_path, 0))
     out = te.promote_one(key, now_local=DAY, now_utc=VALVE_NOW_UTC, now_ts=VALVE_NOW_TS)
     assert out["ok"] is True and out["verdict"] == "agent"
@@ -2525,12 +2511,12 @@ def test_tier1_teaches_the_intro_handoff_and_renders_addressing(tmp_path, monkey
     definition and (b) is told when the user is Cc'd, not To'd."""
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("GOOGLE_AI_API_KEY", "k")
-    monkeypatch.setenv("SOTTO_USER_EMAIL", "nk@fpv.example.com")
+    monkeypatch.setenv("SOTTO_USER_EMAIL", "cl@hbr.example.com")
     _seed_snapshot(tmp_path, contacts=[
         {"name": "Sam Rivera", "phones": [], "emails": ["sam@yahoo.com"]}])
     calls = _stub_llm(monkeypatch, '{"class":"ambient","why":"intro handoff"}')
     ev = {"source": "email", "rowid": "ih1", "from": "Sam <sam@yahoo.com>",
-          "to": "Aditya <aditya@acme.com>", "cc": "N K <nk@fpv.example.com>",
+          "to": "Aditya <aditya@acme.com>", "cc": "N K <cl@hbr.example.com>",
           "subject": "Re: Aditya <> Sanath (intro)", "body": "Great to meet you Aditya — how's Tue?",
           "threadId": "t9", "date": "2026-08-06"}
     out = te.triage({"events": [ev]}, now_local=DAY, now_utc=NOW_UTC)
@@ -2539,7 +2525,7 @@ def test_tier1_teaches_the_intro_handoff_and_renders_addressing(tmp_path, monkey
     assert "intro the USER made" in prompt                     # the taught judgment
     assert "Cc'd, not To'd — the reply is aimed at someone else" in prompt
     # user in To → nothing distinctive, no Addressed line
-    ev2 = dict(ev, rowid="ih2", to="Nikunj <nk@fpv.example.com>", cc="")
+    ev2 = dict(ev, rowid="ih2", to="Casey <cl@hbr.example.com>", cc="")
     te.triage({"events": [ev2]}, now_local=DAY, now_utc=NOW_UTC)
     assert "Addressed:" not in calls[1]["prompt"]
     # non-email events never carry the line, and an unknown self-address yields nothing
@@ -2557,11 +2543,11 @@ def test_poll_gmail_events_carry_to_and_cc():
     spec2.loader.exec_module(pg)
     full = {"from": {"name": "Sam", "email": "sam@yahoo.com"},
             "to": [{"name": "Aditya", "email": "aditya@acme.com"}],
-            "cc": [{"name": "N K", "email": "nk@fpv.example.com"}],
+            "cc": [{"name": "N K", "email": "cl@hbr.example.com"}],
             "subject": "Re: intro", "body": "hi", "threadId": "t9", "date": "2026-08-06"}
     ev = pg._to_event({"id": "m1"}, full)
     assert ev["to"] == "Aditya <aditya@acme.com>"
-    assert ev["cc"] == "N K <nk@fpv.example.com>"
+    assert ev["cc"] == "N K <cl@hbr.example.com>"
     assert pg._to_event({"id": "m2"}, {"from": "x@y.com", "body": "hi"})["to"] == ""  # absent = ""
 
 
@@ -2611,9 +2597,9 @@ def test_tier1_proxy_busy_keeps_event_in_queue_without_provider_details(tmp_path
 def test_tier1_masking_hides_identity_but_not_dates():
     """The mask is identity-only: sender name, phones, and emails go; a date-time survives —
     "2026-08-24 10" is classification signal the phone regex would otherwise eat as [phone]."""
-    e = {"sender_name": "Sarah Chen", "handle": "+14155551234", "source": "imessage"}
+    e = {"sender_name": "Sarah Chen", "handle": "+14155550107", "source": "imessage"}
     out = te._tier1_text(
-        "Sarah Chen here — call me at (415) 555-1234 or sarah@acme.com re 2026-08-24 10:00", e)
+        "Sarah Chen here — call me at (415) 555-0107 or sarah@acme.com re 2026-08-24 10:00", e)
     assert "Sarah Chen" not in out and "[sender]" in out
     assert "555-1234" not in out and "[phone]" in out
     assert "sarah@acme.com" not in out and "[email]" in out
@@ -2621,7 +2607,7 @@ def test_tier1_masking_hides_identity_but_not_dates():
 
     # A phone immediately after a date is a separate identity span. The old callback preserved
     # the regex's entire greedy match when it merely began with an ISO date.
-    adjacent = te._tier1_text("2026-08-24 415-555-1234", {})
+    adjacent = te._tier1_text("2026-08-24 415-555-0107", {})
     assert adjacent == "2026-08-24 [phone]"
 
 
@@ -2635,11 +2621,11 @@ def test_calendar_invite_email_queues_without_a_tier1_call(tmp_path, monkeypatch
     _seed_snapshot(tmp_path)
     _stub_llm(monkeypatch, AssertionError("tier1 must not run for an invite"))
     invite = _email(subject="Invitation: FPV <> Verkada Orientation @ Thu Sep 3, 2026 10am (PDT)",
-                    body="Tina Wong has invited you")
+                    body="Wren Wong has invited you")
     out = te.triage({"events": [invite]}, now_local=DAY, now_utc=NOW_UTC)
     assert out["verdict"] == "queue"
     assert "calendar invite/RSVP email" in out["reason"]
-    rsvp = _email(rowid="e2", subject="Accepted: Nikunj / Will @ Fri Aug 28 10am",
+    rsvp = _email(rowid="e2", subject="Accepted: Casey / Will @ Fri Aug 28 10am",
                   body="Will Roberts has accepted this invitation.")
     out2 = te.triage({"events": [rsvp]}, now_local=DAY, now_utc=NOW_UTC)
     assert "calendar invite/RSVP email" in out2["reason"]

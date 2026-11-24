@@ -21,5 +21,5 @@ export interface Media {
 export interface Inbound { channel: Channel; eventId: string; accountId: string; senderId: string; isDirect: boolean; text?: string; media?: Media[]; receiptOnly?: boolean; replyBound?: boolean; replyToMessageId?: string; providerSentAtMs?: number }
 export interface OwnerPolicy { channel: Channel; accountId: string; ownerId: string }
 /** Internal durable-review exemption; never accepted from HTTP/model arguments. */
-export interface Send { verbatim?: boolean; text?: string; media?: Media[]; threadId: string; signal?: AbortSignal }
+export interface Send { validUntilMs?: number; verbatim?: boolean; text?: string; media?: Media[]; threadId: string; signal?: AbortSignal }
 export interface CredentialSource { telegramToken?: string; telegramLinkFile?: unknown; photonProjectId?: string; photonProjectSecret?: string; photonServerUrl?: string; photonApiKey?: string }

@@ -297,7 +297,7 @@ class ChatClient:
         return f'ChatClient(url={self.url!r}, token=<redacted>)'
 
     def call(self, path, payload=None, *, response_limit=1_048_576, strict_json=False):
-        if path not in ('send', 'send-gallery', 'send-gallery-bytes', 'receipt', 'run', 'sessions', 'retention', 'health',
+        if path not in ('send', 'send-gallery-bytes', 'receipt', 'run', 'sessions', 'retention', 'health',
                         'activation-evidence', 'activation-ack', 'configured-identity',
                         'activation-state'):
             raise ValueError('unsupported chat operation')
@@ -335,25 +335,21 @@ class ChatClient:
         except (OSError, TimeoutError, ValueError):
             return CallResult(False, 'unknown', {})
 
-    def send_receipt(self, body, target, dispatch_id, *, attempt=1, source_revision=None):
+    def send_receipt(self, body, target, dispatch_id, *, attempt=1, source_revision=None, valid_until_ms=None):
         request = {'dispatch_id': dispatch_id, 'target': target, 'text': body, 'attempt': attempt}
         if source_revision is not None:
             if not isinstance(source_revision, str) or re.fullmatch(r'[a-f0-9]{64}', source_revision) is None:
                 raise ValueError('invalid delivery source revision')
             request['source_revision'] = source_revision
+        if valid_until_ms is not None:
+            request['valid_until_ms'] = valid_until_ms
         result = self.call('send', request)
         receipt = _clean_receipt(result.value) if result.ok else {'acceptance': result.acceptance}
         receipt['target'] = target
         accepted = receipt['acceptance'] == 'accepted'
         return accepted, '' if accepted else 'chat transport acceptance unconfirmed', receipt
 
-    def send_gallery(self, paths, summary, target, dispatch_id):
-        result = self.call('send-gallery', {'dispatch_id': dispatch_id, 'target': target, 'paths': paths, 'summary': summary})
-        receipt = _clean_receipt(result.value) if result.ok else {'acceptance': result.acceptance}
-        accepted = receipt['acceptance'] == 'accepted'
-        return accepted, '' if accepted else 'gallery acceptance unconfirmed', receipt
-
-    def send_gallery_bytes(self, images, summary, target, dispatch_id):
+    def send_gallery_bytes(self, images, summary, target, dispatch_id, *, valid_until_ms=None):
         """Transfer exact receiver-read bytes; no Node access to receiver private paths."""
         if (not isinstance(images, list) or len(images) != 4 or
                 any(not isinstance(image, dict) or set(image) != {'name', 'bytes'} or
@@ -365,6 +361,8 @@ class ChatClient:
         payload = {'dispatch_id': dispatch_id, 'target': target, 'summary': summary,
                    'images': [{'name': image['name'], 'base64': base64.b64encode(
                        image['bytes']).decode('ascii')} for image in images]}
+        if valid_until_ms is not None:
+            payload['valid_until_ms'] = valid_until_ms
         result = self.call('send-gallery-bytes', payload)
         receipt = _clean_receipt(result.value) if result.ok else {'acceptance': result.acceptance}
         accepted = receipt['acceptance'] == 'accepted'
@@ -372,6 +370,8 @@ class ChatClient:
 
     def receipt(self, dispatch_id):
         result = self.call('receipt', {'dispatch_id': dispatch_id})
+        if result.ok and result.value.get('found') is False:
+            return {'acceptance': 'not_found'}  # the runtime has no such dispatch; the outbox decides
         if not result.ok or result.value.get('found') is not True:
             return None
         return _clean_receipt(result.value.get('receipt'))
@@ -396,7 +396,9 @@ class ChatClient:
                 raise ValueError('Session purge cutoff is required')
             payload['before'] = before
         elif before is not None:
-            raise ValueError('Only session purge accepts a cutoff')
+            if action != 'rotate' or not isinstance(before, str) or not before:
+                raise ValueError('Invalid session rotation cutoff')
+            payload['before'] = before
         result = self.call('sessions', payload)
         if not result.ok:
             raise RuntimeError('chat session operation failed')

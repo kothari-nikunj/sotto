@@ -277,7 +277,7 @@ def brief_hold(data):
 
 def record_bridge_consent(data, enabled_sources, connected_sources, allow_send=False):
     """The authenticated Bridge reports explicit toggles and successful local reads."""
-    from connectors import json_transaction
+    from connectors import StateUnreadableError, json_transaction
     allowed = set(BRIDGE_SOURCE_FIELDS)
     if (not isinstance(allow_send, bool)
             or not isinstance(enabled_sources, list) or not isinstance(connected_sources, list)
@@ -285,7 +285,14 @@ def record_bridge_consent(data, enabled_sources, connected_sources, allow_send=F
             or set(enabled_sources) - allowed or set(connected_sources) - set(enabled_sources)):
         raise ValueError('Invalid local source consent')
     revoked = False
-    with json_transaction(str(Path(data) / 'config/managed-capabilities.json'), default={}) as state:
+    path = str(Path(data) / 'config/managed-capabilities.json')
+    try:
+        with json_transaction(path, default={}):
+            pass
+    except StateUnreadableError as error:
+        if not error.quarantined:
+            raise  # a set-aside corrupt file is rebuilt below from this fresh consent
+    with json_transaction(path, default={}) as state:
         before = _policy_snapshot(state)
         if state.get('tenant_id') != os.environ['SOTTO_TENANT_ID']:
             state.clear()
@@ -421,7 +428,9 @@ def _tool_allowed(data, name, arguments):
     if name == 'get_note':
         return 'apple_notes' in allowed
     if name == 'get_messages':
-        return 'imessage' in allowed
+        requested = arguments.get('source', 'imessage')
+        return ('imessage' in allowed if probe
+                else requested in ('imessage', 'whatsapp') and requested in allowed)
     if name == 'get_contacts':
         return 'contacts' in allowed
     return False
@@ -449,6 +458,19 @@ def filter_tool_list(data, result):
         return result
     return {**result, 'tools': [tool for tool in result['tools'] if isinstance(tool, dict)
                                 and _tool_allowed(data, tool.get('name'), None) is True]}
+
+
+def _valid_history_payload(payload, requested):
+    if not isinstance(requested, str) or payload.get('source') != requested:
+        return False
+    permitted = {'source', 'status', 'reason', 'rows', 'complete', 'since', 'until', 'next_cursor'}
+    if 'reactions_partial' in payload:
+        if requested != 'imessage' or payload['reactions_partial'] is not True:
+            return False
+        permitted.add('reactions_partial')
+    if 'reason' in payload and payload['reason'] not in ('permission_denied', 'read_failed', 'invalid_arguments'):
+        return False
+    return not any(key not in permitted and bool(value) for key, value in payload.items())
 
 
 def validate_tool_response(data, request, result):
@@ -492,16 +514,13 @@ def validate_tool_response(data, request, result):
                         and row['source'] in requested and set(row) <= result_fields for row in rows)
                 and all(isinstance(item, dict) and set(item) <= coverage_fields for item in coverage.values()))
     if name == 'read_history':
-        requested = arguments.get('source')
-        if not isinstance(requested, str):
-            return False
-        permitted = {'source', 'status', 'rows', 'complete', 'since', 'until', 'next_cursor'}
-        return payload.get('source') == requested and not any(
-            key not in permitted and bool(value) for key, value in payload.items())
+        return _valid_history_payload(payload, arguments.get('source'))
+    if name == 'get_messages':
+        return payload.get('source', 'imessage') == arguments.get('source', 'imessage')
     if name == 'read_local':
         try:
             validate_local_ingress(data, {'local_data': payload})
             return True
         except (ValueError, TypeError, AttributeError):
             return False
-    return True   # get_messages / get_contacts / get_note: consent is the whole decision
+    return True   # get_contacts / get_note: consent is the whole decision

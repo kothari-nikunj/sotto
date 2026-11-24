@@ -204,13 +204,54 @@ def file_lock(path: str):
             os.close(lf)
 
 
+class StateUnreadableError(RuntimeError):
+    """A state file exists but could not be read or parsed, so it was NOT replaced by a default.
+    `quarantined` is True when the corrupt bytes were moved aside (the next transaction starts
+    fresh); False when a read error left them in place."""
+
+    def __init__(self, path: str, quarantined: bool):
+        super().__init__(f"{os.path.basename(path)} unreadable"
+                         + ("; set aside" if quarantined else "; left in place"))
+        self.quarantined = quarantined
+
+
+def on_set_aside(path: str) -> None:
+    """Called once per set-aside file. The receiver replaces it to say in the Record what was lost."""
+
+
+def _read_state(path: str) -> dict | None:
+    """Only a MISSING file is empty. Bad content (encoding, JSON, top-level type) moves the file to
+    `<path>.corrupt.<unix-ts>` and raises; an OS read error raises with the file untouched."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        print(f"[sotto] state file unreadable: {path} ({type(e).__name__}); left in place", flush=True)
+        raise StateUnreadableError(path, False) from e
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        value = None
+    if isinstance(value, dict):
+        return value
+    aside = f"{path}.corrupt.{int(time.time())}"
+    os.replace(path, aside)
+    os.utime(aside)  # retention ages the copy from when it was set aside
+    print(f"[sotto] state file unreadable: {path} is corrupt; set aside as {aside}", flush=True)
+    on_set_aside(path)
+    raise StateUnreadableError(path, True)
+
+
 @contextlib.contextmanager
 def json_transaction(path: str, default=None, mode: int = 0o600, indent: int | None = None):
     """The receiver's half of the read-modify-write lock, on the file_lock protocol above. Same
     copy-plus-guard posture as keys.py. Used for `preferences.json` and friends — any JSON file two
-    processes both write."""
+    processes both write. Raises StateUnreadableError rather than write a default over a file it
+    could not read: only a missing file gets `default`."""
     with file_lock(path):
-        data = _read_json(path)
+        data = _read_state(path)
         if data is None:
             data = default if default is not None else {}
         yield data

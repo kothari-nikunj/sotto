@@ -66,19 +66,24 @@ async function stopReceiver(child: ChildProcessWithoutNullStreams) {
 const usage = { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } };
 const sourceAuthority = { read: async () => ({ version: 2 as const, complete: true, revision: 'a'.repeat(64), bridge_sources: [], google_sources: ['gmail' as const] }) };
 import { createOwnerCalendarClient } from '../src/tools/owner-calendar-client.js';
-import { createOwnerCalendarTools, CALENDAR_EXECUTION_GUIDE } from '../src/tools/owner-calendar-tool.js';
-for (const scenario of [{providerUnknown:false,rsvp:'combined_single'},{providerUnknown:false,rsvp:'combined_occurrence'},{providerUnknown:true,rsvp:'combined_occurrence'},{providerUnknown:false,rsvp:'update'},{providerUnknown:true,rsvp:'update'},{providerUnknown:false},{providerUnknown:true},{providerUnknown:true,rsvp:'occurrence'},{providerUnknown:false,rsvp:'create'},{providerUnknown:true,rsvp:'create'},...['single','occurrence','all_day','series','series_all_day'].map(rsvp=>({providerUnknown:false,rsvp}))])
-    test(`original Schedule ${'rsvp' in scenario?scenario.rsvp:'move'} full occurrence review and distinct yes; ${scenario.providerUnknown ? 'post-contact unknown remains held' : 'lost receipt reopens inspect-only'} and safe chat continues`, async () => {
+import { createOwnerCalendarExecution, CALENDAR_EXECUTION_GUIDE } from '../src/tools/owner-calendar-tool.js';
+for (const scenario of [...['undelivered','intervening','wrong_quote','changed_grant','revoked'].map(fence => ({providerUnknown:false,rsvp:'create',fence})),{providerUnknown:false,rsvp:'create',correction:true},{providerUnknown:false,rsvp:'combined_single'},{providerUnknown:false,rsvp:'combined_occurrence'},{providerUnknown:true,rsvp:'combined_occurrence'},{providerUnknown:false,rsvp:'update'},{providerUnknown:true,rsvp:'update'},{providerUnknown:false},{providerUnknown:true},{providerUnknown:true,rsvp:'occurrence'},{providerUnknown:false,rsvp:'create'},{providerUnknown:true,rsvp:'create'},...['single','occurrence','all_day','series','series_all_day'].map(rsvp=>({providerUnknown:false,rsvp}))])
+    test(`original Schedule ${'fence' in scenario?'pre-model refusal: '+scenario.fence+'; ':''}${'correction' in scenario?'corrected invite, one yes, no model reselection; ':''}${'rsvp' in scenario?scenario.rsvp:'move'} full occurrence review and distinct yes; ${scenario.providerUnknown ? 'post-contact unknown remains held' : 'lost receipt reopens inspect-only'} and safe chat continues`, async () => {
         const providerUnknown=scenario.providerUnknown;
+        const correction = 'correction' in scenario;
+        const fence = 'fence' in scenario ? scenario.fence : undefined;
+        let earlyApproval: Promise<unknown> | undefined;
+        let revision = 'a'.repeat(64), granted = true;
+        const preModelResults: boolean[] = [];
         const rsvp='rsvp' in scenario?scenario.rsvp:undefined;
         const create=rsvp==='create';const update=rsvp==='update';const combined=Boolean(rsvp?.startsWith('combined_'));
-        let target='';
+        let target='', createTitle='Cedar planning';
         const folder = mkdtempSync(join(tmpdir(), 'calendar-move-'));
         let journal = new OperationalJournal(join(folder, 'journal.sqlite'));
         let receiver: Awaited<ReturnType<typeof startReceiver>> | undefined, runtime: ReturnType<typeof createSottoAgentRuntime> | undefined, coordinator: ConversationCoordinator | undefined;
         let exactReview='',phase = 'review', step = 0, lose = true, held = true, applies = 0;
         const sent: string[] = [];
-        const sourceAuthority = { read: async () => ({ version: 2 as const, complete: true, revision: 'a'.repeat(64), bridge_sources: [], google_sources: ['calendar' as const] }) };
+        const sourceAuthority = { read: async () => ({ version: 2 as const, complete: true, revision, bridge_sources: [], google_sources: granted ? ['calendar' as const] : [] }) };
         const mount = async () => {
             const client = createOwnerCalendarClient({ ...receiver!, fetch: async (input, init) => {
                     const body = JSON.parse(init!.body as string);
@@ -100,12 +105,20 @@ for (const scenario of [{providerUnknown:false,rsvp:'combined_single'},{provider
                     }
                     return response;
                 } });
-            const tools = { ...createOwnerCalendarTools({ client, journal: () => journal, sourceAuthority }), ...createGoogleReadTools({ ...receiver!, readBearer: receiver!.readBearer, sourceAuthority }) };
+            const calendar = createOwnerCalendarExecution({ client, journal: () => journal, sourceAuthority });
+            const tools = { ...calendar.tools, ...createGoogleReadTools({ ...receiver!, readBearer: receiver!.readBearer, sourceAuthority }) };
             const model = new MockLanguageModelV4({ doGenerate: async (request) => {
                     const prompt = JSON.stringify(request.prompt);
+                    if (phase === 'batched' || phase === 'premature') {
+                        const text = phase === 'batched'
+                            ? 'I’ll add Morgan / Dana to your main calendar.\nDec 3, 2026, 2:00 PM to 2:45 PM (UTC-08:00)\n\nCreate it?'
+                            : 'Added Morgan / Dana to your calendar.\nDec 3, 2026, 2:00 PM to 2:45 PM (UTC-08:00)';
+                        return {content:[{type:'text', text}],finishReason:{unified:'stop',raw:'STOP'},usage,warnings:[]};
+                    }
+                    if (create && phase === 'confirm') throw new Error('The current accepted invite must be confirmed without model reselection');
                     if (phase === 'safe')
                         return { content: [{ type: 'text', text: 'Hello.' }], finishReason: { unified: 'stop', raw: 'STOP' }, usage, warnings: [] };
-                    const calls = phase === 'review' ? [{ name: 'skill', input: { name: 'sotto-schedule' } }, { name: 'calendar_list', input: { start: '2026-10-10T00:00:00-07:00', end: '2026-10-11T00:00:00-07:00' } }, ...(create?[]:[{ name: 'calendar_get', input: { event_id: rsvp?.startsWith('series')?target:'cedar_occurrence' } }]), combined?{name:'calendar_move_update_review',input:{event_id:'cedar_occurrence',start:'2026-10-10T12:00:00-07:00',end:'2026-10-10T13:00:00-07:00',fields:{summary:'Cedar planning',location:'',description:'New agenda\nExact second line'}}}:update?{name:'calendar_update_review',input:{event_id:'cedar_occurrence',fields:{summary:'Cedar planning',location:'',description:'New agenda\nExact second line'}}}:create?{name:'calendar_create_review',input:{summary:'Cedar planning',start:'2026-10-10T12:00:00-07:00',end:'2026-10-10T13:00:00-07:00',attendees:['DANA@example.com','dana@example.com'],location:'Cedar office, 10 Main Street',description:'Discuss roadmap\nAgree next steps'}}:rsvp?{name:'calendar_rsvp_review',input:{event_id:rsvp?.startsWith('series')?target:'cedar_occurrence',response:rsvp==='all_day'?'declined':rsvp?.startsWith('series')?'tentative':'accepted'}}:{ name: 'calendar_move_review', input: { event_id: 'cedar_occurrence', start: '2026-10-10T12:00:00-07:00', end: '2026-10-10T13:00:00-07:00' } }, null] : [{ name: combined?'calendar_move_update_confirm':update?'calendar_update_confirm':create?'calendar_create_confirm':rsvp?'calendar_rsvp_confirm':'calendar_move_confirm', input: {} }, null];
+                    const calls = phase === 'review' ? [{ name: 'skill', input: { name: 'sotto-schedule' } }, { name: 'calendar_list', input: { start: '2026-10-10T00:00:00-07:00', end: '2026-10-11T00:00:00-07:00' } }, ...(create?[]:[{ name: 'calendar_get', input: { event_id: rsvp?.startsWith('series')?target:'cedar_occurrence' } }]), combined?{name:'calendar_move_update_review',input:{event_id:'cedar_occurrence',start:'2026-10-10T12:00:00-07:00',end:'2026-10-10T13:00:00-07:00',fields:{summary:'Cedar planning',location:'',description:'New agenda\nExact second line'}}}:update?{name:'calendar_update_review',input:{event_id:'cedar_occurrence',fields:{summary:'Cedar planning',location:'',description:'New agenda\nExact second line'}}}:create?{name:'calendar_create_review',input:{summary:createTitle,start:'2026-10-10T12:00:00-07:00',end:'2026-10-10T13:00:00-07:00',attendees:['DANA@example.com','dana@example.com'],location:'Cedar office, 10 Main Street',description:'Discuss roadmap\nAgree next steps'}}:rsvp?{name:'calendar_rsvp_review',input:{event_id:rsvp?.startsWith('series')?target:'cedar_occurrence',response:rsvp==='all_day'?'declined':rsvp?.startsWith('series')?'tentative':'accepted'}}:{ name: 'calendar_move_review', input: { event_id: 'cedar_occurrence', start: '2026-10-10T12:00:00-07:00', end: '2026-10-10T13:00:00-07:00' } }, null] : [{ name: combined?'calendar_move_update_confirm':update?'calendar_update_confirm':create?'calendar_create_confirm':rsvp?'calendar_rsvp_confirm':'calendar_move_confirm', input: {} }, null];
                     const call = calls[step++];
                     if (phase === 'review' && step === 2)
                         assert.ok(prompt.includes('THE TEST IS MECHANICAL'));
@@ -123,10 +136,20 @@ for (const scenario of [{providerUnknown:false,rsvp:'combined_single'},{provider
                     }
                     return { content: call ? [{ type: 'tool-call', toolCallId: phase + '-' + step, toolName: call.name, input: JSON.stringify(call.input) }] : [{ type: 'text', text: (update||combined)&&phase==='review'?exactReview:'normal completion' }], finishReason: { unified: call ? 'tool-calls' : 'stop', raw: 'STOP' }, usage, warnings: [] };
                 } });
-            runtime = createSottoAgentRuntime({ model, storagePath: join(folder, 'memory-' + Math.random() + '.db'), instructions: CALENDAR_EXECUTION_GUIDE, skillPaths: (await readSkillIndex(process.env.SOTTO_TEST_SKILL_PACK??resolve('../../sotto-chief-of-staff'))).map(entry => entry.path), sourceAuthority, chatTools: () => tools });
-            coordinator = new ConversationCoordinator({ journal, ownerCalendar: client, ownerPolicy: { channel: 'photon', accountId: 'account', ownerId: receiver!.identity.owner_id }, model: { generate: req => runtime!.generateChat({ ...req, threadId: 'memory', ownerId: 'owner' }) }, postPrepared: async (post) => { sent.push(post.text); return { acceptance: 'accepted', messageId: 'calendar-review-' + sent.length }; } });
+            runtime = createSottoAgentRuntime({ model, storagePath: join(folder, 'memory-' + Math.random() + '.db'), instructions: CALENDAR_EXECUTION_GUIDE, skillPaths: (await readSkillIndex(process.env.SOTTO_TEST_SKILL_PACK??resolve('../../sotto-chief-of-staff'))).map(entry => entry.path), sourceAuthority, confirmReviewedInvite: async (text, ctx) => {
+                const selected = await calendar.confirmReviewedInvite(text, ctx);
+                if (fence && text === 'yes') preModelResults.push(selected);
+                return selected;
+            }, chatTools: () => tools });
+            coordinator = new ConversationCoordinator({ journal, ownerCalendar: client, ownerPolicy: { channel: 'photon', accountId: 'account', ownerId: receiver!.identity.owner_id }, model: { generate: req => runtime!.generateChat({ ...req, threadId: 'memory', ownerId: 'owner' }) }, postPrepared: async (post) => {
+                sent.push(post.text);
+                if (fence === 'undelivered' && sent.length === 1) {
+                    phase = 'safe';
+                    earlyApproval = receive('early', 'yes');
+                }
+                return { acceptance: 'accepted', messageId: 'calendar-review-' + sent.length }; } });
         };
-        const receive = (id: string, text: string) => coordinator!.receive({ channel: 'photon', accountId: 'account', senderId: receiver!.identity.owner_id, isDirect: true, eventId: id, text }, { threadId: receiver!.identity.route_id, destination: 'photon', lineKey: 'line' });
+        const receive = (id: string, text: string, quote?: string) => coordinator!.receive({ channel: 'photon', accountId: 'account', senderId: receiver!.identity.owner_id, isDirect: true, eventId: id, text, ...(quote ? {replyBound:true,replyToMessageId:quote} : {}) }, { threadId: receiver!.identity.route_id, destination: 'photon', lineKey: 'line' });
         try {
             receiver = await startReceiver(join(folder, 'receiver'),rsvp);
             await mount();
@@ -139,6 +162,45 @@ for (const scenario of [{providerUnknown:false,rsvp:'combined_single'},{provider
             if(update){assert.match(sent[0]!,/^Update: Cedar/);assert.match(sent[0]!,/All day, Oct 10, 2026; ends before Oct 11, 2026/);assert.match(sent[0]!,/After:\n\(empty\)/);}
             if(create){assert.match(sent[0]!,/^I’ll add Cedar planning to your main calendar/);assert.match(sent[0]!,/Guests: dana@example.com, owner@example.com/);assert.match(sent[0]!,/Agenda:\nDiscuss roadmap\nAgree next steps/);assert.match(sent[0]!,/Create it and invite these guests\?/);}
             if(rsvp&&!create&&!update&&!combined){assert.match(sent[0]!,/^RSVP:/);assert.match(sent[0]!,/Your address: owner@example.com/);if(rsvp?.startsWith('series'))assert.match(sent[0]!,/entire recurring series/);if(rsvp?.endsWith('all_day'))assert.match(sent[0]!,/All day, Oct 10, 2026; ends before Oct 11, 2026/);}
+            if (fence) {
+                phase = 'safe';
+                if (fence === 'changed_grant' || fence === 'revoked') revision = 'b'.repeat(64);
+                if (fence === 'revoked') granted = false;
+                if (fence === 'intervening') await receive('intervening', 'A different question');
+                if (fence === 'undelivered') await earlyApproval;
+                else await receive('approval', 'yes', fence === 'wrong_quote' ? 'different-message' : undefined);
+                assert.deepEqual(preModelResults, fence === 'revoked' ? [] : [false]);
+                assert.equal(sent.at(-1), 'Hello.', 'an unbound yes falls through to ordinary chat');
+                assert.equal(applies, 0);
+                assert.equal(existsSync(join(folder, 'receiver/calendar-provider.jsonl')), false);
+                return;
+            }
+            if (correction) {
+                phase = 'batched';
+                await Promise.all([receive('rename', 'Yes. Title should be Morgan / Dama'), receive('spelling', 'Dana')]);
+                assert.equal(sent.length, 2, 'both edits shared one answer');
+                assert.match(sent.at(-1)!, /review the corrected invite/i);
+                phase = 'premature';
+                await receive('premature', 'Yes');
+                assert.match(sent.at(-1)!, /check your calendar/i);
+                assert.equal(applies, 0, 'the old review cannot authorize either edit or the later yes');
+                createTitle = 'Morgan / Dana';
+                phase = 'review';
+                step = 0;
+                await receive('edit', 'Review the corrected invite');
+                assert.match(sent.at(-1)!, /^I’ll add Morgan \/ Dana to your main calendar/);
+                assert.equal(applies, 0);
+                phase = 'confirm';
+                lose = false;
+                assert.equal((await receive('approval', 'Yes')).status, 'accepted');
+                assert.match(sent.at(-1)!, /^Added Morgan \/ Dana to your calendar/);
+                assert.equal((await receive('approval', 'Yes')).status, 'duplicate');
+                assert.equal(applies, 1);
+                const calls = readFileSync(join(folder, 'receiver/calendar-provider.jsonl'), 'utf8').trim().split('\n');
+                assert.equal(calls.length, 1);
+                assert.equal(JSON.parse(calls[0]!).args.body.summary, createTitle);
+                return;
+            }
             if (providerUnknown)
                 writeFileSync(join(folder, 'receiver/calendar-provider-unknown'), '1');
             phase = 'confirm';

@@ -59,7 +59,7 @@ def test_email_is_a_relationship_channel_for_people_you_know(tmp_path, monkeypat
                  {"from": "Me <me@example.com>", "to": "Dana Roe <dana@acme.com>, priya@acme.com",
                   "date": d(9), "isSent": True},
                  {"from": "Priya Raman <priya@acme.com>", "to": "me@example.com", "date": d(4)},
-                 {"from": "Cold Pitch <cold@pitch.io>", "to": "me@example.com", "date": d(3)},
+                 {"from": "Cold Pitch <cold@pitch.test>", "to": "me@example.com", "date": d(3)},
                  {"from": "noreply@acme.com", "to": "me@example.com", "date": d(2)}]}
     people_seen = rp._interactions_by_contact(rp.resolve_contact_names(local))
     assert {p["name"] for p in people_seen.values()} == {"Dana Roe", "Priya Raman"}
@@ -240,7 +240,7 @@ def test_history_records_last_contact_per_channel(tmp_path, monkeypatch):
     ts_call = (NOW - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     local = _local(_msg("Bob", 3, False))
     local["calls"] = [{"phone": "+1", "timestamp": ts_call, "is_outgoing": True,
-                       "is_answered": True, "call_type": "phone"}]
+                       "is_answered": False, "duration_seconds": 42, "call_type": "phone"}]
     out = rp.compute(local, NOW)
     ch = _hist(out, "Bob")["channels"]
     assert ch["imessage"] == (NOW - timedelta(days=3)).strftime("%Y-%m-%d")

@@ -43,8 +43,9 @@ reason if not). `SOTTO_GEMINI_MODEL` keeps its meaning for exactly these lanes.
 Background history learning and Dreamer require the budgeted native Gemini proxy unless a
 self-host explicitly chooses `SOTTO_BACKGROUND_UNMETERED=true`. Direct-key composition does
 not silently enable this extra spending. Managed installs cannot use that opt-out, and the
-supervised self-host launch passes neither the proxy nor the opt-in, so its background learning
-stays held.
+supervised self-host launch passes no proxy and sets the opt-in to `true` only when the protected
+helper config selects `sotto_runtime.background_unmetered: true` (default `false`), so its
+background learning stays held by default.
 
 ## 1. Where the LLM calls actually are
 
@@ -84,12 +85,14 @@ figures are derived at 4 chars/token** and marked `~` throughout — the real co
 
 | Piece | Chars |
 |---|---:|
-| `morning-brief/references/extraction-prompt.md`, raw | 51,083 |
-| …after maintainer-comment strip (what's actually sent) | 48,316 |
-| → `systemInstruction` (static policy, **byte-stable across runs**) | **41,991** |
-| → user template, before any data | 6,235 |
+| `morning-brief/references/extraction-prompt.md`, raw | 80,307 |
+| …after maintainer-comment strip (what's actually sent) | 77,357 |
+| → `systemInstruction` (static policy, **byte-stable across runs**) | **68,788** |
+| → user template, before any data | 8,479 |
 
-The 41,991-char system block is byte-stable on purpose, so Gemini's *implicit* prefix caching applies.
+The 68,788-char system block (re-measured November 2026) is byte-stable on purpose, so Gemini's *implicit* prefix caching applies.
+The day totals in the tables below were measured when the system block was 41,991 chars and the user
+template 6,235; add about 29,000 chars (~7,300 tokens) to each total for today's prompt.
 Note this is close to worthless in practice: two brief calls a day against a ~1 h cache TTL almost
 never hit. Don't count cache discounts in any model comparison for the brief path.
 

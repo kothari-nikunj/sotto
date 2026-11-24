@@ -42,7 +42,7 @@ def _loop(tmp_path, key, **fm):
     fm.setdefault("status", "open")
     fm.setdefault("action_type", "reply")
     fm.setdefault("contact_name", "Maya Chen")
-    fm.setdefault("contact_identifier", "+14155551234")
+    fm.setdefault("contact_identifier", "+14155550107")
     fm.setdefault("summary", "the deck")
     (d / f"{key}.md").write_text("---\n" + yaml.safe_dump(fm, sort_keys=False) + "---\n")
 
@@ -58,7 +58,7 @@ def _resolve(today=TODAY, **payload):
 
 def _capture(text="Send the deck over"):
     return {"type": "reply", "channel": "imessage", "contactName": "Maya Chen",
-            "contactIdentifier": "+14155551234", "contextSummary": text}
+            "contactIdentifier": "+14155550107", "contextSummary": text}
 
 
 def _accept_notice(tmp_path, key, day="2026-09-17"):

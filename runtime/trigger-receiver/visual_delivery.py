@@ -42,7 +42,7 @@ def delivery_detail(presentation_status):
 
 
 def prepare(body, label, target, load_visual, gallery_available, *, diagnostics=None,
-            retained_source_revision=None, candidate_route_digest=None, required_questions=(), research_evidence=None):
+            retained_source_revision=None, candidate_route_digest=None, required_questions=(), research_evidence=None, visible_lines=None):
     if os.environ.get('SOTTO_VISUAL_BRIEFS', '1') != '1' or (target != 'photon' and not target.startswith('photon:')):
         return None
     if 'prep' in label:
@@ -81,7 +81,8 @@ def prepare(body, label, target, load_visual, gallery_available, *, diagnostics=
         root = Path(os.environ.get('SOTTO_DATA', '/data')) / 'cache/visual-briefs'
         manifest = (visual.render(deck, root,
                                   retained_source_revision=retained_source_revision,
-                                  candidate_route_digest=candidate_route_digest)
+                                  candidate_route_digest=candidate_route_digest,
+                                  **({'visible_lines': visible_lines} if visible_lines is not None else {}))
                     if retained_source_revision and candidate_route_digest
                     else visual.render(deck, root))
         if diagnostics is not None:

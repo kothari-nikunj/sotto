@@ -7,7 +7,7 @@ meeting notes — and turns it into a few moments a day that actually matter:
   promised, what's coming up — written like a sharp chief of staff, not a notification digest.
 - **Real-time nudges** when something genuinely needs you: a friend texts with a real ask, a missed
   call from someone you know — you get one short message *with a reply already drafted in your
-  voice*, one tap to send. Everything less urgent waits quietly for a midday catch-up or the next
+  voice*. Open the draft in your messaging app or use the callback link. Everything less urgent waits quietly for a midday catch-up or the next
   brief.
 - **A memory.** Sotto keeps a knowledge graph of your people and companies, tracks open loops
   ("you said you'd send the deck Tuesday"), notices who you're losing touch with, and learns your
@@ -206,7 +206,8 @@ python3.12 -m venv .venv && .venv/bin/pip install --require-hashes -r requiremen
 CI, the public distribution and the release script use that command. It runs Ruff, skill validation,
 pipeline, receiver, adapter, model-proxy tests, shell parsing and available publication
 guards. Tests use synthetic sources and local fixtures; none call paid models or deploy services.
-Some tests bind a local loopback server. Bridge compilation and macOS integration remain a separate
+Some tests bind a local loopback server. The Python and Node lanes run side by side, and each splits
+its main test suite by file across processes; `npm test` and `pytest tests` still run a whole suite by hand. Bridge compilation and macOS integration remain a separate
 platform verification step; backend test success alone does not certify the desktop app.
 
 The root Dockerfile's build also runs the packaged runtime checks: it typechecks and builds the
@@ -278,7 +279,7 @@ self-host upgrades or activates a paid service.
 
 Release CI and the publisher also run `bash tools/verify-public-image.sh <distribution-tree>`.
 This requires a running Docker daemon and the Buildx plugin. It uses BuildKit with plain progress
-output and loads the verified image locally. Docker Desktop includes Buildx; with Homebrew, run
+output and a cache-only build; it does not load the image locally. Docker Desktop includes Buildx; with Homebrew, run
 `brew install docker-buildx` and follow the plugin setup instructions from `brew info docker-buildx`.
 The first build warms a new cache; subsequent builds reuse it. The npm dependency installs run in
 their own build stages from the committed lock file, ahead of app code, so routine releases reuse

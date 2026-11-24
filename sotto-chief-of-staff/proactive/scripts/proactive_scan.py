@@ -16,6 +16,7 @@ Six nudge kinds:
                     one direction: a loop you are WAITING ON belongs to the chase lane and nowhere
                     else — one loop, one nudge, one register (the two branches draft opposite
                     things, and firing both about one loop is a contradiction, not a reminder).
+                    Held back when today's delivered brief already named that loop, like a chase.
   - chase         — something you're WAITING ON that has gone quiet past its chase clock. A nag is
                     not a reply: this kind exists so the draft can be a short warm "any word on X?"
                     instead of the commitment branch's reply. TWO-PHASE, one writer:
@@ -99,7 +100,9 @@ from prep_identity import PrepIdentityResolver  # noqa: E402
 from textutil import _arr, _s, unwrap_tool_result  # noqa: E402
 from calendar_context import work_attendees, meeting_events  # noqa: E402
 from timeutil import _now_local, _parse_ts, configured_tz, configured_user_email  # noqa: E402
+import brief_marker  # noqa: E402
 import delivery_effects  # noqa: E402
+import notification_layout as layout  # noqa: E402
 from jsonfiles import load as _load  # noqa: E402
 from envutil import int_env as _int_env  # noqa: E402
 # The funnel itself — this file calls triage() in-process, so there is one gate order and not a
@@ -145,57 +148,33 @@ PROACTIVE_LEAD_MIN = 45    # how long before a meeting the prep nudge fires — 
 
 
 def _recent_brief_delivered(now_local: datetime, within_hours: int = BRIEF_SUPPRESS_HOURS) -> bool:
-    """True when a morning/evening brief was delivered within the last `within_hours` — read off
-    the brief_marker.py claim files ($SOTTO_DATA/briefs/<date>.<kind>.delivered) by mtime. Checks
-    today's AND yesterday's local dates so a brief delivered just before midnight still counts."""
-    briefs = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "briefs")
-    try:
-        now_ts = now_local.timestamp()
-    except (OSError, OverflowError, ValueError):
-        return False
-    for days_back in (0, 1):
-        date = (now_local - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        for kind in ("morning", "evening"):
-            try:
-                mtime = os.path.getmtime(os.path.join(briefs, f"{date}.{kind}.delivered"))
-            except OSError:
-                continue
-            if now_ts - mtime <= within_hours * 3600:
-                return True
-    return False
+    """Was a morning/evening brief accepted in the recent window, even across midnight?"""
+    now_ts = now_local.timestamp()
+    return any(0 <= now_ts - record["accepted_at"] <= within_hours * 3600
+               for days in (0, 1) for kind in ("morning", "evening")
+               if (record := brief_marker.accepted_named(
+                   (now_local.date() - timedelta(days=days)).isoformat(), kind)))
 
 
 def _brief_delivered_today(now_local: datetime) -> bool:
-    """Did a morning/evening brief DELIVER today (the brief_marker claim file exists)? The 2h
-    suppression window above is a delay; this is the dedup: today's brief already carried the 🎂
-    line AND the quick-wish tap for a birthday that is today, so the day-of nudge is the same nudge
-    a second time, whatever the hour."""
-    briefs = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "briefs")
-    date = now_local.strftime("%Y-%m-%d")
-    return any(os.path.exists(os.path.join(briefs, f"{date}.{kind}.delivered"))
+    return any(brief_marker.accepted_named(now_local.date().isoformat(), kind)
                for kind in ("morning", "evening"))
 
 
-def _brief_named_keys(now_local: datetime):
-    """The anchor_keys today's DELIVERED brief(s) actually NAMED — a set — or None when a brief
-    delivered without leaving that record (an older brief, a failed write), which is the caller's
-    signal to fall back to the blunt time window.
+def _brief_job_active() -> bool:
+    """True while a scheduled morning/evening brief is accepted but not yet finished: it is about
+    to name the open loops, and its `.delivered` marker does not exist yet. Same queue check as the
+    receiver's `_scheduled_brief_work_active`."""
+    import work_queue  # noqa: PLC0415  (_shared/lib is on sys.path)
+    root = os.environ.get("SOTTO_DATA", "/data")
+    return any(work_queue.active_job(root, 'run', f'{lane}:sotto-{kind}-brief') is not None
+               for lane in ('cron', 'brief') for kind in ('morning', 'evening'))
 
-    compose_brief writes `<date>.<kind>.named.json` beside brief_marker's `<date>.<kind>.delivered`
-    claim; only a kind with BOTH is read, so a brief that composed and never sent silences nothing.
-    No delivered brief today = an empty set: nothing was said, so nothing can be said twice."""
-    briefs = os.path.join(os.environ.get("SOTTO_DATA", "/data"), "briefs")
-    date = now_local.strftime("%Y-%m-%d")
-    keys: set = set()
-    for kind in ("morning", "evening"):
-        if not os.path.exists(os.path.join(briefs, f"{date}.{kind}.delivered")):
-            continue
-        try:
-            with open(os.path.join(briefs, f"{date}.{kind}.named.json"), encoding="utf-8") as f:
-                keys |= {_s(k) for k in (json.load(f) or {}).get("anchor_keys") or []}
-        except Exception:  # noqa: BLE001
-            return None      # it delivered but we cannot tell what it said — use the time guard
-    return keys
+
+def _brief_named_keys(now_local: datetime) -> set:
+    """Only provider-accepted briefs can prove a loop was already named."""
+    return {key for kind in ("morning", "evening")
+            for key in brief_marker.accepted_named(now_local.date().isoformat(), kind).get("anchor_keys", [])}
 
 
 def _funnel():
@@ -663,7 +642,8 @@ def scan(calendar, continuity, local, user_email, now_local,
     # 2) Commitments — an open loop whose deadline is today or overdue. ONE loop, ONE nudge, ONE
     #    register: a loop that came back as a chase candidate belongs to the chase branch below and
     #    is skipped here, because "draft the reply" and "a nag is not a reply" cannot both be right
-    #    about the same loop in the same tick.
+    #    about the same loop in the same tick. A loop today's delivered brief already named is the
+    #    same double-tell the chase branch below avoids, so it is skipped with the same check.
     chase_titles = {_s(c.get("title")) for c in (chase_candidates or []) if isinstance(c, dict)}
     for c in (continuity if isinstance(continuity, list) else _arr(continuity, "items")):
         if not isinstance(c, dict):
@@ -672,10 +652,13 @@ def scan(calendar, continuity, local, user_email, now_local,
         title = _s(c.get("title")) or "Open commitment"
         if title in chase_titles:
             continue
+        if (_s(c.get("anchor_key")) in brief_named) if brief_named is not None else brief_recent:
+            continue
         if dl and dl <= today:
             nudges.append({"kind": "commitment", "key": f"loop:{_s(c.get('id')) or dl + _s(c.get('title'))[:20]}",
                            "title": title, "person": _s(c.get("name")),
                            "detail": ("overdue" if dl < today else "due today"),
+                           "action_due_date": dl,
                            "channel": _s(c.get("channel")), "identifier": _s(c.get("identifier")),
                            "anchor_key": _s(c.get('anchor_key')),
                        "loop_version": c.get("loop_version"), "loop_identity": c.get("loop_identity"),
@@ -794,8 +777,10 @@ def main():
     # google_account_email the Google connect learned (cb re-exports timeutil's one copy of it).
     user_email = args.user_email or configured_user_email()
 
-    # The 2h window mutes birthday/handoff repeats after a brief already covered them.
-    brief_recent = _recent_brief_delivered(now_local)
+    # The 2h window mutes birthday/handoff repeats after a brief already covered them. A brief still
+    # running counts as recent, and its named record does not exist yet, so the window decides.
+    brief_running = _brief_job_active()
+    brief_recent = brief_running or _recent_brief_delivered(now_local)
     prep_location_updates, delivered = delivery_effects.prep_location_evidence(calendar, date, now_local.timestamp())
     due = scan(calendar, continuity, local, user_email, now_local,
                birthday_importance=_birthday_importance(local, now_local),
@@ -803,7 +788,7 @@ def main():
                chase_candidates=_chase_candidates(date),
                brief_today=_brief_delivered_today(now_local),
                handoff_candidates=_handoff_candidates(), handoff_allowed=not brief_recent,
-               brief_named=_brief_named_keys(now_local),
+               brief_named=None if brief_running else _brief_named_keys(now_local),
                intentions=_intention_candidates(now_local))["nudges"]
 
     te = _funnel()
@@ -817,7 +802,9 @@ def main():
             # delivery expires, the next scan can reconsider it against current evidence.
             state['pending'] = {k: v for k, v in state['pending'].items()
                                 if (delivery_effects.instant(v.get('valid_until')) or 0) > now_local.timestamp()}
-            fresh = [n for n in due if n['key'] not in seen and n['key'] not in state['pending']]
+            # The composer withheld it today for asking nothing; it returns only once it is urgent.
+            fresh = [n for n in due if n['key'] not in seen and n['key'] not in state['pending']
+                     and (layout.WITHHELD + n['key'] not in seen or layout.urgent(n, now_local))]
             hold = _clock_hold(te, now_local)
             if hold:
                 fresh = [n for n in fresh if f"held:{n['key']}" not in seen]

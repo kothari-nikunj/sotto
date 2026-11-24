@@ -338,7 +338,7 @@ def _replay_funnel(fx: dict, base: datetime, *, live: bool = False) -> dict:
     chronological = fx.get('replay_clock') == 'day_end'
     events = funnel_events(fx)
     def observed(event):
-        stamp = timeutil._parse_ts(textutil._s(event.get('timestamp')) or textutil._s(event.get('date')))
+        stamp = timeutil.source_observed_time(event)
         if stamp is None:
             if chronological:
                 raise ValueError('chronological event requires an observed timestamp')
@@ -357,8 +357,8 @@ def _replay_funnel(fx: dict, base: datetime, *, live: bool = False) -> dict:
     verdicts = {}
     for e in events:
         event_clock = observed(e)
-        ts = event_clock.replace(tzinfo=None)
-        now = ts + timedelta(minutes=1)
+        now = event_clock + timedelta(minutes=1)
+        local_now = now.astimezone(timeutil._resolve_tz(timeutil.configured_tz()) or timezone.utc)
         try:
             # A dry replay remains offline even on an operator machine with provider keys.
             classifier = te._classify_tier1
@@ -381,7 +381,7 @@ def _replay_funnel(fx: dict, base: datetime, *, live: bool = False) -> dict:
                   if chronological else nullcontext(),
                   patch.object(personal_context, 'current_conversation', side_effect=as_of)
                   if chronological else nullcontext()):
-                out = te.triage({"events": [e]}, now_local=now, now_utc=now.replace(tzinfo=timezone.utc))
+                out = te.triage({"events": [e]}, now_local=local_now, now_utc=now)
             # Production queues a failed classifier safely. It is not a completed eval verdict.
             if failures:
                 raise failures[0]
@@ -514,7 +514,7 @@ def run_signature(live: bool, judge: bool, sample: int, critic_policy: str) -> d
     signature = {"mode": ("live+judge" if live and judge else "live" if live else "dry"),
                  "sample": sample, "critic_policy": critic_policy,
                  "metric_policy": "active-states-and-absolute-entity-error-v2",
-                 "chronological_funnel_policy": "event-time-before-day-end-compose-v1"}
+                 "chronological_funnel_policy": "source-instant-before-day-end-compose-v2"}
     if live:
         signature["compose_model"] = "/".join(gemini_transport.effective_compose_model())
     if live and judge:

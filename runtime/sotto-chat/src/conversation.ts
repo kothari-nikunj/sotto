@@ -6,12 +6,12 @@ import type {OwnerContactsClient} from './tools/owner-contacts-client.js';
 import {taskReviewText,cleanupAcknowledgement,resolveManyAcknowledgement,SIMILAR_FACT_TEXT,ownerTaskReadback} from './tools/owner-task-tool-contract.js';
 import {normalizeOwnerQuietText} from './tools/owner-preference-tool-contract.js';
 import type {OwnerCalendarClient} from './tools/owner-calendar-client.js';
-import {ownerCalendarKind,calendarReviewText,calendarWhenText} from './tools/owner-calendar-contract.js';
-import { ManagedProxyAdmissionBusy, ManagedProxyBudgetExhausted, ManagedProxyRequestTooLarge, ManagedProxyUpstreamUnavailable } from './agent/models.js';
+import {ownerCalendarKind,calendarReviewText,calendarWhenText,guardUnrecordedCalendarReply} from './tools/owner-calendar-contract.js';
+import { ChatTurnDeadlineExceeded, ManagedProxyAdmissionBusy, ManagedProxyBudgetExhausted, ManagedProxyRequestTooLarge, ManagedProxyUpstreamUnavailable } from './agent/models.js';
 import {ownerWebReadKind,docsendReviewText,webReadArgsRevision,type OwnerWebReadClient} from './tools/owner-web-read.js';
 import {ownerSkillRequestKind, skillAcknowledgement, skillRejectionAcknowledgement, type OwnerSkillRequestClient} from './tools/owner-skill-request-client.js';
-import {ownerOfferReplyAction, offerReplySelectors, type OwnerOfferReplyClient} from './tools/owner-offer-reply-client.js';
-import {clearMeetingPrepYes, meetingPrepSelectors, type OwnerMeetingPrepClient} from './tools/owner-meeting-prep-client.js';
+import {hideContextualOffer, ownerOfferReplyAction, offerReplySelectors, type OwnerOfferReplyClient} from './tools/owner-offer-reply-client.js';
+import {clearMeetingPrepYes, meetingPrepSelectors, prepAdmissionReply, type OwnerMeetingPrepClient} from './tools/owner-meeting-prep-client.js';
 import {ownerMeetingPrepOfferKind,ownerMeetingPrepOfferQuestion,type OwnerMeetingPrepOfferRefusal} from './tools/owner-meeting-prep-offer-contract.js';
 import type {OwnerMeetingPrepOfferClient} from './tools/owner-meeting-prep-offer-client.js';
 import {classifyRequestedBrief, isReadChatBriefRemainder} from './tools/requested-brief-classifier.js';
@@ -33,10 +33,11 @@ import type { OwnerTaskToolClient } from './tools/owner-task-tool-client.js';
 import type { OwnerPreferenceToolClient } from './tools/owner-preference-tool-client.js';
 import { ownerPreferenceToolKind, procedureReviewText, preferenceAcknowledgement } from './tools/owner-preference-tool-contract.js';
 import { ownerTaskToolKind } from './tools/owner-task-tool-contract.js';
-import { ownerReminderToolKind } from './tools/owner-reminder-tool-contract.js';
+import { ownerReminderToolKind, reminderAcknowledgement } from './tools/owner-reminder-tool-contract.js';
 import type { OwnerQuietClient, OwnerQuietRequest } from './tools/owner-quiet-client.js';
 import { OWNER_ONLY_CONTEXT_PROOF, SourceAuthorityChanged } from './agent/source-authority.js';
 import { createHash } from 'node:crypto';
+import { freshReplyInputs, hasLaterInput, replyWasReplaced, reconcileTerminalReplies, sourceCheckedReply, reconcileUnconfirmedReply } from './reply-unconfirmed.js';
 
 export interface ConversationContext {
   /** Provider thread identity, scoped internally by account, line and channel. */
@@ -108,7 +109,7 @@ export interface ConversationDependencies {
   onOwnerTaskTiming?(timing: {acknowledgementMs:number;dispatchMs:number;receiptToDispatchMs:number;admissionToDispatchMs:number;outcome:ConversationResult['status']}): void;
   /** Repair native conversation memory from durable journal evidence; never send. */
   projectConversation?(threadId?: string): Promise<void>;
-  canPostPrepared?(sourceRevision?: string): Promise<boolean>;
+  canPostPrepared?(sourceRevision?: string, reportChange?: boolean): Promise<boolean>;
   /** A contacted control acknowledgement becomes unknown after this wait; the provider is never retried. */
   controlDeliveryDeadlineMs?: number;
   /** Provider-only send. The coordinator owns the durable prepare/begin/settle states. */
@@ -205,7 +206,7 @@ export class ConversationCoordinator {
   constructor(private readonly deps: ConversationDependencies) {}
 
   /** The returned promise may wait for work; admission itself commits synchronously before yielding. */
-  receive(raw: Inbound, context: ConversationContext, providerSentAtMs?: number): Promise<ConversationResult> {
+  receive(raw: Inbound, context: ConversationContext, providerSentAtMs?: number, gatewayCallbackAtMs?: number): Promise<ConversationResult> {
     if (this.closed) return Promise.resolve({ status: 'error', reason: 'coordinator unavailable' });
     const inbound = normalizeInbound(raw);
     const admission = admitOwnerDirectMessage(inbound, this.deps.ownerPolicy);
@@ -216,12 +217,11 @@ export class ConversationCoordinator {
       saved = this.deps.journal.admitInbound({ eventId: inbound.eventId,
         accountKey: inbound.accountId, lineKey: context.lineKey, threadKey: context.threadId,
         channel: inbound.channel, sender: inbound.senderId, payload: encode({ inbound, context }), activation: context.activation,
+        ingress: gatewayCallbackAtMs !== undefined && inbound.channel === 'photon' ? {gatewayCallbackAtMs, providerSentAtMs} : undefined,
         continuation: providerSentAtMs !== undefined && this.deps.routeDigestForThread
           ? {routeDigest: this.deps.routeDigestForThread(context.threadId), providerSentAtMs} : undefined });
     } catch (error) {
-      // A changed redelivery of an admitted event, or a second owner chat after the
-      // destination is bound, can never be admitted. Deny it so the provider can
-      // acknowledge it; transient journal failures still throw (provider retry).
+      // Permanent conflicts can be acknowledged. Transient journal failures still throw for retry.
       if (error instanceof InboundAdmissionConflict) return Promise.resolve({ status: 'denied', reason: error.reason });
       throw error;
     }
@@ -234,14 +234,11 @@ export class ConversationCoordinator {
         () => !this.closed && this.freshFeedback.get(threadKey)?.eventId === eventId);
     } catch { /* Provider feedback cannot affect admitted work. */ }
     const command = inbound.text?.trim().toLowerCase();
-    // A correction or /stop signals the active model before it waits behind the queue.
+    // A correction cancels the turn; a running write finishes (not on /stop).
     const active = this.active.get(threadKey);
-    if (active) {
-      active.controller.abort();
-      this.deps.journal.cancelRun(active.runId);
-    }
+    if (active) this.deps.journal.cancelAfterWrite(active.runId, () => active.controller.abort(), command === '/stop');
     if (command === '/stop') {
-      // Only /stop releases a contacted send; a correction, close or maintenance awaits its receipt.
+      // Only /stop releases a contacted send or write.
       for (const [release, key] of [...this.stopReleases]) if (key === threadKey) release();
       // Cancelling input processing says nothing about whether a contacted effect
       // happened. Its separate action/dispatch proof survives this transaction.
@@ -584,14 +581,8 @@ export class ConversationCoordinator {
       pending = this.deps.journal.listPendingInboundForThread(eventId);
       if (!pending.some(row => row.id !== heldStopId)) return acknowledgement;
     }
-    const replies = this.deps.journal.listRepliesForThread(eventId);
-    const pendingIds = new Set(pending.map(row => row.id as string));
-    // Reconcile provider acceptance before doing more work, including when the anchor was resolved.
-    for (const reply of replies) {
-      if (reply.dispatch_status !== 'accepted' || reply.purpose === 'outcome_pending') continue;
-      const covered = JSON.parse(reply.covered_event_ids as string) as string[];
-      for (const id of covered) if (pendingIds.has(id)) this.deps.journal.resolveInbound(id, 'resolved');
-    }
+    let replies = this.deps.journal.listRepliesForThread(eventId);
+    reconcileTerminalReplies(this.deps.journal,pending,replies);
     const stillPending = this.deps.journal.listPendingInboundForThread(eventId);
     if (!stillPending.length) return { status: 'silent' };
     const heldCommandIds = new Set<string>(heldStopId ? [heldStopId] : []);
@@ -1096,19 +1087,20 @@ export class ConversationCoordinator {
         !heldCommandIds.has(row.source_event_id as string)))) {
       return { status: 'held' };
     }
-    // Quiet commands mutate one scalar. Only the earliest pending one can run;
-    // later quiet commands wait for its exact effect and reply while safe chat proceeds.
+    // Only the earliest pending quiet command runs.
     let firstQuiet = false;
     for (const row of stillPending) {
       if (!decode(row.payload as string).inbound.text?.startsWith('/quiet')) continue;
       if (firstQuiet) heldCommandIds.add(row.id as string);
       firstQuiet = true;
     }
-    // A contacted reply holds only the owner events it actually covered. Later
-    // admissions can form a separate run; prior Mastra transcript context is not
-    // canonical input replay and cannot authorize another send of this reply.
+    // A contacted reply holds only the events it covered; it is never resent.
     const heldReplyIds = new Set<string>(heldStopId ? [heldStopId] : []);
     const stillPendingIds = new Set(stillPending.map(row => row.id as string));
+    replies = await reconcileUnconfirmedReply(this.deps.journal, replies,
+      new Set([...stillPendingIds].filter(id => !heldCommandIds.has(id) && (!delayedSources || delayedSources.has(id)))),
+      input => this.prepareReply({...input, destination: decode(stillPending.find(row => row.id === input.eventId)!.payload as string).context.destination}),
+      notice => this.postReply(notice));
     for (const reply of replies) {
       if (isDelayedOutcomeNotice(reply)) continue;
       if (reply.dispatch_status !== 'unknown' && reply.dispatch_status !== 'dispatching') continue;
@@ -1122,8 +1114,7 @@ export class ConversationCoordinator {
       if (until === undefined) continue;
       if (until > acknowledgementNow) heldReplyIds.add(id); else this.acknowledgementHeldUntil.delete(id);
     }
-    // A crash may leave the already journaled notice prepared before provider
-    // contact. Resume only that exact dispatch; contacted notices are never resent.
+    // Resume only a held notice journaled but never contacted.
     const preparedHeldNotice = replies.find(reply => reply.dispatch_status === 'prepared' &&
       (!delayedSources || delayedSources.has(reply.event_id as string)) &&
       isHeldOutcomeNotice(reply) && heldCommandIds.has(reply.event_id as string) &&
@@ -1134,8 +1125,7 @@ export class ConversationCoordinator {
       if (run.status === 'cancelled') this.deps.journal.cancelPreparedDispatch(preparedHeldNotice.dispatch_id as string);
       else return this.postReply(preparedHeldNotice);
     }
-    // A contacted effect may remain unprovable forever. Tell the owner once, then
-    // keep its input pending for receipt reconciliation while safe chat continues.
+    // An unprovable effect: tell the owner once, keep its input pending.
     const unknownOwnerAction = this.deps.journal.listUnknownActionsForThread(eventId).find(action => {
       const policy = delayedPolicy(action.kind);
       if (!policy || action.status !== 'unknown' ||
@@ -1180,10 +1170,14 @@ export class ConversationCoordinator {
       if (run?.status === 'cancelled') {
         this.deps.journal.cancelPreparedDispatch(priorReply.dispatch_id as string);
       } else {
-        return this.postReply(priorReply);
+        const newer = !delayedSources && hasLaterInput(stillPending,priorReply,replies,remainingIds,heldCommandIds);
+        const posted = await this.postReply(priorReply,newer);
+        replies = this.deps.journal.listRepliesForThread(eventId);
+        const answered = posted.status === 'accepted' && (priorReply.purpose == null || priorReply.purpose === 'model_failure');
+        if (!newer || this.closed || this.suspended || !(answered || replyWasReplaced(priorReply,replies))) return posted;
       }
     }
-    const remaining = this.deps.journal.listPendingInboundForThread(eventId)
+    const remaining = freshReplyInputs(this.deps.journal,eventId,replies)
       .filter(row => (!delayedSources || delayedSources.has(row.id as string)) && !heldCommandIds.has(row.id as string) && !heldReplyIds.has(row.id as string));
     if (!remaining.length) return heldCommandIds.size || heldReplyIds.size ? { status: 'held' } : { status: 'silent' };
     const commandRows = remaining.filter(row => decode(row.payload as string).inbound.text?.trim().toLowerCase() === '/new');
@@ -1518,8 +1512,7 @@ export class ConversationCoordinator {
           briefAck = saved.receipt ? 'Your brief request is queued.\n\n' : 'I could not queue your brief request.\n\n';
         }
       }
-      // Keep the generated answer and its source proof in the ordinary durable reply path.
-      const answer = typeof generated === 'string' ? generated : generated.text;
+      const answer = guardUnrecordedCalendarReply(typeof generated === 'string' ? generated : generated.text, workRows.length > 1, text);
       // The receipt owns the acknowledgement, but the model may already have used its
       // exact wording. Keep that one copy and preserve the rest of a mixed answer.
       const response = (briefAck && answer.trimStart().startsWith(briefAck.trimEnd())
@@ -1629,12 +1622,13 @@ export class ConversationCoordinator {
       }
       if (modelFailed && isCurrent() && !this.closed && !this.suspended) {
         const payload = error instanceof SourceAuthorityChanged
-          ? 'I couldn’t use that result because source permissions changed or could not be verified while I was working. Please check the current source access and ask me again. If you asked me to take an action, check its status before retrying.'
+          ? error.notice
           : error instanceof ManagedProxyAdmissionBusy
           ? 'I’m busy with another model request right now. Please try again shortly. If you asked me to take an action, check its status before retrying.'
           : error instanceof ManagedProxyRequestTooLarge
             ? 'That request was too large for the model. Please send a shorter request or fewer attachments. If you asked me to take an action, check its status before retrying.'
-            : 'I couldn’t complete a response because the model request failed or took too long. Please try again shortly. If you asked me to take an action, check its status before retrying.';
+          : error instanceof ChatTurnDeadlineExceeded ? error.notice
+            : 'I couldn’t finish generating a reply. Please try again shortly. If you asked me to take an action, check its status before retrying.';
         const reply = this.prepareReply({replyId: randomUUID(), runId,
           eventId: workRows[0]!.id as string, coveredEventIds: workRows.map(row => row.id as string),
           dispatchId: randomUUID(), kind: 'interactive', destination: context.destination,
@@ -1698,9 +1692,7 @@ export class ConversationCoordinator {
       if (!existingRunId) this.deps.journal.startRun({runId, eventId});
       if (!this.deps.journal.isRunCurrent(runId)) return {status: 'cancelled'};
       const payload = saved.receipt
-        ? saved.receipt.reminder_status === 'fired' ? 'That reminder was already sent.'
-          : saved.receipt.reminder_status === 'canceled' ? 'That reminder is canceled.'
-          : saved.receipt.operation === 'conditional' ? 'Conditional reminder set.' : 'Reminder set.'
+        ? reminderAcknowledgement(saved.receipt, saved.request.args!)
         : 'That reminder could not be changed because the target or time is unavailable or it conflicts with a saved request.';
       const reply = this.prepareReply({replyId: randomUUID(), runId, eventId, coveredEventIds: [eventId],
         dispatchId: randomUUID(), kind: 'interactive', destination: decode(row.payload as string).context.destination,
@@ -1735,7 +1727,7 @@ export class ConversationCoordinator {
         ? 'That correction could not be recorded because its exact fact or owner wording is unavailable, or it conflicts with a saved request.'
         : 'That task change could not be recorded because its target or owner wording is unavailable, or it conflicts with a saved request.';
       if (saved.receipt) {
-        payload = saved.receipt.operation==='fact_add'?(saved.receipt.added?'Fact recorded.':'That fact is already recorded.'):saved.receipt.operation==='cleanup'?cleanupAcknowledgement(saved.receipt):saved.receipt.operation==='resolve_many'?resolveManyAcknowledgement(saved.receipt,saved.request.args as Extract<typeof saved.request.args,{operation:'resolve_many'}>):saved.receipt.operation==='relation'?(saved.receipt.mode==='add'?(saved.receipt.changed?'Relationship added.':'That relationship is already recorded.'):(saved.receipt.changed?'Relationship removed.':'That relationship is already absent.')):(saved.receipt.operation === 'add_identifier'||saved.receipt.operation==='identifier')?(saved.receipt.added?'Identifier added.':'That identifier is already known.'):saved.receipt.operation === 'fact_correct'
+        payload = saved.receipt.operation==='fact_add'?(saved.receipt.added?'Fact recorded.':'That fact is already recorded.'):saved.receipt.operation==='cleanup'?cleanupAcknowledgement(saved.receipt):saved.receipt.operation==='resolve_many'?resolveManyAcknowledgement(saved.receipt,saved.request.args):saved.receipt.operation==='relation'?(saved.receipt.mode==='add'?(saved.receipt.changed?'Relationship added.':'That relationship is already recorded.'):(saved.receipt.changed?'Relationship removed.':'That relationship is already absent.')):(saved.receipt.operation === 'add_identifier'||saved.receipt.operation==='identifier')?(saved.receipt.added?'Identifier added.':'That identifier is already known.'):saved.receipt.operation === 'fact_correct'
           ? 'Correction recorded.'
           : saved.receipt.operation==='add'&&saved.request.args.operation==='add'
             ? `Added: ${saved.request.args.text}`
@@ -1748,6 +1740,8 @@ export class ConversationCoordinator {
       }
       if(saved.preview){payload=taskReviewText(saved.preview.review);replySourceRevision=saved.preview.review.source_revision;}
       if(saved.receipt?.operation==='cleanup'||saved.receipt?.operation==='resolve_many'){try{const counts=await this.deps.ownerTaskTool!.readback(saved.request.args,saved.receipt);replySourceRevision=counts.source_revision;
+        if(saved.receipt.operation==='resolve_many'&&saved.request.args.operation==='resolve_many')
+          payload=resolveManyAcknowledgement(saved.receipt,saved.request.args,counts.source_revision);
         if(saved.receipt.operation==='cleanup')payload+='\nYour currently available list has '+counts.you_owe+' you owe and '+counts.waiting_on_them+' waiting on others.';
         else if(ownerTaskReadback(saved.request.text)&&'remaining' in counts&&Array.isArray(counts.remaining)){
           const rows=counts.remaining;const clean=(value:string)=>value.replace(/\s+/g,' ').trim();
@@ -1758,7 +1752,7 @@ export class ConversationCoordinator {
         }
       }catch{payload+='\nI couldn’t verify the current list.';}}
       if(saved.receipt && ((saved.request.args.operation==='add'&&saved.request.args.direction!==undefined) || saved.request.args.operation==='correct' || saved.request.args.operation==='retarget' || saved.request.args.operation==='snooze'||saved.request.args.operation==='keep')) {
-        const label=saved.request.args.operation==='add'?'Task added':saved.request.args.operation==='keep'?'Kept this obligation':saved.request.args.operation==='snooze' && saved.receipt.operation==='snooze'?`Obligation snoozed until ${saved.receipt.snoozed_until}`:saved.request.args.operation==='retarget'?'Obligation updated':saved.request.args.operation==='correct' && saved.request.args.to==='resolved'?'Marked done':'Obligation dismissed';
+        const a=saved.request.args,label=a.operation==='add'?'Task added':a.operation==='keep'?'Kept this obligation':a.operation==='snooze' && saved.receipt.operation==='snooze'?`Obligation snoozed until ${saved.receipt.snoozed_until}`:a.operation==='retarget'?'Obligation updated':a.operation==='correct'&&a.to!=='dismissed'?(a.to==='open'?'Reopened':'Marked done'):'Obligation dismissed';
         if(this.closed || this.suspended)return {status:'cancelled'};
         const currentActive=this.active.get(threadKey);
         const controller=currentActive?.runId===runId?currentActive.controller:new AbortController();
@@ -2400,7 +2394,7 @@ export class ConversationCoordinator {
       const inbound = decode(String(row.payload)).inbound;
       if (!inbound.text || (inbound.replyBound && kind !== 'prep') || inbound.media?.length ||
           (kind === 'prep' ? !clearMeetingPrepYes(inbound.text) : ownerOfferReplyAction(inbound.text) !== 'declined')) continue;
-      if (kind === 'prep' && !await this.freezeFreshBackgroundContinuation(rows)) return undefined;
+      if ((kind==='prep'||hideContextualOffer.test(inbound.text)) && !await this.freezeFreshBackgroundContinuation(rows)) return undefined;
       const args = (kind === 'prep' ? meetingPrepSelectors(inbound) : null) ?? this.deps.journal.continuationArgs(String(row.id));
       if(kind==='prep'&&rows.length===1&&!inbound.replyBound&&args?.selected_offer?.message_id&&this.deps.ownerMeetingPrepOffer&&
          !await this.repairAcceptedMeetingPrepOffers(String(row.thread_key),args.selected_offer.message_id))
@@ -2496,8 +2490,7 @@ export class ConversationCoordinator {
         action = this.deps.journal.readOwnerMeetingPrepAction(request.actionId, authority);
       }
       if (controller.signal.aborted || !this.deps.journal.isRunCurrent(runId)) return {status: 'cancelled'};
-      const payload = action.receipt ? 'Your meeting prep is queued.'
-        : 'I could not identify an available meeting-prep offer from that reply. Please reply directly to a current meeting-prep offer.';
+      const payload = prepAdmissionReply(!!action.receipt, action.rejection);
       const reply = this.prepareReply({replyId: randomUUID(), runId, eventId,
         coveredEventIds: [eventId], dispatchId: randomUUID(), kind: 'interactive',
         destination: saved.context.destination, payload, sourceRevision: OWNER_ONLY_CONTEXT_PROOF});
@@ -2890,16 +2883,16 @@ export class ConversationCoordinator {
     return false;
   }
 
-  private async postReply(reply: Record<string, unknown>): Promise<ConversationResult> {
+  private async postReply(reply: Record<string, unknown>, laterInput = false): Promise<ConversationResult> {
     const dispatchId = reply.dispatch_id as string;
     const dispatch = this.deps.journal.getDispatch(dispatchId);
     if (dispatch?.status === 'unknown') return { status: 'held' };
     if (dispatch?.status === 'accepted') return this.resolveAccepted(reply, dispatch);
     if (dispatch?.status !== 'prepared') return { status: 'held' };
     if (this.deps.canPostPrepared) {
-      try {
-        if (!await this.deps.canPostPrepared(typeof reply.source_revision === 'string' ? reply.source_revision : undefined)) return { status: 'held' };
-      } catch { return { status: 'held' }; }
+      const checked = await sourceCheckedReply(reply, dispatch, this.deps.canPostPrepared, input => this.prepareReply(input), () => !this.closed && !this.suspended, laterInput);
+      if (!checked) return {status:'held'};
+      if (checked !== reply) return this.postReply(checked);
     }
     if (this.closed || this.suspended || !this.deps.journal.isRunCurrent(reply.run_id as string)) {
       return {status: 'held'};
@@ -2934,9 +2927,8 @@ export class ConversationCoordinator {
         if (onStop) this.stopReleases.delete(onStop);
       }
     } catch { receipt = { acceptance: 'unknown' }; }
-    const outcome = receipt.acceptance === 'accepted' && receipt.messageId
-      ? 'accepted' : receipt.acceptance === 'rejected' || receipt.acceptance === 'not_attempted'
-        ? 'rejected' : 'unknown';
+    const outcome = receipt.acceptance === 'accepted' && !receipt.messageId ? 'unknown'
+      : receipt.acceptance === 'not_attempted' && reply.purpose !== 'source_withheld' ? 'rejected' : receipt.acceptance;
     const settled = this.deps.journal.settleDispatch(dispatchId, attempt.number as number,
       outcome, outcome === 'accepted' ? receipt.messageId : undefined, receipt.messageIds, receipt.providerSentAtMs);
     if (settled.status !== 'accepted') return { status: 'held' };
@@ -2977,7 +2969,7 @@ export class ConversationCoordinator {
     const covered = JSON.parse(reply.covered_event_ids as string) as string[];
     const threadId = this.deps.journal.getInbound(reply.event_id as string)?.thread_key as string;
     const fresh = this.freshFeedback.get(threadId);
-    const eligibleFeedback = reply.purpose !== 'model_failure' && reply.purpose !== 'outcome_pending' && !isHeldOutcomeNotice(reply) && !this.closed && fresh && covered.includes(fresh.eventId);
+    const eligibleFeedback = reply.purpose !== 'source_withheld' && reply.purpose !== 'model_failure' && reply.purpose !== 'outcome_pending' && !isHeldOutcomeNotice(reply) && !this.closed && fresh && covered.includes(fresh.eventId);
     let incompleteTaskOutcome=false;
     // Read the exact receipt while its source is still pending; add/close reads
     // intentionally refuse resolved sources. Settling first would hide proved completion.

@@ -76,7 +76,7 @@ for (const skill of ['meeting-prep', 'ask-research'] as const) test(`native ${sk
     let step = 0;
     const calls = [{name: 'skill', args: {name: skill === 'ask-research' ? 'sotto-ask' : 'sotto-meeting-prep'}},
       {name: 'run_sotto_script', args: {id: skill, args: skill === 'ask-research' ? ['--person', 'Dana'] : []}}, null,
-      {name: 'run_sotto_script', args: {id: skill, args: [skill === 'ask-research' ? '--person' : '--focus', 'Spencer Kim']}}, null];
+      {name: 'run_sotto_script', args: {id: skill, args: [skill === 'ask-research' ? '--person' : '--focus', 'Rowan Pike']}}, null];
     const model = new MockLanguageModelV4({doGenerate: async request => {
       if (step === 1) assert.ok(JSON.stringify(request.prompt).includes(skill === 'ask-research' ? 'Answer questions over' : 'Two modes, one pipeline'));
       const call = calls[step++];
@@ -94,7 +94,7 @@ for (const skill of ['meeting-prep', 'ask-research'] as const) test(`native ${sk
     assert.equal((await coordinator.receive(inbound('sweep', skill === 'ask-research' ? 'Research Dana' : 'Prep my meetings'), context)).status, 'accepted');
     assert.match(sent[0]!, /queued/); assert.ok(!sent[0]!.includes('invented'));
     lose = true; blocked = true;
-    assert.equal((await coordinator.receive(inbound('focus', skill === 'ask-research' ? 'Research Spencer Kim' : 'Prep Spencer Kim'), context)).status, 'held');
+    assert.equal((await coordinator.receive(inbound('focus', skill === 'ask-research' ? 'Research Rowan Pike' : 'Prep Rowan Pike'), context)).status, 'held');
     assert.match(sent[1]!, /I couldn’t confirm whether the skill request/);
     const before = journal.db.prepare('SELECT * FROM actions WHERE kind=? ORDER BY created_at').all(ownerSkillRequestKind);
     assert.deepEqual(before.map(row => row.status), ['succeeded', 'unknown']);
@@ -116,7 +116,7 @@ for (const skill of ['meeting-prep', 'ask-research'] as const) test(`native ${sk
     blocked = false;
     assert.equal((await coordinator.recover())[0]?.status, 'accepted');
     assert.equal(admissions, 2);
-    assert.equal((await coordinator.receive(inbound('focus', skill === 'ask-research' ? 'Research Spencer Kim' : 'Prep Spencer Kim'), context)).status, 'duplicate');
+    assert.equal((await coordinator.receive(inbound('focus', skill === 'ask-research' ? 'Research Rowan Pike' : 'Prep Rowan Pike'), context)).status, 'duplicate');
     const queue = new DatabaseSync(join(folder, 'receiver/events/work.sqlite3'), {readOnly: true});
     try {
       const jobs = queue.prepare('SELECT id,admission,payload FROM jobs WHERE admission IS NOT NULL').all().filter(row => JSON.parse(row.payload as string).label.startsWith('skill:'));

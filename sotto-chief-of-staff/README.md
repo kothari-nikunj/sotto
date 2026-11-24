@@ -22,6 +22,9 @@ morning-brief/                       # THE morning brief (communications-first; 
   references/research-prompt.md      # PORT: gemini-research.ts (host-native attendee web search)
   scripts/select_attendees.py        # CLI over the shared research attendee selector
   scripts/continuity_resolve.py      # PORT: continuity.rs + deterministic.ts + reconciler.ts + tests
+  scripts/loop_check.py              # automatic closes + possibly-handled notes (events/loop-checks.json)
+  scripts/loop_interactions.py       # direct exchange matching and read/reaction notes
+  scripts/closure_pass.py            # your own message judged against that person's open tasks at send time
 evening-brief/SKILL.md               # end-of-day wrap: accountability + tomorrow (carries the merged followup)
 meeting-prep/                        # standalone "prep me for the people in my meetings ahead"
   SKILL.md
@@ -60,6 +63,7 @@ _shared/
   references/relevance.md            # ONE relevance judgment for briefs, digests and nudges
   lib/relevance.py                  # shared policy loader + native-model judgment seam
   lib/personal_context.py           # ONE conversation renderer (thread keys, message caps) for triage, digest and learning; --feedback-only prints the owner's usefulness examples
+  lib/pack_path.py                  # the one fresh-process search path: real lib/, scripts/ and knowledge/ for scripts whose functions import across them
   lib/history_coverage.py           # content-free extraction windows and gaps, shared with dashboard, person-context and topic-outcome reads
   lib/brief_evidence.py             # observed-reference binding shared by composition and delayed brief learning
   lib/source_context.py             # authenticated Bridge reads, observation receipts and consent projection
@@ -68,6 +72,8 @@ _shared/
   lib/source_corrections.py         # read-only compatibility for retained correction provenance; admission retired
   lib/pipeline_checkpoint.py        # shared started/completed stage receipts; each pipeline owns its authority guard
   lib/local_snapshot.py             # consent-filtered local snapshot resolution shared by brief composition and its runner
+  lib/gmail_poll_health.py          # repeated Gmail poll failures as a source-state receipt the brief reports
+  lib/brief_window.py               # the brief's read window: 24 h, reaching back to the last success (≤72 h)
   lib/work_queue.py                 # durable work, lease ownership and unmounted routine cursor/slot admission
   lib/cleanup_selection.py          # pure complete-snapshot and bounded numeric-answer predicates for owner task cleanup
   lib/owner_loop_capability.py      # private identity-bound explicit owner-command capability
@@ -77,6 +83,7 @@ _shared/
   lib/calendar_gather.py            # one independent Calendar worker and source receipt for the ordinary Google gather
   lib/calendar_context.py           # shared human attendees and explicit calendar participation
   lib/calendar_cache_contract.py    # calendar producer/consumer cache path, source IDs and refresh protocol
+  lib/delivered_tasks.py            # task references from an accepted nudge, brief, or prep
   lib/delivery_effects.py           # current-item eligibility and replayable post-acceptance effects
   lib/attended_web_read.py          # one admitted public URL through the original provider ladder; immutable contact proof
   lib/brief_detail_selection.py     # original gallery discovery retention and owner-local acceptance dates
@@ -95,6 +102,7 @@ _shared/
   lib/chatfmt.py                     # the ONE markdown→chat-text transform (to_chat) every surface shares
   lib/visual_brief.py                # deterministic optional image cards of the SAME composed brief/prep; no model calls
   lib/message_targets.py             # supported messaging addresses and invalid-link removal shared by builders and delivery
+  lib/message_match.py               # phone, WhatsApp-handle and email-recipient matching for loop evidence
   lib/connector_tokens.py            # read/refresh per-service OAuth tokens from the receiver's /setup
   lib/gemini_transport.py            # identical native Gemini payloads; managed tenant proxy or self-host key
   lib/google_cli.py                  # strict Google CLI JSON decoder, including the empty Gmail-search sentinel
@@ -102,7 +110,13 @@ _shared/
   lib/usage_accounting.py           # canonical cached-input/thinking-aware estimates; packaged into proxy
   lib/gemini.py                      # direct Gemini REST call (call_gemini) + retryable-error classification + diagnostics
   lib/jsonstore.py                   # locked JSON read/write for shared state files (pending_offer, preferences)
+  lib/loop_checks.py                 # possibly-handled notes store and owner-facing phrase
+  lib/signal_closes.py               # automatic-close row shape: close, named once, owner reopen
+  lib/capture_shape.py               # captured deliverable/owedBy fields and the capture direction check
+  lib/loop_snapshot.py               # permitted source snapshot for loop evidence checks
   lib/jsonfiles.py                   # optional JSON input loading for triage/proactive, preserving null/default behavior
+  lib/yamlio.py                      # the one YAML frontmatter reader: libyaml safe loader when built in, pure-Python otherwise
+  lib/statmemo.py                    # per-process reuse of parsed ledger rows and the people index while their files are unchanged and settled
   lib/envutil.py                     # shared integer environment parsing for proactive/triage/digest
   lib/utc_time.py                    # UTC epoch formatter shared by dashboard/calendar records
   lib/funnel_policy.py               # shared budget exemptions, valve bounds, chase cap, proactive source and claim staleness
@@ -122,12 +136,16 @@ _shared/
   lib/timeutil.py                    # timezone/date/timestamp helpers (delegates the zone to tzchain)
   lib/tzchain.py                     # data-root and timezone chain (SOTTO_TIMEZONE → TZ → settings.json → UTC); copied beside the receiver in the image
   scripts/compose_notification.py    # direct proactive/event renderer and bounded native writer
+  scripts/notification_context.py    # whole evidence fitting and included source checks for the notification writer
+  scripts/notification_layout.py     # how one nudge reads (paragraphs, marked drafts, offers) and the send rule
   scripts/render_cards.py            # render an existing brief/prep file as cards; never researches, sends or changes memory
   scripts/compose_brief.py           # the FLEX extraction engine + critic + tap-links + escalation (PORT: gemini-flex.ts/brief-critic.ts/generate.ts)
+  lib/accepted_briefs.py             # retained brief artifacts joined to accepted outbox runs
   lib/review_candidates.py           # Friday candidate selection and accepted offer receipts in existing relationship state
   scripts/brief_detail.py            # accepted owner photo text, permission-checked and paginated
   scripts/meeting_context.py         # read-only meeting notes and canonical obligation outcomes
   scripts/release_one_proof.py        # read-only retained-history coverage and proposal counters; no model call
+  scripts/loop_label_report.py        # read-only hint precision from your own loop decisions; no model call
   scripts/learn_step.py              # essential knowledge/continuity, then separately queued ancillary writers; one merged receipt
   scripts/memory_cycle.py            # bounded history progress, changed-person curation and weekly stale-fact archival
   scripts/context_learning.py        # cited durable facts from consented direct-message history
@@ -145,7 +163,7 @@ _shared/
   scripts/style_apply.py             # PORT: style-profile.ts formatStyleForWorker (verbatim sample injection)
   scripts/preferences.py             # explicit preference memory (mute/tone rules)
   scripts/log_outcome.py             # outcomes + analytics (parity C2)
-  scripts/usefulness_feedback.py     # "that was useful / not useful" bound to a delivered brief or offered draft; stores reference + rating only
+  scripts/usefulness_feedback.py     # "that was useful / not useful" bound to an exact accepted brief version; stores identity + rating
   scripts/draft_outcomes.py          # draft→outcome matcher: offered drafts × what you actually sent
   scripts/schedule_wakeup.py         # one-shot intentions (create/list/cancel; serviced by the 15-min heartbeat)
   scripts/action_links.py            # deep-link / tap-to-send URL builder (+ the offered-drafts ledger)
@@ -160,6 +178,7 @@ _shared/
   scripts/triage_read.py             # fresh bounded triage inputs through the original gather and queue builders
   scripts/ask_research_pipeline.py   # one graph-first Ask research job: shared research, persistence and answer runtime
   scripts/followup_pipeline.py       # on-demand follow-up extraction and canonical capture, uncertain stages held
+  scripts/brief_followup_offer.py    # one exact cached meeting draft offered through the accepted brief
   scripts/granola_history.py         # bounded Granola MCP discovery or one exact meeting; no extraction or ledger writes
   scripts/meeting_prep_pipeline.py   # shared complete meeting-prep orchestration; callers own admission and delivery
   scripts/relationship_pulse_pipeline.py  # attended relationship pulse; uncertain state writes are never repeated
@@ -167,8 +186,10 @@ _shared/
   knowledge/                         # THE memory subsystem — graph models, writers and query/edit surfaces
     knowledge.py                     # graph model, serializer and live conflict-pair projection
     knowledge_correction.py         # fact correction/profile state and research coverage helpers; no file writes
+    fact_hygiene.py                  # copy, wrong-person, one-off rules; writer rejects, readers hide
     knowledge_update.py              # apply an extraction (dedup/decay/prune) + the ONE relations and company writer
     knowledge_query.py               # canonical participants from local, email, calendar and active loops; standalone mtime fallback
+    person_candidates.py             # saved people a partial or shared name could mean; never selects one
     knowledge_edit.py                # user-initiated writes (facts, company About, loops, merges, relations) for chat + dashboard
     master_file.py                   # the ONE writer/reader for knowledge/master.md (the always-in-context master memory file)
 evals/                               # brief-quality eval harness
@@ -188,6 +209,9 @@ evals/                               # brief-quality eval harness
 tests/                               # pytest: parity fixtures in → expected exhaust out (conftest sets sys.path)
   test_notification_batch_context.py # current-batch replies, context mutes, exact threads and quiet notification admission
   test_notification_current_mutes.py # current person/sender mutes through composition and restarted outbox delivery
+  test_notification_master_context.py # saved master-file Procedures reach batch and meeting-reminder nudge writers
+  test_entry_script_imports.py       # every entry script, in a fresh interpreter without conftest's paths, resolves its functions' imports (fresh_import_probe.py)
+  test_owner_owed_capture.py         # a first task you owe must bind the message it cites; a meeting-note citation is not disproved by a failed bind
 tools/                               # skill-tree tooling
   vulture_whitelist.py               # AST-only references for current callback/fixture argument contracts
   verify.py                          # dependency lock, lint, dead-code/size checks and shared backend/release gate: pipeline, receiver, adapter, proxy, guards
@@ -211,6 +235,8 @@ or enabled routine.
 
 
 `_shared/lib/source_catalog.py` owns the Bridge source IDs and payload projections used by both the receiver consent gate and shared readers.
+
+The stale sent lane uses `_shared/lib/stale_sent.py` for the shared candidate and waiting-on evidence projection.
 
 Optional visual output: `_shared/lib/visual_brief.py` holds deterministic templates; `_shared/assets/card-fonts/` holds licensed fonts; `_shared/scripts/render_cards.py` renders saved brief/prep text without sending or calling a model.
 

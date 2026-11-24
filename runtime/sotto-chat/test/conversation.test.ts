@@ -633,23 +633,23 @@ test('recovery holds only contacted reply coverage and batches later admitted ow
         model: { generate: async request => { generated.push(request); return 'new answer'; } },
         postPrepared: async request => { sent.push(request); return { acceptance: 'accepted', messageId: 'new-provider' }; },
       });
-      assert.equal((await service.recover())[0]?.status, 'held');
+      assert.equal((await service.recover())[0]?.status, 'accepted');
       assert.deepEqual(generated.map(request => request.text), ['new question first\nnew question second']);
       assert.deepEqual(generated[0]?.messages.map(message => message.eventId), ['new-first', 'new-second']);
       assert.equal(generated[0]?.ownerRequestKey, newFirst);
-      assert.deepEqual(sent.map(request => request.text), ['new answer']);
+      assert.deepEqual(sent.map(r => r.text).slice(1), ['new answer']);
       const replies = reopened.listRepliesForThread(oldFirst);
-      const fresh = replies.find(reply => reply.dispatch_id === sent[0]?.dispatchId);
+      const fresh = replies.find(reply => reply.dispatch_id === sent[1]?.dispatchId);
       assert.deepEqual(JSON.parse(fresh?.covered_event_ids as string), [newFirst, newSecond]);
-      assert.equal(reopened.getInbound(oldFirst)?.outcome, 'pending');
-      assert.equal(reopened.getInbound(oldSecond)?.outcome, 'pending');
+      assert.equal(reopened.getInbound(oldFirst)?.outcome, 'resolved');
+      assert.equal(reopened.getInbound(oldSecond)?.outcome, 'resolved');
       assert.equal(reopened.getDispatch('old-dispatch')?.status, 'unknown');
       assert.deepEqual(reopened.getAttempts('old-dispatch').map(row => [row.number, row.status]), [[1, 'unknown']]);
       assert.equal(reopened.getInbound(newFirst)?.outcome, 'resolved');
       assert.equal(reopened.getInbound(newSecond)?.outcome, 'resolved');
-      assert.equal((await service.recover())[0]?.status, 'held');
+      assert.deepEqual(await service.recover(), []);
       assert.equal(generated.length, 1);
-      assert.equal(sent.length, 1);
+      assert.equal(sent.length, 2);
     } finally { reopened.close(); }
   });
 });
@@ -679,24 +679,24 @@ test('a new same-thread owner turn and /new proceed while an earlier contacted r
       assert.equal((await service.receive(inbound('new-turn', 'new question'), context)).status, 'accepted');
       assert.deepEqual(generated.map(request => request.text), ['new question']);
       assert.deepEqual(generated[0]?.messages.map(message => message.eventId), ['new-turn']);
-      assert.deepEqual(sent.map(request => request.text), ['new answer']);
-      const newEvent = reopened.listRepliesForThread(old).find(reply => reply.dispatch_id === sent[0]?.dispatchId);
+      assert.deepEqual(sent.map(r => r.text).slice(1), ['new answer']);
+      const newEvent = reopened.listRepliesForThread(old).find(reply => reply.dispatch_id === sent[1]?.dispatchId);
       assert.deepEqual(JSON.parse(newEvent?.covered_event_ids as string), [generated[0]?.ownerRequestKey]);
-      assert.equal(reopened.getInbound(old)?.outcome, 'pending');
+      assert.equal(reopened.getInbound(old)?.outcome, 'resolved');
       assert.deepEqual(reopened.getAttempts('old-dispatch').map(row => [row.number, row.status]), [[1, 'unknown']]);
 
       assert.equal((await service.receive(inbound('rotate', '/new'), context)).status, 'rotated');
       assert.deepEqual(rotated, [context.threadId]);
-      assert.equal(reopened.getInbound(old)?.outcome, 'pending');
+      assert.equal(reopened.getInbound(old)?.outcome, 'resolved');
       assert.equal(reopened.getDispatch('old-dispatch')?.status, 'unknown');
       assert.equal(generated.length, 1);
-      assert.deepEqual(sent.map(request => request.text), ['new answer', 'I started a new conversation.']);
+      assert.deepEqual(sent.map(r => r.text).slice(1), ['new answer', 'I started a new conversation.']);
 
       reopened.settleDispatch('old-dispatch', 1, 'accepted', 'late-old-provider-proof');
       await service.recover();
       assert.equal(reopened.getInbound(old)?.outcome, 'resolved');
       assert.equal(generated.length, 1);
-      assert.equal(sent.length, 2);
+      assert.equal(sent.length, 3);
     } finally { reopened.close(); }
   });
 });
@@ -993,7 +993,7 @@ test('verified budget refusal posts durable owner-only notice once and unclassif
     const other=coordinator(journal,async()=>{throw Error('402 sotto_budget_exhausted');},async post=>{
       genericNotice=post.text;return {acceptance:'accepted',messageId:'generic-notice'};});
     assert.equal((await other.receive(inbound('other','Hello'),context)).status,'accepted');
-    assert.match(genericNotice,/model request failed or took too long/);
+    assert.match(genericNotice,/couldn’t finish generating a reply/);
     assert.doesNotMatch(genericNotice,/402|sotto_budget_exhausted/);
     await other.close();
   });
@@ -1056,7 +1056,7 @@ test('busy, oversized, and plain model failures send one safe fixed reply withou
   for (const [label, failure, expected] of [
     ['busy', new ManagedProxyAdmissionBusy(), /busy/],
     ['oversized', new ManagedProxyRequestTooLarge(), /too large/],
-    ['plain', new Error('private provider body'), /couldn’t complete a response/],
+    ['plain', new Error('private provider body'), /couldn’t finish generating a reply/],
   ] as const) await withDb(async journal => {
     let models = 0; const replies: string[] = [];
     const service = new ConversationCoordinator({journal, ownerPolicy,
@@ -1078,14 +1078,13 @@ test('model deadline after an uncertain action stays held while stopped work sen
   await withDb(async (journal, path) => {
     let sends = 0, generations = 0;
     const model = new MockLanguageModelV4({doGenerate: async ({abortSignal}) => {
-      // AbortSignal.timeout does not keep Node's event loop alive; hold it until the turn deadline
-      // aborts, so the test exercises the deadline rather than racing Mastra's setup.
+      abortSignal?.throwIfAborted();
       await new Promise<void>((_resolve, reject) => { const hold = setTimeout(() => {}, 60_000);
         abortSignal?.addEventListener('abort', () => { clearTimeout(hold); reject(abortSignal.reason); }, {once: true}); });
       throw new Error('unreachable');
     }});
     const runtime = createSottoAgentRuntime({model, storagePath: `${path}.deadline-memory`,
-      instructions: 'Answer briefly.', modelTurnDeadlineMs: 1000});
+      instructions: 'Answer briefly.', modelTurnDeadlineMs: 5000});
     const service = new ConversationCoordinator({journal, ownerPolicy,
       model: {generate: async request => {
         generations++;
@@ -1117,11 +1116,12 @@ test('model deadline after an uncertain action stays held while stopped work sen
   });
 });
 
-test('own model deadline without an action gives one durable fixed reply', async () => {
+test('own model deadline without an action gives one durable timeout reply', async () => {
   await withDb(async (journal, path) => {
     const model = new MockLanguageModelV4({doGenerate: async ({abortSignal}) => {
       // AbortSignal.timeout does not keep Node's event loop alive; hold it until the turn deadline
       // aborts, so the test exercises the deadline rather than racing Mastra's setup.
+      abortSignal?.throwIfAborted();
       await new Promise<void>((_resolve, reject) => { const hold = setTimeout(() => {}, 60_000);
         abortSignal?.addEventListener('abort', () => { clearTimeout(hold); reject(abortSignal.reason); }, {once: true}); });
       throw new Error('unreachable');
@@ -1141,7 +1141,7 @@ test('own model deadline without an action gives one durable fixed reply', async
       assert.equal(generations, 1);
       assert.equal(model.doGenerateCalls.length, 1, 'the held provider request must time out without retry');
       assert.equal(replies.length, 1);
-      assert.match(replies[0]!, /model request failed or took too long/);
+      assert.match(replies[0]!, /ran out of time/);
       assert.equal(journal.listPendingInbound().length, 0);
     } finally {await service.close(); await runtime.close();}
   });
@@ -1163,12 +1163,12 @@ test('final source revocation withholds generated content and sends one source-s
       model: {generate: request => runtime.generateChat(request)},
       postPrepared: async post => {posts.push(post.text); return {acceptance: 'accepted', messageId: 'source-notice'};}});
     try {
-      assert.equal((await service.receive(inbound('revoked-source', 'Read my messages'), context)).status, 'accepted');
+      assert.equal((await service.receive(inbound('revoked-source', 'Yes draft a reply to Rowan please'), context)).status, 'accepted');
       await service.recover();
       assert.equal(model.doGenerateCalls.length, 1, 'recovery does not regenerate');
       assert.equal(sourceReads, 2, 'begin and final source checks remain live');
       assert.equal(posts.length, 1, 'only the fixed notice contacts delivery');
-      assert.match(posts[0]!, /source permissions changed or could not be verified/);
+      assert.match(posts[0]!, /source access changed.*paste the relevant text here/i);
       assert.doesNotMatch(posts[0]!, /REVOKED PRIVATE CONTENT|model request failed/i);
       assert.equal(journal.listPendingInbound().length, 0);
     } finally {await service.close(); await runtime.close();}
@@ -1240,7 +1240,7 @@ test('model failures get fixed replies while owner text stays within the model b
       assert.ok(texts.every(text => text.length <= 32_768), 'every model turn fits the chat bound');
       assert.equal(journal.listPendingInbound().length, 0, 'failed turns and later owner input are resolved');
       assert.equal(sent.length, 5);
-      assert.ok(sent.slice(0,2).every(reply=>reply.includes('model request failed or took too long')));
+      assert.ok(sent.slice(0,2).every(reply=>reply.includes('couldn’t finish generating a reply')));
       // A single message above the bound (direct callers bypass the gateway cap) is truncated explicitly.
       const huge = 'q'.repeat(40_000);
       assert.equal((await service.receive(inbound('f', huge), context)).status, 'accepted');

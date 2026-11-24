@@ -41,11 +41,11 @@ def test_mute_sender_is_lowercased(tmp_path, monkeypatch):
 
 
 def test_sender_is_muted_matching():
-    muted = ["news@example.com", "@marketing.acme.com", "promo.shop.com"]
+    muted = ["news@example.com", "@marketing.acme.com", "promo.shop.test"]
     assert pr.sender_is_muted("news@example.com", muted)            # exact
     assert pr.sender_is_muted("anything@marketing.acme.com", muted)  # @domain rule
-    assert pr.sender_is_muted("x@promo.shop.com", muted)            # bare-domain rule
-    assert pr.sender_is_muted("x@eu.promo.shop.com", muted)         # subdomain of a domain rule
+    assert pr.sender_is_muted("x@promo.shop.test", muted)            # bare-domain rule
+    assert pr.sender_is_muted("x@eu.promo.shop.test", muted)         # subdomain of a domain rule
     assert not pr.sender_is_muted("ceo@example.com", muted)         # different local-part, no domain rule
     assert not pr.sender_is_muted("", muted)
 

@@ -11,6 +11,13 @@ def change(key='a'):
             'store_generation': 'd' * 64}
 
 
+def test_bridge_summary_unsend_keeps_the_native_edit_timestamp_marker():
+    candidate = change()
+    candidate['source_revision_evidence'] = {'kind': 'unsend', 'marker': 'date_edited', 'value': '814000000000000001'}
+    assert corrections.validate(candidate) == candidate
+    assert corrections.enabled() is False
+
+
 @pytest.fixture
 def active(tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))

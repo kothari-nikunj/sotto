@@ -240,10 +240,10 @@ def test_a_namesake_is_never_linked_from_a_handle_guessed_off_the_name(tmp_path,
     monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
         "johnsmith": {"id": "777", "username": "johnsmith", "name": "John Smith",
                        "description": "Crypto trader. Not financial advice. Miami."}}))
-    out = xc.gather(_calendar("John Smith", "johnsmith@sequoia.com"),
+    out = xc.gather(_calendar("John Smith", "johnsmith@seqvc.test"),
                     now=datetime(2026, 8, 31, tzinfo=timezone.utc))
     assert out["attendees"] == []
-    assert kg.find_person_file(identifier="johnsmith@sequoia.com") is None
+    assert kg.find_person_file(identifier="johnsmith@seqvc.test") is None
     suggestions = json.loads((tmp_path / "knowledge" / "x_link_suggestions.json").read_text())
     assert suggestions["suggestions"][0]["x_user_id"] == "777"
 
@@ -255,8 +255,8 @@ def test_a_guessed_handle_links_when_the_profile_shows_their_company(tmp_path, m
     monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
         "johnsmith": {"id": "778", "username": "johnsmith", "name": "John Smith",
-                       "description": "Partner at Sequoia. Investing in seed."}}))
-    out = xc.gather(_calendar("John Smith", "johnsmith@sequoia.com"),
+                       "description": "Partner at Seqvc. Investing in seed."}}))
+    out = xc.gather(_calendar("John Smith", "johnsmith@seqvc.test"),
                     now=datetime(2026, 8, 31, tzinfo=timezone.utc))
     assert out["attendees"][0]["x_user_id"] == "778"
 
@@ -268,11 +268,11 @@ def test_a_web_hint_with_no_published_source_is_still_a_suggestion(tmp_path, mon
     monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
         "olenyapark": {"id": "303", "username": "olenyapark", "name": "Alina Park",
                         "description": "building things"}}))
-    research = {"attendees": [{"email": "alina@stacktrace.dev", "x_handle": "olenyapark"}]}
-    out = xc.gather(_calendar("Alina Park", "alina@stacktrace.dev"), research,
+    research = {"attendees": [{"email": "alina@stack.test", "x_handle": "olenyapark"}]}
+    out = xc.gather(_calendar("Alina Park", "alina@stack.test"), research,
                     datetime(2026, 8, 31, tzinfo=timezone.utc))
     assert out["attendees"] == []
-    assert kg.find_person_file(identifier="alina@stacktrace.dev") is None
+    assert kg.find_person_file(identifier="alina@stack.test") is None
     suggestions = json.loads((tmp_path / "knowledge" / "x_link_suggestions.json").read_text())
     assert suggestions["suggestions"][0]["x_user_id"] == "303"
 
@@ -286,14 +286,14 @@ def test_a_published_handle_is_shown_unconfirmed_and_never_written_down(tmp_path
     monkeypatch.setenv("SOTTO_X_STUB", _stub(tmp_path, users_by_username={
         "olenyapark": {"id": "303", "username": "olenyapark", "name": "Alina Park",
                         "description": "building things"}}))
-    research = {"attendees": [{"email": "alina@stacktrace.dev", "x_handle": "olenyapark",
+    research = {"attendees": [{"email": "alina@stack.test", "x_handle": "olenyapark",
                                 "x_handle_source": "https://ycombinator.com/companies/stacktrace"}]}
-    out = xc.gather(_calendar("Alina Park", "alina@stacktrace.dev"), research,
+    out = xc.gather(_calendar("Alina Park", "alina@stack.test"), research,
                     datetime(2026, 8, 31, tzinfo=timezone.utc))
     row = out["attendees"][0]
     assert row["x_user_id"] == "303" and row["unconfirmed"] is True
     # …and the graph is untouched: no person, no id, no fact, nothing to un-learn later.
-    assert kg.find_person_file(identifier="alina@stacktrace.dev") is None
+    assert kg.find_person_file(identifier="alina@stack.test") is None
     doc = json.loads((tmp_path / "knowledge" / "x_link_suggestions.json").read_text())
     assert doc["suggestions"][0]["x_user_id"] == "303"
     assert "unconfirmed" in _format_x_context({"x_context": out}).lower()
@@ -322,9 +322,9 @@ def test_provenance_never_rescues_a_handle_guessed_from_the_email(tmp_path, monk
                        "description": "Crypto trader. Not financial advice. Miami."},
         "jsmith_real": {"id": "778", "username": "jsmith_real", "name": "John Smith",
                          "description": "building"}}))
-    research = {"attendees": [{"email": "johnsmith@sequoia.com", "x_handle": "jsmith_real",
+    research = {"attendees": [{"email": "johnsmith@seqvc.test", "x_handle": "jsmith_real",
                                 "x_handle_source": "https://example.com/team/john"}]}
-    out = xc.gather(_calendar("John Smith", "johnsmith@sequoia.com"), research,
+    out = xc.gather(_calendar("John Smith", "johnsmith@seqvc.test"), research,
                     datetime(2026, 8, 31, tzinfo=timezone.utc))
     # The PUBLISHED handle links; the crypto namesake the email guessed is never reached.
     assert out["attendees"][0]["x_user_id"] == "778"

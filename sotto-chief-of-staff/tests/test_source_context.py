@@ -70,7 +70,7 @@ def test_valid_empty_read_clears_previous_rows_and_stays_empty_offline():
     assert not cb._local_fallback({}).get('imessage')
 
 
-def test_partial_pull_drops_missing_old_rows_and_records_the_new_observation():
+def test_failed_pull_keeps_expired_rows_out_and_records_the_failure_not_an_observation():
     old = stamp(cb.LOCAL_SNAPSHOT_TTL_HOURS + 1)
     cb._save_local_snapshot({'generated_at': old, 'source_status': {'imessage': 'ok', 'whatsapp': 'ok'},
                             'imessage': [{'text': 'expired'}], 'whatsapp': [{'text': 'old'}]})
@@ -79,8 +79,47 @@ def test_partial_pull_drops_missing_old_rows_and_records_the_new_observation():
                                       'imessage': [], 'whatsapp': [{'text': 'fresh'}]})
     assert not current.get('imessage')
     assert current['whatsapp'][0]['text'] == 'fresh'
-    assert current['_source_observed_at']['imessage'] != old
+    # A degraded empty read is a failed read: it is not a fresh observation of an empty source.
+    assert current['_source_observed_at']['imessage'] == old
+    assert current['_source_failed']['imessage']['carried'] is False
     assert not cb._local_fallback({}).get('imessage')
+
+
+def test_a_timed_out_read_keeps_the_last_good_rows_and_says_so(tmp_path):
+    # A Bridge timeout reports `degraded` with the empty fallback. That is a failed read, not a
+    # fresh empty observation: the last good rows (snapshot and day archive) must survive, and the
+    # brief must say the source could not be read this run.
+    good = stamp(3)
+    cb._save_local_snapshot({"imessage": [{"text": "last-good-marker", "is_from_me": False,
+                                           "handle": "+15551234567", "timestamp": good}],
+                             "generated_at": good, "source_status": {"imessage": "ok"}})
+    failed = stamp(0)
+    eff = cb._save_local_snapshot({"imessage": [], "generated_at": failed,
+                                   "source_status": {"imessage": "degraded"},
+                                   "source_coverage": {"imessage": {"status": "failed",
+                                                                    "failure_category": "timeout"}}})
+    assert [r["text"] for r in eff["imessage"]] == ["last-good-marker"]
+    assert eff["_source_observed_at"]["imessage"] == good
+    assert eff["_source_failed"]["imessage"] == {"failed_at": failed, "last_good_at": good,
+                                                 "reason": "timeout", "carried": True}
+    snap = json.load(open(cb._snapshot_path()))
+    assert [r["text"] for r in snap["local"]["imessage"]] == ["last-good-marker"]
+    archive = tmp_path / "knowledge" / "snapshots" / f"{failed[:10]}.json"
+    assert "last-good-marker" in archive.read_text()
+    prompt = cb.build_prompt(cb._load_prompt(), {"type": "morning", "google": {"events": []}, "local": eff})
+    assert "Could Not Be Read This Run" in prompt and "iMessage" in prompt and failed in prompt
+
+
+def test_a_contacts_timeout_keeps_the_cached_address_book():
+    cb._save_local_snapshot({"contacts": [{"name": "Sarah", "phones": ["+15551234567"]}], "contacts_total": 1,
+                             "generated_at": stamp(3), "source_status": {"contacts": "ok"}})
+    eff = cb._save_local_snapshot({"contacts": [], "imessage": [{"text": "hi", "handle": "+15551234567",
+                                                                 "timestamp": stamp(0)}],
+                                   "generated_at": stamp(0),
+                                   "source_status": {"contacts": "degraded", "imessage": "ok"}})
+    assert [c["name"] for c in eff["contacts"]] == ["Sarah"]
+    snap = json.load(open(cb._snapshot_path()))
+    assert [c["name"] for c in snap["local"]["contacts"]] == ["Sarah"]
 
 
 def test_out_of_order_snapshot_does_not_roll_back_live_data():

@@ -35,13 +35,17 @@ from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import pack_path  # noqa: E402
+pack_path.ensure()  # the birthday-courtesy helpers import knowledge/ lazily
+import statmemo  # noqa: E402
 from textutil import _s  # noqa: E402
 from timeutil import _calendar_day, _now_local, _parse_ts, configured_tz  # noqa: E402  (ages match the brief)
 import funnel_policy as _funnel_policy  # noqa: E402
-from ledger_provenance import classify_ledger_sources, UnknownProvenanceError  # noqa: E402
+from ledger_provenance import classify_ledger_sources, ref_fields, source_refs, UnknownProvenanceError  # noqa: E402
 
 try:
     import yaml
+    from yamlio import safe_load as _yaml_load
 except Exception:  # pragma: no cover
     yaml = None
 
@@ -57,8 +61,13 @@ PARKED = {"parked"}
 PARK_AFTER_DAYS = 14
 
 
+def deliverable(row: dict) -> str:
+    """What capture recorded as owed (capture_shape); "" on legacy rows, whose text stays as it was."""
+    return _s(row.get("deliverable")).strip()
+
+
 def task_label(row: dict) -> str:
-    return (_s(row.get("ask")).strip() or _s(row.get("summary")).strip()
+    return (deliverable(row) or _s(row.get("ask")).strip() or _s(row.get("summary")).strip()
             or _s(row.get("action_type")).replace("_", " ").strip())
 
 
@@ -153,6 +162,18 @@ def is_waiting_on(t) -> bool:
     return normalize_action_type(t) in WAITING_ON_TYPES
 
 
+def told_unchanged(row: dict, today: str, told) -> bool:
+    """An overdue loop the user owes that an earlier delivered brief already named at this exact
+    `loop_version` (`told`, from brief_marker.told_before). It was told once, so it keeps to the
+    count line until the loop changes (owner, Nov 2026: "name it once, then keep it in the count
+    line until something changes"). Waiting-on loops keep their own chase rules."""
+    from delivery_effects import loop_version  # noqa: PLC0415
+    deadline, day = _s(row.get("deadline"))[:10], _s(today)[:10]
+    return (bool(told) and bool(deadline and day and deadline < day)
+            and not is_waiting_on(row.get("action_type"))
+            and told.get(_s(row.get("anchor_key"))) == loop_version(row))
+
+
 def is_routine_birthday_greeting(row: dict) -> bool:
     """A suggested birthday wish, distinct from planning or a requested birthday task."""
     text = f"{_s(row.get('summary'))} {_s(row.get('ask'))}".casefold()
@@ -206,7 +227,6 @@ def birthday_courtesy_identity():
 def birthday_courtesy_importance(row: dict, now, identity=None):
     """Require a proven person and current permitted reciprocal evidence, or an explicit VIP."""
     import jsonstore
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'knowledge'))
     import knowledge as kg
     from relationship_importance import for_contact
     from source_context import allowed, _read_source_state, _source_rows, _state_path
@@ -304,6 +324,11 @@ def is_optional_birthday_courtesy(row: dict) -> bool:
         return False
 
 
+def birthday_dates(row: dict) -> set:
+    """The birthday dates a greeting's Contacts refs name (`cid:birthday:YYYY-MM-DD`)."""
+    return {ident[-10:] for source, ident, _ in map(ref_fields, source_refs(row)) if source == 'contacts'}
+
+
 def birthday_greeting_retired(row: dict, today: str) -> bool:
     """An optional greeting outlives its offer once the birthday is beyond the capture window.
 
@@ -314,8 +339,7 @@ def birthday_greeting_retired(row: dict, today: str) -> bool:
     if not is_optional_birthday_courtesy(row):
         return False
     from relationship_importance import WINDOW_DAYS
-    dates = {_s(ref.get('sourceId'))[-10:] for ref in row.get('source_refs') or []
-             if isinstance(ref, dict) and ref.get('sourceType') == 'contacts'}
+    dates = birthday_dates(row)
     if len(dates) != 1:
         dates = {_s(row.get('created_at'))[:10]}
     try:
@@ -359,10 +383,17 @@ def parse_frontmatter(content: str):
     if end == -1:
         return None        # opening fence but no closing one — malformed, not a bare file
     try:
-        fm = yaml.safe_load(content[4:end])
+        fm = _yaml_load(content[4:end])
     except Exception:
         return None
     return fm if isinstance(fm, dict) else None
+
+
+_PARSED: dict = {}
+
+
+def _frontmatter_and_fence(content: str):
+    return parse_frontmatter(content), content.startswith("---")
 
 
 def load_entries(with_path: bool = False, include_bare: bool = False) -> list:
@@ -376,18 +407,22 @@ def load_entries(with_path: bool = False, include_bare: bool = False) -> list:
     if yaml is None:  # pragma: no cover — the read views degrade to empty without PyYAML
         return []
     out = []
-    for path in sorted(glob.glob(os.path.join(ledger_dir(), "*.md"))):
+    paths = sorted(glob.glob(os.path.join(ledger_dir(), "*.md")))
+    for gone in _PARSED.keys() - set(paths):
+        del _PARSED[gone]  # a deleted row must not stay in a long-lived process
+    for path in paths:
         try:
             with open(path, encoding="utf-8") as f:
-                content = f.read()
+                # Unchanged, settled files are parsed once per process (statmemo's rule).
+                fm, fenced = statmemo.reuse(_PARSED, path, [(path, os.fstat(f.fileno()))],
+                                            lambda f=f: _frontmatter_and_fence(f.read()))
         except OSError:
             continue
-        fm = parse_frontmatter(content)
         if fm is None:
             if not include_bare:
                 continue
             # A fence that didn't parse to a mapping = malformed; no fence at all = bare.
-            fm = {"_malformed": True} if content.startswith("---") else {}
+            fm = {"_malformed": True} if fenced else {}
         if with_path:
             fm["_path"] = path
         out.append(fm)

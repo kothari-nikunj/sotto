@@ -6,6 +6,46 @@ from datetime import datetime, timezone
 
 MAX_CALENDARS = 50
 MAX_PAGES = 20
+FILL_MAX_ITEMS = 100  # events one client calendar result can carry
+
+
+def clip(value, limit, field, clipped):
+    """Free text over its bound is cut at a UTF-8 boundary and named in `clipped`, never a failed read."""
+    if not isinstance(value, str):
+        raise ValueError('Google result is invalid')
+    if len(value.encode('utf-8')) <= limit:
+        return value
+    clipped.append(field)
+    return value.encode('utf-8')[:limit].decode('utf-8', 'ignore')
+
+
+def _utc_start(row, start):
+    when = (row or {}).get('start') or {}
+    moment = (datetime.fromisoformat(when['dateTime'].replace('Z', '+00:00')).astimezone(timezone.utc)
+              if when.get('dateTime') else datetime.fromisoformat(when.get('date') or start[:10]))
+    return max(start, moment.strftime('%Y-%m-%dT%H:%M:%SZ'))
+
+
+def fill(rows, project, budget, start, resume_by=None):
+    """Project time-ordered events until `budget` encoded bytes. Events that do not fit are not an
+    error: the result says `truncated` and `next_from`, the UTC start to read on from. `resume_by`
+    (CalendarRows.resume_by) is where a capped calendar stopped: next_from never passes it. A
+    next_from that would equal `start` returns the same page again, so it is replaced by a notice."""
+    items = []
+    for row in rows[:FILL_MAX_ITEMS]:
+        item = project(row)
+        budget -= len(json.dumps(item, ensure_ascii=False).encode('utf-8')) + 1
+        if budget < 0:
+            break
+        items.append(item)
+    result = {'items': items}
+    marks = ([_utc_start(rows[len(items)], start)] if len(rows) > len(items) else []) + ([resume_by] if resume_by else [])
+    if marks and min(marks) > start:
+        result.update(truncated=True, next_from=min(marks))
+    elif marks:
+        result.update(truncated=True, next_from_unavailable=(
+            f'more events overlap {start} than one result holds; read on with a start after they end'))
+    return result
 
 
 class CalendarSelectionExpiredError(ValueError):
@@ -72,9 +112,11 @@ class CalendarRows(list):
         super().__init__()
         self.complete = True
         self.calendars = []
+        self.cancelled = []
+        self.resume_by = None  # earliest last-fetched start (UTC) of a calendar that stopped early
 
 
-def read(fetch_inventory, fetch_events, *, selected=None, max_items=5000):
+def read(fetch_inventory, fetch_events, *, selected=None, max_items=5000, include_cancelled=False):
     """Callbacks preserve each transport's deadline and credentials; no retries here."""
     selected = validate_selection(selected) if selected is not None else selection()
     rows = CalendarRows()
@@ -123,7 +165,7 @@ def read(fetch_inventory, fetch_events, *, selected=None, max_items=5000):
     seen = set()
     for calendar_id in ids:
         status, tokens, page = 'ok', set(), None
-        count = 0
+        count, last = 0, None
         try:
             for _ in range(MAX_PAGES):
                 if count >= max_items or len(rows) >= 5000:
@@ -135,6 +177,8 @@ def read(fetch_inventory, fetch_events, *, selected=None, max_items=5000):
                     raise ValueError('Calendar events exceed bound')
                 for item in items:
                     if item.get('status') == 'cancelled':
+                        if include_cancelled and isinstance(item.get('id'), str) and item['id'] and len(rows.cancelled) < 5000:
+                            rows.cancelled.append({'id': item['id'], 'start': item.get('start'), 'calendar_id': calendar_id})
                         continue
                     key = (calendar_id, item.get('id'), json.dumps(item.get('originalStartTime'), sort_keys=True))
                     if not isinstance(item.get('id'), str) or not item['id']:
@@ -146,7 +190,7 @@ def read(fetch_inventory, fetch_events, *, selected=None, max_items=5000):
                         break
                     seen.add(key)
                     rows.append({**item, 'calendar_id': calendar_id, '_calendar_primary': calendar_id in primary_calendars})
-                    count += 1
+                    count, last = count + 1, item
                 page = result.get('nextPageToken')
                 if not page or status == 'partial':
                     break
@@ -160,6 +204,9 @@ def read(fetch_inventory, fetch_events, *, selected=None, max_items=5000):
         except Exception:
             status = 'unavailable'
         rows.calendars.append({'calendar_id': calendar_id, 'status': status})
+        if status == 'partial' and last and ((last.get('start') or {}).get('dateTime') or (last.get('start') or {}).get('date')):
+            stop = _utc_start(last, '')
+            rows.resume_by = min(rows.resume_by or stop, stop)
         rows.complete = rows.complete and status == 'ok'
     def order(item):
         raw = (item.get('start') or {}).get('dateTime') or (item.get('start') or {}).get('date') or ''
@@ -173,7 +220,7 @@ def read(fetch_inventory, fetch_events, *, selected=None, max_items=5000):
     return rows
 
 
-def read_service(service, start, end, *, selected=None):
+def read_service(service, start, end, *, selected=None, include_cancelled=False):
     def inventory(page):
         params = {'maxResults': 250, 'minAccessRole': 'reader', 'showHidden': False}
         if page:
@@ -183,7 +230,9 @@ def read_service(service, start, end, *, selected=None):
     def events(calendar_id, page):
         params = {'calendarId': calendar_id, 'timeMin': start, 'timeMax': end,
                   'singleEvents': True, 'orderBy': 'startTime', 'maxResults': 250}
+        if include_cancelled:
+            params['showDeleted'] = True
         if page:
             params['pageToken'] = page
         return service.events().list(**params).execute()
-    return read(inventory, events, selected=selected)
+    return read(inventory, events, selected=selected, include_cancelled=include_cancelled)

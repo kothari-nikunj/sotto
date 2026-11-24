@@ -1079,7 +1079,7 @@ def test_sottos_own_held_nudges_are_never_offered_nudge_me_now(tmp_path):
                                   "key": "bday:jordan:2026", "timestamp": ts}}),
             json.dumps({"ts": ts, "verdict_class": "budget", "held_class": "urgent",
                         "sender": "Sarah Chen",
-                        "event": {"source": "imessage", "rowid": 1, "handle": "+14155551234",
+                        "event": {"source": "imessage", "rowid": 1, "handle": "+14155550107",
                                   "timestamp": ts}})]
     _write(os.path.join(str(tmp_path), "events", "queue.jsonl"), "\n".join(rows) + "\n")
     try:
@@ -1369,7 +1369,7 @@ def test_master_card_reads_the_file_and_writes_through_the_one_writer(tmp_path):
     _write(fake, FAKE_MASTER_CLI.format(rec=rec))
     m._find_sotto_script = lambda *rel: fake
     _write(os.path.join(str(tmp_path), "knowledge", "master.md"),
-           "## About\nA partner at FPV.\n\n## Procedures\n- Never book Fridays.\n")
+           "## About\nA partner at HBR.\n\n## Procedures\n- Never book Fridays.\n")
     try:
         cookie, authed = _login_with_csrf(base)
         code, body, _ = _get(base, "/api/master", headers=cookie)

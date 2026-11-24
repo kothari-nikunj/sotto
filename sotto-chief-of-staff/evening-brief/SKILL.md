@@ -18,7 +18,8 @@ with kind evening runs the same pipeline, including its deliver-once gate. For c
 call the tool and stop after the receipt; never promise a queued brief without it or compose a
 replacement recap yourself. The evening pass
 differs in these ways:
-- **It composes with the evening type.** That is what turns on the evening-only **Evening
+- **It composes with the evening type.** The shared composer uses the same extraction prompt
+  as the morning brief. The evening type turns on **Evening
   Accountability** section — checking this morning's commitments against today's data for
   follow-through. With the wrong type that section silently disappears.
 - **Emphasize open loops**: nothing extra to run — the composer already reads the ledger itself (via `ledger_io`) and renders the open loops into the extraction. Do not add a `loops-query` read to the brief: the composer owns that section, and a second copy pasted in is a second version of the truth.
@@ -49,7 +50,8 @@ differs in these ways:
   loop is ONE quiet count line pointing at `/app#loops`; the composer appends the urgent misses (one
   line per person) and that count. Never write your own list of what is still open — the evening
   brief that inventoried 14 rows for 7 real debts is the bug this rule closes. A quiet evening says
-  so in one line instead of omitting the sections.
+  so in one line. If an expected source returned a partial result or failed, keep the quiet line
+  within the checked scope and name the source gap once.
 - **The Granola gather (step 1) is the same** — its default 36-hour transcript window already covers today's ended meetings, which is what feeds the merged followup pass below.
 - **The evening brief is the ONE end-of-day report — it carries the post-meeting followup content.**
   The standalone 16:45 followup job is retired; the same commitments/drafts extraction

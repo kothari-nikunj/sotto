@@ -10,7 +10,7 @@ import { ReceiptedDelivery } from '../src/delivery.js';
 import type { Receipt, Send } from '../src/channels/types.js';
 import type { RouteIdentity } from '../src/route-proof.js';
 import { routeDigest } from '../src/route-proof.js';
-import { createTelegramTransport } from '../src/channels/transport.js';
+import { createPhotonTransport, createTelegramTransport, type PhotonAdapterLike } from '../src/channels/transport.js';
 
 const routeIdentity: RouteIdentity = { channel: 'photon', tenantId: 'fixture-tenant',
   projectFingerprint: 'a'.repeat(64), ownerId: 'owner-1', accountId: 'account-1', lineKey: 'line-1' };
@@ -325,5 +325,81 @@ test('legacy and corrupt route rows never acquire proof from the current map', a
     assert.equal((await f.delivery.sendText({ dispatch_id: 'legacy-unknown', target: 'owner',
       text: 'unknown', attempt: 2 })).route_digest, undefined);
     assert.equal(calls, 1);
+  } finally { f.close(); }
+});
+
+test('expired prep text and gallery cannot contact the provider, and accepted receipts survive the cutoff', async () => {
+  let calls = 0;
+  const f = fixture(async () => { calls++; return { acceptance: 'accepted', providerMessageIds: ['prep'] }; });
+  try {
+    const expired = Date.now() - 1;
+    assert.deepEqual(await f.delivery.sendText({ ...request, valid_until_ms: expired }), { acceptance: 'not_attempted' });
+    const gallery = { dispatch_id: 'prep-gallery', target: 'owner', summary: 'Meeting prep',
+      images: [1, 2, 3, 4].map(index => ({ name: `0${index}.png`, bytes: Buffer.from([index]) })) };
+    assert.deepEqual(await f.delivery.sendGalleryBytes({ ...gallery, valid_until_ms: expired }), { acceptance: 'not_attempted' });
+    assert.equal(calls, 0);
+    assert.equal(f.delivery.getReceipt(request.dispatch_id).found, false);
+    const receipt = await f.delivery.sendText({ ...request, valid_until_ms: Date.now() + 60_000 });
+    assert.equal(receipt.acceptance, 'accepted');
+    assert.deepEqual(await f.delivery.sendText({ ...request, valid_until_ms: expired }), receipt);
+    assert.equal(calls, 1);
+  } finally { f.close(); }
+});
+
+test('a deadline crossed while reserving the dispatch leaves no provider send or uncertain receipt', async t => {
+  const f = fixture(async () => assert.fail('expired prep reached the provider'));
+  try {
+    const start = Date.now();
+    const begin = f.journal.beginDispatch.bind(f.journal);
+    t.mock.method(f.journal, 'beginDispatch', (...args: Parameters<typeof begin>) => {
+      const attempt = begin(...args);
+      t.mock.method(Date, 'now', () => start + 60_000);
+      return attempt;
+    });
+    const result = await f.delivery.sendText({ ...request, valid_until_ms: start + 60_000 });
+    assert.equal(result.acceptance, 'not_attempted');
+    assert.equal(f.delivery.getReceipt(request.dispatch_id).receipt?.acceptance, 'rejected');
+  } finally { f.close(); }
+});
+
+
+for (const stage of ['formatting','gallery lookup','provider acknowledgment'] as const)
+  test(`prep deadline at Photon handoff: ${stage}`, async t => {
+    let now = Date.now(), posts = 0;
+    const deadline = now + 1000;
+    t.mock.method(Date, 'now', () => now);
+    const post = async () => { posts++; now=deadline; return { id:'fictional-receipt' }; };
+    const adapter = {postMessage:post, app:{send:post}, decodeThreadId:()=>({chatGuid:'fixture'}),
+      encodeThreadId:()=>'owner-dm'} as unknown as PhotonAdapterLike;
+    const transport = createPhotonTransport(adapter, {
+      formatText:async body => { if (stage === 'formatting') now=deadline; return body; },
+      gallerySpace:async () => { now=deadline; return {send:post}; },
+    });
+    const f = fixture(transport.send);
+    try {
+      const result = stage === 'gallery lookup'
+        ? await f.delivery.sendGalleryBytes({dispatch_id:'gallery',target:'owner',summary:'Meeting prep',
+            images:[1,2,3,4].map(i=>({name:`0${i}.png`,bytes:Buffer.from([i])})),valid_until_ms:deadline})
+        : await f.delivery.sendText({...request,valid_until_ms:deadline});
+      assert.equal(posts,stage === 'provider acknowledgment' ? 1 : 0);
+      assert.equal(result.acceptance,stage === 'provider acknowledgment' ? 'accepted' : 'rejected');
+    } finally { f.close(); }
+  });
+
+test('Telegram prep crossing its deadline between chunks holds the accepted prefix', async t => {
+  let now = Date.now(), posts = 0;
+  const deadline = now + 1000;
+  t.mock.method(Date, 'now', () => now);
+  const transport = createTelegramTransport({postMessage:async () => {
+    now=deadline; return {id:`part-${++posts}`} as never;
+  }});
+  const f=fixture(transport.send,{...routeIdentity,channel:'telegram',projectFingerprint:''});
+  try {
+    const input={...request,text:'x'.repeat(9000),valid_until_ms:deadline};
+    const partial=await f.delivery.sendText(input);
+    assert.equal(posts,1);
+    assert.deepEqual(partial,{acceptance:'unknown',message_ids:['part-1']});
+    assert.deepEqual(await f.delivery.sendText({...input,attempt:2}),partial);
+    assert.equal(posts,1);
   } finally { f.close(); }
 });

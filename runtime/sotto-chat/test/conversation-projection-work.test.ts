@@ -56,18 +56,19 @@ test('old frozen dispatches avoid journal rereads while failed receipts can reco
   const background=journal.acceptedBackgroundMessage.bind(journal),getInbound=journal.getInbound.bind(journal);
   journal.acceptedBackgroundMessage=(...args)=>{checks++;return background(...args);};
   journal.getInbound=(...args)=>{reads++;return getInbound(...args);};
-  const scope=(t:string)=>createHash('sha256').update(JSON.stringify(['account','line','telegram',t])).digest('hex');
+  const scope=(t:string)=>createHash('sha256').update(JSON.stringify(['account','line','photon',t])).digest('hex');
   const memory=new AcceptedConversationMemory({journal,ownerId:'owner',threadFor:()=>String(sessionStartedAt),scopeThread:scope,
     routeDigestForThread:()=> 'b'.repeat(64),sessionStartedAt:()=>sessionStartedAt,reset:async()=>{},
     project:async input=>{batches.push(input);return 'settled';}});
   const seed=(id:string,createdAt:number,status='accepted')=>{
     journal.prepareDispatch({dispatchId:id,kind:'scheduled_text',destination:'owner',payload:JSON.stringify({text:`Background ${id}`}),routeDigest:'b'.repeat(64),sourceRevision:'a'.repeat(64)});
-    journal.db.prepare('UPDATE dispatches SET created_at=?,updated_at=200,status=?,provider_message_id=?,provider_message_ids=? WHERE id=?')
-      .run(createdAt,status,id,JSON.stringify([id]),id);
-    const admitted=journal.admitInbound({eventId:id,accountKey:'account',lineKey:'line',threadKey:'thread',channel:'telegram',sender:'owner',
-      payload:JSON.stringify({inbound:{text:`Owner ${id}`,replyBound:true,replyToMessageId:id}})});
-    journal.db.prepare('UPDATE inbound_events SET received_at=300,continuation_json=? WHERE id=?')
-      .run(JSON.stringify({quoted_context:true,dispatch_id:id,provider_message_id:id,route_digest:'b'.repeat(64)}),String(admitted.event.id));
+    journal.db.prepare("UPDATE dispatches SET created_at=?,updated_at=200,status='accepted',provider_message_id=?,provider_message_ids=?,provider_sent_at_ms=200 WHERE id=?")
+      .run(createdAt,id,JSON.stringify([id]),id);
+    const admitted=journal.admitInbound({eventId:id,accountKey:'account',lineKey:'line',threadKey:'thread',channel:'photon',sender:'owner',
+      payload:JSON.stringify({inbound:{channel:'photon',text:`Owner ${id}`,replyBound:true,replyToMessageId:id,providerSentAtMs:300}}),
+      continuation:{routeDigest:'b'.repeat(64),providerSentAtMs:300}});
+    journal.db.prepare('UPDATE inbound_events SET received_at=300 WHERE id=?').run(String(admitted.event.id));
+    if(status!=='accepted')journal.db.prepare('UPDATE dispatches SET status=? WHERE id=?').run(status,id);
   };
   try{
     for(let i=0;i<200;i++)seed(`old-${i}`,99);

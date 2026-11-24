@@ -55,6 +55,8 @@ def snooze_row(it: dict, days: int, today: str) -> str:
     it["snoozed_until"] = until
     if not ledger_io.is_waiting_on(it.get("action_type")):
         cr.unpark(it, today)
+    else:
+        it.pop("handoff_asked_at", None)  # snoozed: after it the loop may be named again
     return until
 
 
@@ -99,13 +101,13 @@ def _apply_unlocked(action: str, anchor_key: str, days: int = 7) -> dict:
     if action == "snooze":
         # Calendar-day intent follows the configured local date, not the Railway host's UTC day.
         until = snooze_row(it, days, today)
-        cr._persist(it)
+        cr._persist(it, owner_label="snooze")
         return {"ok": True, "action": "snooze", "anchor_key": anchor_key,
                 "detail": f"hidden until {until}"}
     if action == "keep":
         result = keep_row(it, today)
         result["anchor_key"] = anchor_key
-        cr._persist(it)
+        cr._persist(it, owner_label="keep")
         return result
     return {"ok": False, "detail": f"unknown action: {action}"}
 

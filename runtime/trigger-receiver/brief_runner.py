@@ -16,7 +16,6 @@ import uuid
 from datetime import datetime, timezone
 
 PREPARATION_MAX_AGE_SECONDS = 30 * 60
-# A saved composition older than this is re-gathered, not resent: its greeting and its "today" have aged.
 ARTIFACT_MAX_AGE_SECONDS = 2 * 3600
 NOTES_CACHE_MAX_AGE_SECONDS = 24 * 3600
 WELCOME_SEED_BUDGET_SECONDS = 20
@@ -34,7 +33,6 @@ class BriefModelBudgetError(Exception):
 
 
 def _stage_prep_offer(artifact, persist=lambda artifact: None):
-    """Only the rendered, source-bound single offer joins existing accepted-delivery effects."""
     offer = artifact.get('_prep_offer')
     if not isinstance(offer, dict):
         return
@@ -42,9 +40,8 @@ def _stage_prep_offer(artifact, persist=lambda artifact: None):
         import delivery_effects
         import pending_offer
         from source_context import allowed
-        if (not delivery_effects.run_id() or not allowed('calendar')
-                or 'calendar' not in artifact.get('_source_permissions', [])
-                or not isinstance(offer, dict) or set(offer) != {'person', 'question', 'meeting', 'ambiguous'}
+        if (not delivery_effects.run_id() or not allowed('calendar') or 'calendar' not in artifact.get('_source_permissions', [])
+                or set(offer) != {'person', 'question', 'meeting', 'ambiguous'}
                 or type(offer['ambiguous']) is not bool
                 or not isinstance(offer['person'], str) or not offer['person']
                 or not isinstance(offer['question'], str) or not offer['question']
@@ -72,10 +69,8 @@ def _stage_prep_offer(artifact, persist=lambda artifact: None):
     except Exception as error:  # optional assistance must never hold the brief
         print(f'[brief_runner] prep offer skipped: {type(error).__name__}', file=sys.stderr)
 
-
 class BriefModelOutcomeUncertainError(Exception):
     """An upstream brief timeout must not start another paid generation."""
-
 
 class BriefModelAdmissionBusyError(Exception):
     """The shared proxy refused an unbilled attempt; durable work retries within its deadline."""
@@ -94,7 +89,8 @@ def _generation_lock(scratch):
 
 def run(request):
     pack = Path(request['pack'])
-    sys.path.insert(0, str(pack / '_shared' / 'lib'))
+    sys.path[:0] = [str(pack / '_shared' / part) for part in ('lib', 'scripts')]
+    import brief_followup_offer
     import jsonstore
     import work_queue
     from brief_evidence import project_learning_payload
@@ -103,9 +99,10 @@ def run(request):
     from source_context import (allowed, email_dependency_sources, project_emails, project_local,
                                 project_x, read_local, record_bridge_status, used_sources)
     from local_snapshot import resolve_effective_local
+    import brief_window
     from calendar_context import meeting_events, user_participates
     from textutil import unwrap_tool_result
-    from timeutil import configured_tz, _user_local_date
+    from timeutil import _now_local, _user_local_date, configured_tz, configured_user_email
 
     root = Path(os.environ.get('SOTTO_DATA', '/data'))
     day = request.get('day') or _user_local_date(configured_tz())
@@ -181,10 +178,7 @@ def run(request):
         sources = artifact.get('_source_permissions', [])
         if (any(not allowed(source) for source in sources)
                 or (request.get('history_discovery') and artifact.get('_composition_proof') != composition_proof)):
-            # The saved composition read a source the user has since switched off. It must not
-            # be delivered — and it must not be RELOADED either: every retry found the same
-            # artifact and raised the same error until the job went terminal and the day's brief
-            # never came. Discard it here, so the retry composes afresh under current consent.
+            # It read a source since switched off: never deliver or reload it; recompose under consent.
             (scratch / 'artifact.json').unlink(missing_ok=True)
             raise RuntimeError('source permission changed; a fresh brief is required')
         delivery_effects.stage([{'kind': 'source_permissions', 'sources': sources,
@@ -193,10 +187,10 @@ def run(request):
                                  float(artifact.get('composed_at') or 0) + ARTIFACT_MAX_AGE_SECONDS},
                                 *artifact.get('_calendar_eligibility', []),
                                 *artifact.get('_parking_notices', []),
+                                *([artifact['_brief_named']] if artifact.get('_brief_named') else []),
                                 *([artifact['_review_candidate']] if artifact.get('_review_candidate') else [])])
-        if artifact.get('_prep_offer'):
-            sys.path.insert(0, str(pack / '_shared' / 'scripts'))
-            _stage_prep_offer(artifact, lambda value: save(scratch / 'artifact.json', value))
+        _stage_prep_offer(artifact, lambda v: save(scratch / 'artifact.json', v))
+        brief_followup_offer.stage_offer(artifact)
 
     def learn(paths, phase):
         local = project_local(load(paths['local'], {}))
@@ -205,7 +199,7 @@ def run(request):
         if isinstance(continuity, dict):
             continuity['local'] = local
             if not allowed('calendar'):
-                continuity['events'] = []
+                continuity.update(events=[], calendar_cancellations=[], calendar_observation=None)
         gmail = project_emails(load(paths['gmail'], []))
         save(paths['gmail'], gmail)
         if isinstance(continuity, dict):
@@ -405,11 +399,8 @@ def run(request):
     with _generation_lock(scratch):
         artifact = load(scratch / 'artifact.json', {})
         previous_artifact = artifact
-        # A retry hours later must not resend the 6:30 composition: the greeting and every "today"
-        # in it were stamped at compose time, so past ARTIFACT_MAX_AGE_SECONDS the saved artifact is
-        # treated as absent and this run gathers and composes afresh. Still the SAME brief — the
-        # day, the work key, the deliver-once marker and not_before are untouched, and the marker is
-        # claimed at the send seam, so a fresher artifact for an undelivered day cannot double-send.
+        # Past ARTIFACT_MAX_AGE_SECONDS "today" has aged: gather and compose afresh. Same brief (day,
+        # work key, deliver-once marker claimed at the send seam), so it cannot double-send.
         if (artifact.get('_closure_uncommitted') or
                 time.time() - float(artifact.get('composed_at') or 0) > ARTIFACT_MAX_AGE_SECONDS):
             artifact = {}
@@ -434,33 +425,36 @@ def run(request):
             shutil.rmtree(scratch / 'current', ignore_errors=True)
             paths = paths_at(scratch / 'current')
             payload_path = request.get('payload_path')
+            window_hours = 168 if request['kind'] == 'welcome' else brief_window.local_hours()
             if payload_path:
                 staged = json.loads(Path(payload_path).read_text())
                 local = staged.get('local_data', staged)
             else:
-                local = read_local(168 if request['kind'] == 'welcome' else 24)
+                local = read_local(window_hours)
             local = unwrap_tool_result(local)
+            read_status = dict(local.get('source_status') or {}) if isinstance(local, dict) else {}
             record_bridge_status(local)
             local = resolve_effective_local(project_local(local))
+            local_read = [s for s, status in read_status.items() if status in ('ok', 'partial')
+                          and s not in (local.get('_source_failed') or {}) and not s.startswith('deferred_unread_')]
             save(paths['local'], local)
             consumed_sources = set(used_sources(local, already_projected=True))
             if discovery:
                 consumed_sources.update(discovery['sources'])
-            # The pinned Google search makes a metadata GET for every hit. The former two
-            # 200-hit slices cost 8,000 quota units before reading a single body (new Google
-            # projects allow 6,000/user/minute). Keep a seven-day starter sample, both date
-            # slices and the sent lane; capped slices are disclosed by the source receipt.
-            # With 50 hits/slice and 20 bodies, even the attachment/fallback allowance stays
-            # below 5,000 units. Concurrent jobs can still hit quota and must report partial.
-            extra = ['--window-days', '7', '--max', '50', '--bodies', '20'] if request['kind'] == 'welcome' else []
+            # Every pinned search hit costs a metadata GET (6,000 quota units/user/minute): the welcome
+            # sample keeps 50 hits/slice and 20 bodies, under 5,000 units; caps are disclosed as partial.
+            # A daily brief after a missed run reads Gmail back to its last success (brief_window).
+            extra = (['--window-days', '7', '--max', '50', '--bodies', '20'] if request['kind'] == 'welcome'
+                     else ['--catch-up-days', brief_window.days('gmail')])
             command('_shared/scripts/gather_google.py', '--gmail-out', paths['gmail'], '--cal-out', paths['cal'],
                     '--source-results-out', paths['source_results'], '--loop-local', paths['local'], *extra)
-            # Source status is required for an honest current brief, even when legacy arrays are empty.
+            # Legacy arrays cannot prove a current source read.
             source_results = load(paths['source_results'], {})
             if not source_results:
                 raise RuntimeError('gather omitted source observation receipts')
-            # A grant can change while Google is gathering. Do not let an earlier file reach
-            # seeding, knowledge query, or the pre-compose resolver under a revoked grant.
+            cancellations = source_results.get('calendar', {}).pop('loop_cancellations', [])
+            save(paths['source_results'], source_results)
+            # Recheck grants before seeding or resolution.
             local = project_local(load(paths['local'], {}))
             save(paths['local'], local)
             gmail = project_emails(load(paths['gmail'], []))
@@ -487,8 +481,7 @@ def run(request):
                 save(paths['granola'], cached_notes())
             if not allowed('granola'):
                 save(paths['granola'], {'meetings': []})
-            # Prepared attendee research and X context were selected from Calendar. A source
-            # toggle after preparation must not carry those names into a new composition.
+            # Recheck consent before using Calendar-derived preparation.
             if not allowed('calendar'):
                 save(paths['research'], {'attendees': []})
                 save(paths['x'], {})
@@ -528,7 +521,9 @@ def run(request):
                         '--local', paths['local'], output=paths['knowledge'])
             if any(not allowed(source) for source in consumed_sources):
                 raise RuntimeError('source permission changed during brief preparation')
-            continuity = {'today': day, 'signals': {}, 'local': local, 'emails': emails, 'events': events}
+            continuity = dict(today=day, signals={}, local=local, emails=emails, events=events,
+                              calendar_cancellations=cancellations if allowed('calendar') else [],
+                              calendar_observation=source_results.get('calendar'))
             save(paths['continuity'], continuity)
             command('morning-brief/scripts/continuity_resolve.py', '--resolve-only', paths['continuity'])
             discovery_args = []
@@ -543,19 +538,23 @@ def run(request):
                 '--local', paths['local'], '--local-resolved', '--effective-local-out', paths['local'],
                 '--gmail', paths['gmail'], '--calendar', paths['cal'],
                 '--granola', paths['granola'], '--knowledge', paths['knowledge'],
-                '--source-results', paths['source_results'],
+                '--source-results', paths['source_results'], '--window-hours', window_hours,
                 '--attendee-research', paths['research'], '--x-context', paths['x'], *discovery_args, *direction_args))
             if not isinstance(composed.get('brief_text'), str) or not composed['brief_text'].strip():
                 raise RuntimeError('composer produced no chat text')
+            brief_window.record(local_read + (['gmail'] if source_results.get('gmail', {}).get('status')
+                                              in ('ok', 'partial') else []), coverage_until)
             # Compose can heal a partial Bridge read with permitted cached sources. Its preview
             # and the later durable resolver must inspect the same rows and source provenance.
             local = project_local(load(paths['local'], {}))
             save(paths['local'], local)
             continuity['local'] = local
-            # Keep every source that earlier stages actually consumed. Rechecking only the
-            # composer's currently permitted rows could erase a source revoked mid-run.
-            composed['_source_permissions'] = sorted(consumed_sources | set(
-                composed.get('_source_permissions') or []))
+            composed['_source_permissions'] = sorted(consumed_sources | set(composed.get('_source_permissions') or []))
+            gmail_result = source_results.get('gmail', {})
+            if (request['kind'] != 'welcome' and gmail_result.get('status') in ('ok', 'partial')
+                    and gmail_result.get('error') != 'rate_limited'):
+                brief_followup_offer.append_offer(composed, load(paths['granola'], {}).get('meetings', []),
+                    gmail, configured_user_email(), _now_local(configured_tz()))
             composed['_source_cutoff'] = coverage_until
             if discovery:
                 composed['_composition_proof'] = composition_proof
@@ -653,7 +652,6 @@ def run(request):
                     raise RuntimeError('required learning retry admission failed') from error
                 print(f'[brief_runner] learning follow-up admission failed: {type(error).__name__}',
                       file=sys.stderr)
-        # Bind reusable content to exact delivery jobs. Only accepted outbox IDs may replay it.
         run_id = os.environ.get('SOTTO_DELIVERY_RUN_ID', '')
         if len(run_id) == 32 and all(c in '0123456789abcdef' for c in run_id):
             artifact['_delivery_run_ids'] = list(dict.fromkeys([

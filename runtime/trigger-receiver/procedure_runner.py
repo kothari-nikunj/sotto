@@ -221,7 +221,9 @@ def run(request):
             return 'NO_NUDGES'
         import compose_notification
         guard()
-        output = compose_notification.compose('proactive', result['nudges'])
+        from delivered_tasks import compose_nudge
+        output = (compose_notification.compose('proactive', result['nudges']) if attended else
+                  compose_nudge(compose_notification.compose, result['nudges'], effects))
         guard()
         return output
     if request['kind'] == 'digest':
@@ -237,9 +239,20 @@ def run(request):
         effects = [{'kind': 'digest_accept', 'item_ids': item_ids}, *(result.get('effects') or [])]
         if result.get('valid_until') is not None:
             effects.append({'kind': 'eligibility', 'valid_until': result['valid_until']})
+        lines = []
+        for item in result['items']:
+            excerpt = item['excerpt']
+            label = item['display_sender']
+            if item.get('status') == 'waiting':
+                label = 'Waiting for a reply'
+                if sender := item.get('request_sender'):
+                    label += f' about the request from {sender}'
+                label += '. You wrote'
+            lines.append(f'{label}: “{excerpt}”')
+        if not lines:
+            return 'NO_NUDGES'
         stage(effects)
-        lines = [f"{item['sender']}: {item['why']}" for item in result.get('items') or []]
-        return 'Midday catch-up\n\n' + '\n\n'.join(lines) if lines else 'NO_NUDGES'
+        return 'Midday catch-up\n\n' + '\n\n'.join(lines)
     raise ValueError('unknown scheduled procedure')
 
 

@@ -29,7 +29,7 @@ def _seed(tmp_path, *, status="open"):
         "action_type": "reply",
         "channel": "imessage",
         "contact_name": "Maya",
-        "contact_identifier": "+14155551234",
+        "contact_identifier": "+14155550107",
         "summary": "Send the deck",
         "created_at": "2026-09-01 09:00:00",
     }
@@ -60,7 +60,7 @@ def test_retune_preserves_created_at_and_earlier_completion_evidence(tmp_path, m
     else:
         assert row["snoozed_until"] == "2026-10-18"
 
-    message = {"rowid": 7, "handle": "+14155551234", "is_from_me": True,
+    message = {"rowid": 7, "handle": "+14155550107", "is_from_me": True,
                "timestamp": "2026-09-10 12:00:00", "text": "Sent the deck."}
     update = {"evidence": [{"sourceType": "imessage", "sourceId": "7",
                             "snippet": "Sent the deck."}]}

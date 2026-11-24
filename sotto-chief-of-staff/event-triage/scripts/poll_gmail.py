@@ -36,6 +36,9 @@ if _SHARED_LIB not in sys.path:
     sys.path.insert(0, _SHARED_LIB)
 from gmail_read import fetch_message, gmail_service  # noqa: E402
 
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "_shared", "scripts"))
+from gather_google import mark_sent  # noqa: E402
+
 GMAIL_SEEN_MAX = 1000   # ring size — 20 msgs/poll × ~1h windows leaves plenty of overlap margin
 SEARCH_QUERY = "in:inbox"
 SEARCH_MAX = 70
@@ -286,6 +289,7 @@ def poll() -> list:
                 ev["_sotto_catchup"] = True
             if mid in sent_ids:
                 ev["is_from_me"] = True
+                mark_sent(ev)  # the readers that grade a send read isSent / SENT, not is_from_me
             events.append(ev)
         if deferred:
             _diag(f"[poll_gmail] deferred {deferred} message(s) after full-read failure")

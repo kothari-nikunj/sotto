@@ -4,6 +4,11 @@ export class ActionHeldError extends Error {
   constructor() { super('Action outcome is unknown; reconciliation is required before another attempt.'); }
 }
 
+/** Writes need one owner message; this is the explanation the model relays when messages arrived together. */
+export class OneMessageRequiredError extends Error {
+  constructor() { super('Nothing changed: messages that arrived together cannot start a change. Ask the owner to send this request again as one message.'); }
+}
+
 function canonicalJson(value: unknown): string {
   const seen = new Set<object>();
   function stable(input: unknown): unknown {

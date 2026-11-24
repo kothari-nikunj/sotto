@@ -34,20 +34,20 @@ def test_continuity_anchor_key_composite():
 
 
 def test_continuity_anchor_phone_vs_email_and_call_back_family():
-    # Same person reached by +1 (415) 555-1234 vs 4155551234 must anchor-match (last-10 digits).
+    # Same person reached by +1 (415) 555-0107 vs 4155550107 must anchor-match (last-10 digits).
     a = cr.compute_anchor_key({"channel": "imessage", "action_type": "reply",
-                               "contact_identifier": "+1 (415) 555-1234", "contact_name": "Jo"})
+                               "contact_identifier": "+1 (415) 555-0107", "contact_name": "Jo"})
     b = cr.compute_anchor_key({"channel": "imessage", "action_type": "call_back",
-                               "contact_identifier": "4155551234", "contact_name": "Jo"})
-    assert a == b == "follow_up:id:4155551234"  # call_back in the follow_up family, channel-free
+                               "contact_identifier": "4155550107", "contact_name": "Jo"})
+    assert a == b == "follow_up:id:4155550107"  # call_back in the follow_up family, channel-free
 
 
 def test_continuity_camelcase_actions_normalize():
     # The brief emits camelCase actionItems — they must not collapse to "::".
     ak = cr.compute_anchor_key(cr._normalize_action(
         {"type": "reply", "channel": "imessage", "contactName": "Sarah",
-         "contactIdentifier": "+14155551234"}))
-    assert ak == "follow_up:id:4155551234"
+         "contactIdentifier": "+14155550107"}))
+    assert ak == "follow_up:id:4155550107"
     assert ak != "::"
 
 
@@ -59,9 +59,9 @@ def test_continuity_passed_meeting():
     assert not cr.meeting_passed("2026-06-25 10:00", "2026-06-19", "2026-06-23")
 
 
-def test_continuity_camelcase_thread_reply_signal_does_not_resolve(tmp_path):
+def test_continuity_camelcase_thread_reply_signal_does_not_resolve(tmp_path, monkeypatch):
     # A generic thread reply signal is not task-specific completion evidence.
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     payload = {"today": "2026-06-23", "signals": {"replied_thread_ids": ["t-cc"]},
                "new_actions": [{"type": "reply", "channel": "gmail", "contactName": "Sarah",
                                 "contactIdentifier": "sarah@acme.com", "emailThreadId": "t-cc",
@@ -70,27 +70,27 @@ def test_continuity_camelcase_thread_reply_signal_does_not_resolve(tmp_path):
     assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_age_does_not_expire_an_obligation(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_continuity_age_does_not_expire_an_obligation(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     cr.resolve({"today": "2026-06-10", "new_actions": [
-        {"type": "reply", "channel": "imessage", "contactName": "Old", "contactIdentifier": "+14155550000",
+        {"type": "reply", "channel": "imessage", "contactName": "Old", "contactIdentifier": "+14155550102",
          "contextSummary": "Old still owes a reply on the Q3 deck"}]}, datetime(2026, 6, 10, 9, 0, 0))
     out = cr.resolve({"today": "2026-06-23"}, NOW)
     assert out["expired"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_deadline_does_not_expire_an_obligation(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_continuity_deadline_does_not_expire_an_obligation(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     out = cr.resolve({"today": "2026-06-23", "new_actions": [
         {"type": "follow_up", "channel": "gmail", "contactName": "DL", "contactIdentifier": "dl@x.com",
          "deadlineDate": "2026-06-19", "contextSummary": "DL owes the signed contract"}]}, NOW)
     assert out["expired"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_snoozed_loop_not_surfaced(tmp_path):
+def test_continuity_snoozed_loop_not_surfaced(tmp_path, monkeypatch):
     # A user-snoozed loop (created today so age can't expire it) is kept on disk but NOT surfaced as
     # active until the snooze date passes. Source-of-truth for sotto-loops' snooze.
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     out1 = cr.resolve({"today": "2026-06-23", "new_actions": [
         {"type": "reply", "channel": "gmail", "contactName": "Zoe", "contactIdentifier": "zoe@x.com",
          "contextSummary": "Zoe asked for the pricing sheet"}]}, NOW)
@@ -108,11 +108,11 @@ def test_continuity_snoozed_loop_not_surfaced(tmp_path):
     assert any(a["contact_name"] == "Zoe" for a in out3["active"])
 
 
-def test_continuity_meeting_resolves_not_expires(tmp_path):
+def test_continuity_meeting_resolves_not_expires(tmp_path, monkeypatch):
     # Meeting actions no longer CREATE loops (calendar shadows aren't debts) — but LEGACY
     # entries on existing volumes must still close via the meeting-passed resolver rather
     # than expiring. Seed the legacy file directly, as a pre-fix volume would carry it.
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     legacy = {"anchor_key": "calendar:meeting_prep:id:ev1", "action_type": "meeting_prep",
               "channel": "calendar", "contact_name": "Pitch", "contact_identifier": "ev1",
               "status": "open", "created_at": "2026-06-21", "times_surfaced": 1,
@@ -124,45 +124,45 @@ def test_continuity_meeting_resolves_not_expires(tmp_path):
     assert any(r["resolution"] == "meeting_passed" and r["status"] == "resolved" for r in out["resolved"])
 
 
-def test_continuity_generic_handled_signal_does_not_resolve(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_continuity_generic_handled_signal_does_not_resolve(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     cr.resolve({"today": "2026-06-23", "new_actions": [
-        {"type": "reply", "channel": "imessage", "contactName": "Han", "contactIdentifier": "+14155551111",
+        {"type": "reply", "channel": "imessage", "contactName": "Han", "contactIdentifier": "+14155550106",
          "contextSummary": "owe a reply"}]}, NOW)
     out = cr.resolve({"today": "2026-06-23",
-                      "signals": {"handled": [{"identifier": "4155551111", "channel": "imessage"}]}}, NOW)
+                      "signals": {"handled": [{"identifier": "4155550106", "channel": "imessage"}]}}, NOW)
     assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_cross_channel_reply_needs_task_specific_update(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_continuity_cross_channel_reply_needs_task_specific_update(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     cr.resolve({"today": "2026-06-23", "new_actions": [
         {"type": "reply", "channel": "gmail", "contactName": "Dhruv", "contactIdentifier": "dhruv@acme.com",
          "emailThreadId": "tA", "contextSummary": "owe the LOI reply", "created_at": "2026-06-23 08:00:00"}]}, NOW)
     out = cr.resolve({"today": "2026-06-24",
-        "local": {"contacts": [{"name": "Dhruv", "emails": ["dhruv@acme.com"], "phones": ["+14155552222"]}],
-                  "imessage": [{"is_from_me": True, "handle": "+14155552222",
+        "local": {"contacts": [{"name": "Dhruv", "emails": ["dhruv@acme.com"], "phones": ["+14155550109"]}],
+                  "imessage": [{"is_from_me": True, "handle": "+14155550109",
                                 "timestamp": "2026-06-23 20:00:00", "text": "sent the LOI"}]}},
         datetime(2026, 6, 24, 9, 0, 0))
     assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_callback_needs_explicit_task_completion(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_continuity_callback_needs_explicit_task_completion(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     cr.resolve({"today": "2026-06-23", "new_actions": [
-        {"type": "call_back", "channel": "phone", "contactName": "Dad", "contactIdentifier": "+14155559999",
+        {"type": "call_back", "channel": "phone", "contactName": "Dad", "contactIdentifier": "+14155550116",
          "contextSummary": "call dad back", "created_at": "2026-06-23 08:00:00"}]}, NOW)
     out = cr.resolve({"today": "2026-06-24",
-        "local": {"calls": [{"is_outgoing": True, "phone": "+14155559999", "timestamp": "2026-06-23 19:00:00"}]}},
+        "local": {"calls": [{"is_outgoing": True, "phone": "+14155550116", "timestamp": "2026-06-23 19:00:00"}]}},
         datetime(2026, 6, 24, 9, 0, 0))
     assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_cross_channel_no_false_positive(tmp_path):
+def test_continuity_cross_channel_no_false_positive(tmp_path, monkeypatch):
     # An outgoing message to a DIFFERENT person must not resolve the loop.
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     cr.resolve({"today": "2026-06-23", "new_actions": [
-        {"type": "reply", "channel": "imessage", "contactName": "Dhruv", "contactIdentifier": "+14155552222",
+        {"type": "reply", "channel": "imessage", "contactName": "Dhruv", "contactIdentifier": "+14155550109",
          "contextSummary": "owe a reply", "created_at": "2026-06-23 08:00:00"}]}, NOW)
     out = cr.resolve({"today": "2026-06-24",
         "local": {"imessage": [{"is_from_me": True, "handle": "+19998887777",
@@ -172,8 +172,8 @@ def test_continuity_cross_channel_no_false_positive(tmp_path):
     assert not out["resolved"]
 
 
-def test_continuity_replied_thread_signal_does_not_resolve(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_continuity_replied_thread_signal_does_not_resolve(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     payload = {"today": "2026-06-23",
                "signals": {"replied_thread_ids": ["t1"]},
                "new_actions": [{"action_type": "reply", "channel": "email", "contact_name": "Sarah",
@@ -182,8 +182,8 @@ def test_continuity_replied_thread_signal_does_not_resolve(tmp_path):
     assert out["resolved"] == [] and len(out["active"]) == 1
 
 
-def test_continuity_dedup_does_not_claim_delivery(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_continuity_dedup_does_not_claim_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     a = {"action_type": "reply", "channel": "email", "contact_name": "Sarah", "source_thread_id": "t9", "summary": "Sarah asked about the term sheet"}
     cr.resolve({"today": "2026-06-23", "new_actions": [a]}, NOW)
     out = cr.resolve({"today": "2026-06-23", "new_actions": [a]}, NOW)
@@ -193,8 +193,8 @@ def test_continuity_dedup_does_not_claim_delivery(tmp_path):
 
 
 
-def test_log_outcome_rejects_invalid(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_log_outcome_rejects_invalid(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     try:
         lo.log({"outcome": "nonsense"})
         assert False
@@ -210,8 +210,8 @@ _SARAH = [
 ]
 
 
-def test_style_extract_v2_seeds_canonical_buckets(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_style_extract_v2_seeds_canonical_buckets(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract({"sent_messages": _SARAH + [
         {"text": "Hi team, here is the Q3 update. Numbers look strong this quarter. Best", "channel": "email", "work": True}]})
     style = json.load(open(os.path.join(str(tmp_path), "style.json")))
@@ -222,24 +222,24 @@ def test_style_extract_v2_seeds_canonical_buckets(tmp_path):
     assert "c_sarah" in style["per_person"]                  # >=2 samples → per-person profile
 
 
-def test_style_apply_injects_verbatim_samples(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_style_apply_injects_verbatim_samples(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract({"sent_messages": _SARAH})
     out = sa.apply({"recipient": "sarah@acme.com", "channel": "imessage", "canonical_id": "c_sarah"})
     assert out["source"] == "per_person"
     assert "send the deck by Friday" in out["guidance"]      # a real message is quoted, not a descriptor
 
 
-def test_style_apply_email_uses_work_email_bucket(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_style_apply_email_uses_work_email_bucket(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     se.extract({"sent_messages": [
         {"text": "Hi team, here is the Q3 update. Numbers look strong this quarter. Best", "channel": "email", "work": True}]})
     out = sa.apply({"recipient": "unknown@x.com", "channel": "email"})
     assert out["bucket"] == "work_email"
 
 
-def test_style_apply_includes_explicit_tone_notes(tmp_path):
-    os.environ["SOTTO_DATA"] = str(tmp_path)
+def test_style_apply_includes_explicit_tone_notes(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOTTO_DATA", str(tmp_path))
     (tmp_path / "preferences.json").write_text(json.dumps({
         "explicit": {"tone_notes": ["keep it terse", "no exclamation marks"]}}))
     out = sa.apply({"recipient": "unknown@x.com", "channel": "imessage"})

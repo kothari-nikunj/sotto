@@ -60,9 +60,11 @@ export class ReceiptedDelivery {
     return row ? { found: true, receipt: this.receiptForDispatch(row) } : { found: false };
   }
 
-  private async dispatch(dispatchId: string, destination: string, kind: DispatchKind, payload: string, send: Send, requestedAttempt: number, sourceRevision?: string): Promise<AcceptanceReceipt> {
+  private async dispatch(dispatchId: string, destination: string, kind: DispatchKind, payload: string, send: Send, requestedAttempt: number, sourceRevision?: string, validUntilMs?: number): Promise<AcceptanceReceipt> {
     const target = this.destinations.get(destination);
     if (!target) return { acceptance: 'not_attempted' };
+    const expired = () => validUntilMs !== undefined && Date.now() >= validUntilMs;
+    if (expired() && !this.journal.getDispatch(dispatchId)) return { acceptance: 'not_attempted' };
     const threadId = target.threadId;
     const digest = routeDigest(this.routeIdentity, threadId);
     const row = this.journal.prepareDispatch({ dispatchId, kind, destination, payload,
@@ -74,6 +76,7 @@ export class ReceiptedDelivery {
     if (row.status === 'accepted' || row.status === 'unknown' || row.status === 'dispatching') return this.receiptForDispatch(row);
     const currentAttempt = Number(row.current_attempt);
     if (requestedAttempt <= currentAttempt) return this.receiptForDispatch(row);
+    if (expired()) return { acceptance: 'not_attempted' };
     // Synchronous durable transition occurs before any asynchronous provider call.
     const attempt = row.status === 'prepared'
       ? this.journal.beginDispatch(dispatchId, requestedAttempt)
@@ -81,7 +84,11 @@ export class ReceiptedDelivery {
     let outcome: AcceptanceReceipt;
     let providerSentAtMs: number | undefined;
     try {
-      const sent = await target.transport.send({ ...send, threadId });
+      if (expired()) {
+        this.journal.settleDispatch(dispatchId, Number(attempt.number), 'rejected');
+        return { acceptance: 'not_attempted' };
+      }
+      const sent = await target.transport.send({ ...send, threadId, ...(validUntilMs === undefined ? {} : {validUntilMs}) });
       const ids = sent.providerMessageIds.filter(id => typeof id === 'string' && id.length > 0 && id.length <= 512).slice(0, 8);
       if (sent.acceptance === 'accepted' && ids.length) {
         outcome = { acceptance: 'accepted', message_id: ids[0], message_ids: ids };
@@ -97,7 +104,7 @@ export class ReceiptedDelivery {
   }
 
   sendText(request: SendRequest): Promise<AcceptanceReceipt> {
-    return this.dispatch(request.dispatch_id, request.target, 'scheduled_text', JSON.stringify({ text: request.text }), { threadId: '', text: request.text }, request.attempt, request.source_revision);
+    return this.dispatch(request.dispatch_id, request.target, 'scheduled_text', JSON.stringify({ text: request.text }), { threadId: '', text: request.text }, request.attempt, request.source_revision, request.valid_until_ms);
   }
 
   async sendGallery(request: GalleryRequest): Promise<AcceptanceReceipt> {
@@ -121,6 +128,6 @@ export class ReceiptedDelivery {
     });
     const payload = JSON.stringify({ summary: request.summary, images: images.map(image => image.hash) });
     const media = images.map(image => ({ url: '', data: image.bytes, mimeType: 'image/png', filename: image.name, sizeBytes: image.bytes.length }));
-    return this.dispatch(request.dispatch_id, request.target, 'gallery', payload, { threadId: '', text: request.summary, media }, 1);
+    return this.dispatch(request.dispatch_id, request.target, 'gallery', payload, { threadId: '', text: request.summary, media }, 1, undefined, request.valid_until_ms);
   }
 }

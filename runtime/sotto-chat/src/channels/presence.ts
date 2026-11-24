@@ -230,7 +230,7 @@ interface FeedbackTurn { createdAt: number; sequence: number; stages: FeedbackSt
 interface FeedbackThread { current?: FeedbackTurn; tail: Promise<void> }
 
 interface PhotonFeedbackProvider {
-  markRead(threadId: string, messageId: string, isCurrent: () => boolean, observe?: FeedbackObservation): Promise<void>;
+  markRead(threadId: string, messageId: string, isCurrent: () => boolean, observe?: FeedbackObservation, onContact?: () => void): Promise<void>;
   addReaction(threadId: string, messageId: string, emoji: string, isCurrent: () => boolean, observe?: FeedbackObservation): Promise<void>;
 }
 
@@ -248,7 +248,7 @@ export function photonFeedbackProvider(adapter: Pick<iMessageAdapter, 'fetchMess
     return raw;
   }
   async function perform(threadId: string, messageId: string, isCurrent: () => boolean,
-                         effect: (message: SpectrumMessage) => Promise<unknown>, observe?: FeedbackObservation): Promise<void> {
+                         effect: (message: SpectrumMessage) => Promise<unknown>, observe?: FeedbackObservation, onContact?: () => void): Promise<void> {
     const note: FeedbackObservation = (step, outcome, error) => {
       try {observe?.(step, outcome, error);} catch { /* observation cannot affect provider work */ }
     };
@@ -258,11 +258,15 @@ export function photonFeedbackProvider(adapter: Pick<iMessageAdapter, 'fetchMess
     catch (error) {note('lookup', 'error', error instanceof FeedbackFailure ? error.category : 'provider_error'); throw error;}
     if (!isCurrent()) {note('effect', 'skipped'); return;}
     note('effect', 'running');
-    try {await effect(message); note('effect', 'success');}
+    try {
+      const contacted = effect(message);
+      try {onContact?.();} finally {await contacted;}
+      note('effect', 'success');
+    }
     catch (error) {note('effect', 'error', 'provider_error'); throw error;}
   }
   return {
-    markRead: (threadId, messageId, isCurrent, observe) => perform(threadId, messageId, isCurrent, message => message.read(), observe),
+    markRead: (threadId, messageId, isCurrent, observe, onContact) => perform(threadId, messageId, isCurrent, message => message.read(), observe, onContact),
     addReaction: (threadId, messageId, emoji, isCurrent, observe) => perform(threadId, messageId, isCurrent, message => message.react(emoji), observe),
   };
 }
@@ -289,7 +293,11 @@ export class PhotonOwnerFeedback {
     this.latest = turn;
     this.queue(thread, turn, async () => {
       if (!this.live(thread, turn)) {this.skip(turn, 'read'); this.skip(turn, 'processing'); return;}
-      await this.bounded(turn, 'read', observe => this.adapter.markRead(threadId, turn.eventId, () => this.live(thread, turn), observe), () => this.resume(thread, turn, threadId));
+      let processing: Promise<void> | undefined;
+      await this.bounded(turn, 'read', observe => this.adapter.markRead(threadId, turn.eventId, () => this.live(thread, turn), observe, () => {
+        if (!turn.control && this.live(thread, turn) && !turn.processingStarted) processing = this.process(thread, turn, threadId);
+      }), () => this.resume(thread, turn, threadId));
+      await processing;
       await this.remaining(thread, turn, threadId);
     });
   }
@@ -314,17 +322,22 @@ export class PhotonOwnerFeedback {
 
   private resume(thread: FeedbackThread, turn: FeedbackTurn, threadId: string): void {
     if (this.closed || thread.current !== turn || !(turn.accepted || turn.isCurrent())) return;
+    if (turn.stages.some(stage => stage.outcome === 'error' || (stage.outcome === 'timeout' &&
+      !(stage.step === 'effect' && stage.late_outcome === 'success')))) return;
     turn.uncertain = false;
     this.queue(thread, turn, () => this.remaining(thread, turn, threadId));
+  }
+
+  private process(thread: FeedbackThread, turn: FeedbackTurn, threadId: string): Promise<void> {
+    turn.processingStarted = true;
+    return this.bounded(turn, 'processing', observe => this.adapter.addReaction(threadId, turn.eventId, turn.emoji,
+      () => this.live(thread, turn), observe), () => this.resume(thread, turn, threadId));
   }
 
   private async remaining(thread: FeedbackThread, turn: FeedbackTurn, threadId: string): Promise<void> {
     if (!this.live(thread, turn)) {this.skip(turn, 'processing'); this.skip(turn, 'completion'); return;}
     if (turn.control) this.skip(turn, 'processing');
-    else if (!turn.processingStarted) {
-      turn.processingStarted = true;
-      await this.bounded(turn, 'processing', observe => this.adapter.addReaction(threadId, turn.eventId, turn.emoji, () => this.live(thread, turn), observe), () => this.resume(thread, turn, threadId));
-    }
+    else if (!turn.processingStarted) await this.process(thread, turn, threadId);
     if (!this.live(thread, turn) || !turn.accepted || turn.emoji === '❤️') {
       if (turn.emoji === '❤️' || !this.live(thread, turn)) this.skip(turn, 'completion');
       return;

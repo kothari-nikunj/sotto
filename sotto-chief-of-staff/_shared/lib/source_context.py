@@ -672,10 +672,10 @@ def project_local(local):
             if source in statuses or any(field in local for field in fields):
                 statuses[source] = 'disabled'
                 availability[source] = 'disabled'
-    # Supplemental exact-handle history also depends on the source obligation that chose it.
+    # Supplemental text history also depends on the obligation that chose it.
     # Apply this before every model, Learn and delivery consumer; native snapshot rows keep
     # their own source permission and are never rewritten on an ID collision.
-    for field in ('imessage',):
+    for field in ('imessage', 'whatsapp'):
         if isinstance(result.get(field), list):
             result[field] = [row for row in result[field] if not isinstance(row, dict)
                              or '_loop_context_sources' not in row

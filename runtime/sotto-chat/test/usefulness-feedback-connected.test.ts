@@ -5,6 +5,7 @@ import {once} from 'node:events';
 import {existsSync,readFileSync,writeFileSync,mkdtempSync,rmSync} from 'node:fs';
 import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
+import {createServer} from 'node:http';
 import {MockLanguageModelV4} from 'ai/test';
 import type {OwnerToolIdentity} from '../src/tools/owner-contract.js';
 import {OperationalJournal} from '../src/journal/index.js';
@@ -15,6 +16,9 @@ import {createOwnerPreferenceToolClient} from '../src/tools/owner-preference-too
 import {createOwnerPreferenceExecution,type OwnerPreferenceExecutionContext} from '../src/tools/owner-preference-execution.js';
 import {createPreferenceCommand,USEFULNESS_EXECUTION_GUIDE} from '../src/tools/preference-command.js';
 import {createRunScriptTool} from '../src/tools/run-script-tool.js';
+import {ReceiptedDelivery} from '../src/delivery.js';
+import {routeDigest} from '../src/route-proof.js';
+import type {SendRequest} from '../src/http.js';
 async function startReceiver(folder: string) {
   const python = resolve('../../.venv/bin/python');
   const child = spawn(process.env.SOTTO_PYTHON ?? (existsSync(python) ? python : 'python3'), [resolve('test/owner-loop-receiver-child.py')], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1',
@@ -127,4 +131,76 @@ for(const syncFault of [false,true])test(`original Feedback rates an actual deli
   assert.ok(prompt.prompt.includes('USER FEEDBACK ON SPECIFIC PAST OUTPUTS'));assert.ok(prompt.prompt.includes(excerpt));assert.ok(!prompt.prompt.includes('Donation item: community fundraiser'));assert.ok(prompt.prompt.includes('not a sender mute'));
   assert.equal(outcomes().length,1);
  }finally{await coordinator?.close();await runtime?.close();if(receiver)await stopReceiver(receiver.child);journal.close();rmSync(folder,{recursive:true,force:true});}
+});
+
+test('a direct reply rates the exact triaged notification and repeated owner events share one outcome',async()=>{
+ const folder=mkdtempSync(join(tmpdir(),'sotto-notification-rating-'));
+ const journal=new OperationalJournal(join(folder,'operations.sqlite'));
+ const receiver=await startReceiver(join(folder,'receiver'));
+ assert.equal(receiver.identity.channel,'photon');
+ if(receiver.identity.channel!=='photon')throw Error('unexpected fixture identity');
+ const thread=receiver.providerThreadId;
+ const identity={channel:'photon' as const,tenantId:'tenant',ownerId:receiver.identity.owner_id,
+  accountId:'account',lineKey:'line',projectFingerprint:receiver.identity.project_fingerprint};
+ const route=routeDigest(identity,thread);
+ const providerId='fixture-delivered-notification';
+ const delivery=new ReceiptedDelivery(journal,new Map([['photon',{threadId:thread,transport:{send:async()=>({
+  acceptance:'accepted' as const,providerMessageIds:[providerId],providerSentAtMs:Date.now(),
+ })}}]]),identity);
+ let sentRequest:SendRequest|undefined;
+ const server=createServer(async(req,res)=>{
+  assert.equal(req.url,'/v1/send');
+  let body=''; for await(const part of req)body+=part;
+  sentRequest=JSON.parse(body) as SendRequest;
+  res.setHeader('content-type','application/json');res.end(JSON.stringify(await delivery.sendText(sentRequest)));
+ });
+ server.listen(0,'127.0.0.1');await once(server,'listening');
+ const port=(server.address() as {port:number}).port;
+ const client=createOwnerPreferenceToolClient(receiver);
+ const command=createPreferenceCommand({execution:createOwnerPreferenceExecution({client,journal:()=>journal,sourceAuthority})});
+ const acknowledgements:string[]=[];
+ const coordinator=new ConversationCoordinator({journal,ownerPreferenceTool:client,
+  ownerPolicy:{channel:'photon',accountId:'account',ownerId:receiver.identity.owner_id},routeDigestForThread:()=>route,
+  model:{generate:async req=>{
+   const invoke=command({id:'usefulness-feedback',args:['not_useful','--quoted-notification']},{mode:'chat',
+    runId:req.runId,ownerRequestKey:req.ownerRequestKey,allowOwnerPreference:true,sourceRevision:'a'.repeat(64)});
+   if(req.messages[0]?.replyBound){
+    assert.deepEqual(req.quotedReply,{status:'unavailable'},'rating uses the provider quote proof without loading its text');
+    assert.match(JSON.stringify((await invoke).result),/"status":"recorded"/);
+   } else await assert.rejects(invoke,/Reply directly/);
+   return {text:'Please reply directly to the notification.',sourceRevision:'a'.repeat(64)};
+  }},postPrepared:async post=>{acknowledgements.push(post.text);return {acceptance:'accepted',messageId:`reply-${acknowledgements.length}`};}});
+ try{
+  const evidence=await new Promise<{delivered:boolean,dispatch_id:string,decision_id:string}>((resolve,reject)=>{
+   let buffered='';
+   const timer=setTimeout(()=>{receiver.child.stdout.off('data',onData);reject(Error('notification delivery fixture timed out'));},6000);
+   const onData=(chunk:Buffer)=>{
+    buffered+=String(chunk);
+    const lines=buffered.split('\n');buffered=lines.pop()!;
+    for(const line of lines){
+     try{const value=JSON.parse(line);if(typeof value.delivered!=='boolean')continue;
+      clearTimeout(timer);receiver.child.stdout.off('data',onData);resolve(value);return;
+     }catch{/* receiver can log unrelated status lines */}
+    }
+   };
+   receiver.child.stdout.on('data',onData);
+   receiver.child.stdin.write(`nudge-rate=${JSON.stringify({route,runtime:`http://127.0.0.1:${port}`})}\n`);
+  });
+  const outbox=join(folder,'receiver/events/outbox.json');
+  assert.ok(evidence.delivered,existsSync(outbox)?readFileSync(outbox,'utf8'):JSON.stringify(evidence));
+  assert.match(evidence.decision_id,/^[a-f0-9]{16}$/);
+  // An event nudge now carries its composing revision as reply context; the rating still uses only the quote proof.
+  assert.equal(sentRequest?.dispatch_id,evidence.dispatch_id);assert.equal(sentRequest?.source_revision,'a'.repeat(64));
+  const receive=(id:string,quoted:boolean)=>coordinator.receive({channel:'photon',accountId:'account',
+   senderId:receiver.identity.owner_id,isDirect:true,eventId:id,text:'Not useful.',
+   ...(quoted?{replyBound:true,replyToMessageId:providerId}:{})},{threadId:thread,destination:'photon',lineKey:'line'},Date.now()+1);
+  assert.equal((await receive('no-quote',false)).status,'accepted');
+  assert.ok(!existsSync(join(folder,'receiver/outcomes.jsonl')));
+  assert.equal((await receive('exact-quote',true)).status,'accepted');
+  assert.equal((await receive('later-same-quote',true)).status,'accepted');
+  assert.equal(acknowledgements.at(-1),'Recorded this notification as not useful.');
+  const outcomes=readFileSync(join(folder,'receiver/outcomes.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
+  assert.equal(outcomes.length,1);assert.equal(outcomes[0].decision_id,evidence.decision_id);
+  assert.equal(outcomes[0].reference,`notification:${evidence.dispatch_id}`);
+ }finally{await coordinator.close();await stopReceiver(receiver.child);await new Promise<void>(done=>server.close(()=>done()));journal.close();rmSync(folder,{recursive:true,force:true});}
 });

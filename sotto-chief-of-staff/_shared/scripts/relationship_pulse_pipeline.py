@@ -23,7 +23,7 @@ def run(pack, selection, command, *, authority=current_authority):
     from preferences import _sync_existing_preferences
     from local_snapshot import _local_fallback, merge_local_unsaved
     from loops_query import query_permitted_rows
-    from source_catalog import LOCAL_SNAPSHOT_TTL_HOURS
+    from source_catalog import LOCAL_SNAPSHOT_TTL_HOURS, SOURCE_LABELS
     from timeutil import _now_local, configured_tz
     if selection != {'mode': 'current'}:
         raise ValueError('relationship pulse selection invalid')
@@ -181,12 +181,12 @@ def run(pack, selection, command, *, authority=current_authority):
         if not captured['bridge_ok'] and not captured['gmail_ok']:
             coverage.append('Fresh message and email checks unavailable.')
         if captured['bridge_missing']:
-            coverage.append('Message coverage is partial or unavailable for: ' + ', '.join(captured['bridge_missing']) + '.')
+            coverage.append('Message coverage is partial or unavailable for: ' + ', '.join(SOURCE_LABELS.get(source, source) for source in captured['bridge_missing']) + '.')
         if captured['partial']:
             coverage.append('Latest email check was incomplete; some recent messages may be missing.')
         if captured.get('gmail_error') == 'rate_limited':
             coverage.append('Gmail rate limit prevented a complete email history read.')
         elif captured.get('gmail_error') in ('RefreshError', 'PermissionError'):
             coverage.append('Gmail authorization prevented a complete email history read.')
-        return {'text': '\n'.join(coverage + [result['pulse_markdown']]),
+        return {'text': '\n'.join(coverage) + '\n\n' + result['pulse_markdown'],
                 'sources': captured['sources'], 'coverage_until': captured['coverage_until']}

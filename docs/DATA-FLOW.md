@@ -64,7 +64,9 @@ material into one prompt and posts it. That prompt contains, for the window the 
 
 - iMessage / WhatsApp **message text**, with sender names resolved from your contacts — a daily
   read carries only the cards the day touched, plus every card with a note or a birthday in the
-  next 7 days; the whole address book travels only on the first brief and the weekly pulse
+  next 7 days; the whole address book travels only on the first brief and the weekly pulse.
+  The prompt's contact notes cover only people in that read's messages or calls, with Facebook
+  sync tags (`<sn>…</sn>`) removed
 - **email bodies** (trimmed) and subjects
 - **calendar events**, titles and attendees
 - **Apple Notes and Reminders** in the window (last 7 days / next 3)
@@ -98,17 +100,17 @@ the configured data mount, including lock sidecars. It truncates only regular lo
 | `knowledge/people/*.md` · `companies/*.md` | Facts about people and companies, with provenance; a person may also carry immutable `x_user_id`, handle alias history, and the 90-day X resolution cache | **Never auto-deleted** — this is the memory. Superseded facts are archived, not deleted, and an archived fact that is observed again is re-learned in place; only a fact you archived yourself stays archived |
 | `knowledge/x_link_suggestions.json` | The X resolver's own notes about people the graph has no file for: metadata-only identity candidates too weak (or too conflicted) to link, and the negative results that stop tomorrow's brief re-asking X the same question | **Never auto-deleted** — bounded to 100 suggestions, and negatives self-prune at 90 days on each write. A negative never creates a person file; confirmation UI is a later phase |
 | `knowledge/source-retractions.json` | Legacy experimental hashes, not trustworthy deletion proof | **Inert; no active reader or writer.** Existing files remain available for inspection, but do not project fact withdrawals or block learning. Existing archived facts are not automatically restored. B1 must define migration before historical retraction returns. |
-| `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief and prep prompt | **Never auto-deleted** — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
+| `knowledge/master.md` | The master memory file: who you are, the people around you, your standing rules — **your own stated words**, confirmed before writing, included in every brief, prep and model-written nudge prompt | **Never auto-deleted** — editable on the dashboard's Learned page, in chat, or by hand; delete anytime |
 | `knowledge/continuity/*.md` | Open loops | Terminal items pruned after 30 days by the resolver, never by the sweep |
-| `knowledge/snapshots/<date>.json` | Dated archive copies of the payload, for the golden corpus | 60 days, pruned by the brief that writes them |
-| `briefs/<date>_<kind>.json` · `<date>.<kind>.named.json` · `<date>.<kind>.learned.json` · `.claim` · `.delivered` | Composed brief archives, named loops, phased learning receipts and daily markers; an archive alone is not proof of delivery | **60 days** |
+| `knowledge/snapshots/<date>.json` | Dated archive copies of the payload, for the golden corpus | 60 days, pruned by the brief that writes them. Delete with `forget.py --snapshot`. |
+| `briefs/<date>_<kind>.json` · `<date>.<kind>.named.json` · `<date>.<kind>.learned.json` · `.claim` · `.delivered` | Composed brief archives, provider-accepted named loops, phased learning receipts and daily claims. Only outbox acceptance publishes the named record. | **60 days** |
 | `briefs/<date>.<kind>.payload.json` | The staged wake payload a brief was built from | **7 days** |
 | `events/surfaced.jsonl` · `queue.jsonl` | One line per triage verdict | Rotates at 4 MB / 4,000 lines, **and lines older than 90 days are dropped** |
 | `events/delivery.jsonl` | Run and transport outcomes, including accepted, failed, expired and superseded results; acceptance is not proof of reading | **90 days** |
 | `events/sends.jsonl` | One metadata-only line per real-effect **attempt** (send, reply, calendar create/delete/RSVP), allowed or refused, carrying `payload_sha256` — the hash of the exact bytes that left, never the bytes | **180 days** — the authorization trail, kept twice as long on purpose |
 | Node chat `node-state/operations.sqlite` | Durable inbound events, prepared replies, provider dispatch attempts and external-action results | The receiver's existing 3:30 AM sweep asks the Node runtime to prune terminal delivery proof after **90 days** and terminal action proof after **180 days**. Pending events/actions, unknown outcomes and accepted replies covering pending events remain. Gallery receipts remain until a receiver acknowledgement protocol exists; no age-only sweep deletes them. This operational cleanup does not purge Mastra chat transcripts, for which no automatic lifetime is set. |
 | Sotto incoming media descriptors in `operations.sqlite` | Bounded provider IDs/content paths and metadata attached to the admitted owner message; no fetch closures or download credentials | These follow inbound-event retention. Downloaded bytes stay in the active run only. Restart re-reads the exact provider reference or reports unavailable content; a prepared reply never requires rehydration. |
-| Node chat `node-state/agent-memory.db` | Mastra conversational context, separate from canonical knowledge and operational recovery | The receiver owns session rotation. A changed or unverifiable source-permission revision clears all conversation threads before reuse; a change during generation also clears them and withholds the result. No additional age-based transcript lifetime is imposed. |
+| Node chat `node-state/agent-memory.db` | Mastra conversational context, separate from canonical knowledge and operational recovery; per-turn agent-loop run state stays in process memory and is never written here | The receiver owns session rotation. A changed or unverifiable source-permission revision clears all conversation threads before reuse; a change during generation also clears them and withholds the result. No additional age-based transcript lifetime is imposed. |
 | Sotto chat `operations.sqlite` activation tables | Exact Photon cloud tenant/project/owner/account/line/thread manifest and one pending owner-admission event ID; no credentials | The pending obligation pins its admitted event until the receiver writes its existing activation receipt and ACKs. Acknowledgement releases that retention pin; the last event ID remains a replay tombstone. A new owner DM after ACK can create repair evidence. This metadata never grants source access. |
 | Sotto chat `agent-memory.db.source-authority.json` | The revision against which transcript deletion completed; **not a permission grant** | Replaced atomically only after required deletion succeeds. Missing, unsafe or invalid metadata forces deletion before history can be reused. No source content or credentials are stored here. |
 | Node chat `node-state/chat-sdk.sqlite` | Adapter cache, subscriptions, locks, lists and queues | The existing receiver retention call removes expired entries using their original SDK expiry. Permanent entries and subscriptions remain. This database never proves operational delivery or provider acknowledgement. |
@@ -117,10 +119,13 @@ the configured data mount, including lock sidecars. It truncates only regular lo
 | `runtime/owner-routines.json` | Routines you approved in chat (name, schedule, prompt) and their single-use approval receipts | Until you cancel them; never swept — it is live configuration, and only your approved changes (or an owner-route change, which retires old-route routines) write it |
 | `events/outbox.json` | Pending message text, delivery deadlines and current-item eligibility; after acceptance, minimal replayable effects and provider receipt metadata | Text leaves terminal rows immediately. The effects' per-source addressing leaves the moment they settle — applied **or** quarantined — so no row holds a handle, address or thread id it can no longer use. Closed metadata lasts 7 days after terminal delivery and effects resolution; unfinished acceptance or invalidation effects remain retryable until finalized. A terminal row whose producer has not yet reconciled it (an owner reminder whose send is unknown, in flight or not yet accepted, or whose reconciliation failed) is kept past 7 days until reconciliation succeeds, one row per reminder. |
 | `events/delivery-effects-<run>.json` | Merged source/Calendar eligibility, original cutoff and delivery-dependent effects for one work run | Removed after the completed result reaches the outbox; retryable failures retain it. Abandoned staged files expire after **7 days**. |
+| `<file>.corrupt.<unix-ts>` (top level or one folder down, e.g. `events/outbox.json.corrupt.…`, `preferences.json.corrupt.…`) | A state file whose content could not be read as a JSON document (bad JSON, bad text encoding, or not an object), set aside instead of being overwritten, kept for a person to inspect; the next write starts from an empty file. A file the system could not open (a permission or disk error) stays in place. When the set-aside file is `events/outbox.json`, queued deliveries in it are lost and are never re-sent: the Record gets one `state:outbox` failed line, "delivery records unreadable; set aside", whichever reader found it. The Bridge consent file is the one that rebuilds itself at once: its next authenticated consent report is a complete replacement | **7 days** from when it was set aside; also erased by `forget.py --receipts`. Copies under `config/` are settings and are never swept. |
 | `events/bundle-<random>.json` | One staged event bundle per spawned agent run | 7 days, swept by the receiver that stages them |
 | `style.json` | Verbatim samples of things **you** wrote, plus hash-only markers for the drafts already confirmed | Self-capped by its writer (30/25/25 canonical, 30 recent, 500 keys, the drafts-you-shipped bucket at its newest 20 per register, and the confirmed-action markers pruned on every extract to the drafts still in `events/drafts.jsonl`, so they inherit that ledger's 30-day bound); the sweep exempts it on that strength |
 | `outcomes.jsonl` | What you did with drafts | **90 days** — the learning loop re-reads this whole file after every brief, and a quarter is all it can use |
 | `logs/compose_brief.log` | Diagnostics, **including contact identifiers** | Rotates at 4 MB; the sweep's **5 MB** truncation is a ceiling above that, defence in depth |
+| `cache/brief-window.json` | When the brief last read each Mac source and Gmail successfully (one timestamp per source, no content) | One file, overwritten after each composed brief |
+| `cache/session_rotation.json` | The local date the chat sessions last rotated (no content) | One file, overwritten by each rotation |
 | `cache/brief-granola.json` | Gathered meeting notes plus their observation time | **1 day**; older than 30 minutes is disclosed when reused, and data older than 24 hours is not reused |
 | `events/work.sqlite3` (+ SQLite journal or WAL/SHM) | Accepted jobs, leases and recoverable completed results | Raw payload/results removed on terminal transition; metadata and input ownership aliases expire after **7 days** |
 | `events/work-inputs/brief-*/` | Resumable brief inputs, artifacts and completion manifests | Raw current/prepared inputs removed after ancillary success; remaining staged files expire after **7 days** |
@@ -128,6 +133,7 @@ the configured data mount, including lock sidecars. It truncates only regular lo
 | `.sotto-volume.json` · `.sotto-runtime.lock` · `.sotto-epoch.json` · `config/model-lease.json` | Adapter-owned volume identity, writer lock, replacement epoch and model lease metadata | Adapter lifecycle state; never swept |
 | `cache/research_<date>.json` | Attendee research render cache | 7 days, pruned by the research run |
 | `connectors/*.json` | OAuth tokens for connected services | Until you disconnect; never swept |
+| `config/mcp-clients/<client>.json` · `config/mcp-clients/oauth.sqlite3` | Read-only assistant grants: a hash of the client token, its label, granted tools and expiry; hosted OAuth clients, connections and token hashes. No source content | A native grant stops working at its expiry (1 to 90 days) and its file stays until you revoke it. Hosted connections expire after 30 days; expired or revoked OAuth rows are deleted when the store is next opened for writing. Never swept (`config/`) |
 | `decks/<view_id>.pdf` · `.json` | A DocSend deck you asked Sotto to read — the pages as one PDF, plus the extracted text (the cache that stops a re-ask logging a second view with the sender) | Yours — user-requested artifacts, **never auto-deleted**; kept until you delete the files |
 | `config/settings.json` | Setup choices, including the Google account email Sotto excludes from attendee research | Until you change them; never swept |
 | `proactive/<date>.json` | The watcher's once-per-day nudge dedup stamps | **30 days** |
@@ -135,6 +141,7 @@ the configured data mount, including lock sidecars. It truncates only regular lo
 | `proactive/pending_offer.json` | The one standing question Sotto last asked you (it can name a person), plus `payload_sha256` when a yes to it would send or write — the hash of the offered content, never the content | Expires 180 min after it is written, at read |
 | `cache/meeting_taps.json` · `events/seen.json` | Exactly-once records: which meeting-ends were tapped, which events were already triaged | Bounded rings, overwritten in place |
 | `dashboard_sessions.json` | Dashboard login sessions | Expire on idle; pruned on every read |
+| `logs/mcp-access-<date>.jsonl` | Metadata for authenticated MCP calls. UTC time, connection fingerprint, tool, attempted source, outcome and result byte count. Up to 1 MiB/day. The owner can clear it with `forget.py --logs` | **30 days** |
 | `dashboard_audit.jsonl` | One line per dashboard write | **90 days** |
 
 One situational handoff lives outside `$SOTTO_DATA`: `/tmp/sotto_x_context.json` contains recent
@@ -143,7 +150,7 @@ on every run, and subject to the host OS/container's temporary-file lifetime. It
 enter the graph, caches, event ledgers, briefs archive, or relationship state; a new prep fetches
 them again.
 
-**What the sweep will never delete:** `knowledge/` (the graph, `master.md`, style, outcomes, the
+**What the sweep will never delete:** `knowledge/` (the graph, `master.md`, the
 continuity ledger), `corpus/`, `decks/`, `connectors/`, `config/`, `preferences.json`,
 `intentions.jsonl` and `setup_code`. That guard is checked per path, below every rule in the table,
 so a future mistake in the table still cannot reach your memory. A missed sweep — a restart, a box
@@ -178,11 +185,13 @@ SOTTO_DATA=~/SottoData python3 sotto-chief-of-staff/tools/forget.py --snapshot
 
 | Verb | Removes |
 |---|---|
-| `--snapshot` | `knowledge/last_local_snapshot.json`, staged `briefs/*.payload.json`, and resumable `events/work-inputs/brief-*` JSON inputs and artifacts |
+| `--snapshot` | `knowledge/last_local_snapshot.json`, its dated archive copies `knowledge/snapshots/*.json`, staged `briefs/*.payload.json`, and resumable `events/work-inputs/brief-*` JSON inputs and artifacts |
 | `--caches` | `cache/research_*.json`, `events/{notification,triage,research}-artifacts/*.json`, `cache/calendar_today.json`, `cache/visual-briefs/*/*` — rebuilt when needed |
 | `--logs` | truncates `logs/compose_brief.log` (truncated, not unlinked: a running process holds it open) |
-| `--receipts` | `events/delivery.jsonl`, `events/sends.jsonl`, `events/learning-diagnostics/*.json` and their `*.json.lock` files |
+| `--receipts` | `events/delivery.jsonl`, `events/sends.jsonl`, `events/learning-diagnostics/*.json` and their `*.json.lock` files, and set-aside `*.corrupt.*` state files |
 | `--all` | every category above |
+
+No verb removes these families, even with `--all`; they age out on the schedules in the table above, or you delete them by hand: `events/queue.jsonl` and `surfaced.jsonl`, `events/drafts.jsonl`, `events/owner-gmail-drafts.json`, `events/outbox.json`, `events/bundle-*.json`, `events/bridge-send-receipts.json`, `briefs/<date>_<kind>.json` archives and markers, `cache/brief-granola.json`, `outcomes.jsonl`, `style.json`, `decks/`, and the chat runtime's `node-state/` (including `operations.sqlite` and its conversation history) and `node-media/`.
 
 **It never touches `knowledge/people/`, `knowledge/companies/` or `knowledge/continuity/`.** That is
 the memory — who someone is, what a company builds, what you still owe whom. Deleting *that* is a
@@ -221,7 +230,12 @@ stating plainly:
 - **No local-model mode.** See below.
 - **The setup cookie's value is the setup code itself** — no expiry, no logout; rotating the
   code is the revocation story. A deliberate simplicity trade-off (owner, Aug 2026) on a
-  single-admin surface defended by per-client lockout, `Secure`, and `no-store`.
+  single-admin surface defended by `Secure`, `no-store`, and a failed-guess delay: after 5 wrong
+  `/setup?code=` guesses from one socket peer, each further wrong guess waits 1 second. A right code
+  always works, and no header can reset the count. On Railway every request arrives from the proxy,
+  so this slows all wrong guesses together. The default code is 72 random bits.
+- **The receiver prints the full setup link, code included, on every boot** (unless a supervisor
+  takes that line on its own descriptor). Anyone who can read the deploy logs can open setup.
 - **The `$SOTTO_DATA` volume is not encrypted at rest by Sotto.** It inherits whatever your host
   provides.
 
@@ -253,11 +267,22 @@ small state files have no age sweep; delete them with the rest of the volume. De
 causes connected history to be reviewed again, not erased. `config/onboarding.json` remembers that
 the first-use message was delivered; removing it can restart onboarding on a new installation.
 
-Explicit usefulness ratings join `outcomes.jsonl`, retained for 90 days by the existing sweep. A row
-carries the output reference, a hashed item locator and the rating — nothing else. Neither the rated
-excerpt nor the user's explanation is stored: an explanation is only length-checked (over 900
-characters is refused as too long) and then discarded. Prompt readers resolve up to 320 characters
-from the archive for only the latest eight examples from the past 42 days.
+Explicit usefulness ratings join `outcomes.jsonl`, retained for 90 days by the existing sweep. A brief row
+carries the edition reference, a content-free accepted version, a hashed item locator and the rating.
+The provider-accepted outbox row retains a normalized delivery-body digest, not provider-rendered bytes. Feedback joins it to the matching run and text
+in the staged artifact, then rechecks that every recorded source remains authorized. Day claims and
+composition archives do not establish acceptance. The latest verifiable accepted edition owns the
+date/kind reference, ordered by provider-contact time rather than receipt-discovery time. An older
+late confirmation cannot displace a newer contacted, accepted brief; an unaccepted refresh cannot
+replace it. Missing or invalid contact time cannot prove feedback ordering. Previously recorded ratings remain
+in the ledger when their version is superseded, cannot be proven, or lacks a version.
+The excerpt and explanation stay out of the ledger. An explanation over 900 characters is refused.
+Prompt readers resolve up to 320 characters per item for up to eight examples within the 42-day
+rating window, while both proof files remain available under their existing seven-day retention.
+An accepted notification rating instead carries the delivery reference, selected decision ID,
+hashed source message reference, deduplication key and rating. The outbox acceptance carries
+the matching route and source revision. The notification and its source message text stay out
+of the outcome, and the rating stays out of automatic prompt examples.
 History-derived facts remain memory like other person facts: disabling a source stops new reads
 but does not erase previously captured person facts or writing samples.
 

@@ -1,0 +1,37 @@
+{
+  "cutoff": "2026-10-22T12:00:00+00:00",
+  "cases": {
+    "footbridge": {
+      "name": "Mira Calder",
+      "email": "mira@example.test",
+      "phone": "+12025550140",
+      "subject": "Footbridge trial",
+      "superseded_plan_wording": [
+        "should the plan be adjusted to hold off on the 40-person preview for Saturday?",
+        "should we hold off on Saturday's 40-person preview?"
+      ],
+      "email_text": "The Footbridge trial plan proposes a 40-person preview on Saturday. Could you send comments on the plan by Friday?",
+      "whatsapp_text": "One correction for the Footbridge trial: the ramp inspection moved to Monday, so keep Saturday staff-only. This is internal for now.",
+      "unrelated_text": "Unrelated note: the Tuesday bicycle class needs a spare pump.",
+      "namesake_text": "My train ticket for the art fair is refundable.",
+      "sent_text": "Comments on the Footbridge trial: keep Saturday staff-only until the ramp inspection on Monday.",
+      "later_text": "New update for the Footbridge trial: the inspection moved again, to Wednesday."
+    },
+    "greenhouse": {
+      "name": "Nolan Voss",
+      "email": "nolan@example.test",
+      "phone": "+12025550141",
+      "subject": "Greenhouse trial",
+      "superseded_plan_wording": [
+        "Friday's seedling giveaway will need to stick to a dry setup",
+        "Friday's seedling giveaway must stick to a dry setup"
+      ],
+      "email_text": "The Greenhouse trial plan proposes a Friday seedling giveaway. Could you send comments on the plan by Friday?",
+      "whatsapp_text": "One correction for the Greenhouse trial: the water supply is off until Sunday, so keep Friday to dry setup. This is internal for now.",
+      "unrelated_text": "Unrelated note: the book club needs a spare chair.",
+      "namesake_text": "My train ticket for the art fair is refundable.",
+      "sent_text": "Comments on the Greenhouse trial: keep Friday to dry setup until the water is back on Sunday.",
+      "later_text": "New update for the Greenhouse trial: the water interruption now runs through Monday."
+    }
+  }
+}

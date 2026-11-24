@@ -339,7 +339,7 @@
     return a + "–" + b;
   }
 
-  /* "sarah.chen@meridianlabs.io" → "Sarah Chen" — research entries carry only
+  /* "sarah.chen@meridian.test" → "Sarah Chen" — research entries carry only
      an email; attendees sometimes arrive nameless too. */
   function nameFromEmail(email) {
     var local = String(email).split("@")[0] || "";
@@ -617,14 +617,11 @@
       .then(function (results) {
         if (seq !== state.renderSeq) return;
         var data = results[0] || {};
-        var loops = results[1] && Array.isArray(results[1].loops) ? results[1].loops : [];
-        var parked = results[1] && Array.isArray(results[1].parked) ? results[1].parked : [];
+        var tasks = results[1];
         var cal = results[2];
         var research = results[3];
         var frag = document.createDocumentFragment();
 
-        // Masthead — dateline + folio number. This page keeps the display-scale
-        // date: it is the brand moment, and the only one left on the site.
         var head = el("div", "masthead");
         var folio = el("div", "masthead-folio");
         folio.appendChild(el("span", null, "Today"));
@@ -635,17 +632,19 @@
         frag.appendChild(head);
         frag.appendChild(el("hr", "head-rule"));
 
-        // Housekeeping, above the fold and deliberately dull — a new version is news, not an alarm.
         append(frag, buildUpdateNote(data.update));
 
         // Today's docket — the day's meetings, each carrying its attendees' research
         var googleOk = !!(data.services && data.services.google === true);
         frag.appendChild(buildDocket(cal, research, googleOk));
 
-        // Waiting on you — the loops, actionable in place
-        buildLoopsSection(frag, loops, "now");
-        // Parked — kept, out of the brief; one tap brings any of them back
-        buildParkedSection(frag, parked, "now");
+        if (tasks && Array.isArray(tasks.loops)) {
+          buildLoopsSection(frag, tasks.loops, "now");
+          buildParkedSection(frag, Array.isArray(tasks.parked) ? tasks.parked : [], "now");
+        } else {
+          frag.appendChild(ledgerCap("Waiting on you"));
+          frag.appendChild(errorView("Tasks couldn't load.", function () { viewNow(); }));
+        }
 
         // Today's brief delivery state, from the outbox/provider receipts.
         var todays = Array.isArray(data.briefs_today) ? data.briefs_today : [];

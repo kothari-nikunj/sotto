@@ -58,3 +58,17 @@ export function reminderReceiptMatches(args: OwnerReminderToolArgs, receipt: Own
     receipt.anchor_key === args.anchor_key && receipt.action === args.action && sameOffsetInstant(receipt.due, args.due);
   return receipt.operation === undefined && receipt.anchor_key === undefined && receipt.action === args.action && sameOffsetInstant(receipt.due, args.due);
 }
+
+export function reminderAcknowledgement(receipt: OwnerReminderToolReceipt, args: OwnerReminderToolArgs): string {
+  if (receipt.reminder_status === 'fired') return 'That reminder was already sent.';
+  if (receipt.reminder_status === 'canceled') return 'That reminder is canceled.';
+  // The receipt verifies the instant; the matching request preserves the owner's offset.
+  const due = 'due' in args ? args.due : receipt.due;
+  const offset = due.endsWith('Z') ? '+00:00' : due.slice(-6);
+  const timeZone = offset === '+00:00' || offset === '-00:00' ? 'UTC' : offset;
+  const date = new Intl.DateTimeFormat('en-US', {
+    timeZone, month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit',
+  }).format(new Date(receipt.due));
+  const kind = receipt.operation === 'conditional' ? 'Conditional reminder' : 'Reminder';
+  return `${kind} set for ${date} ${timeZone === 'UTC' ? timeZone : `UTC${offset}`}.`;
+}

@@ -47,6 +47,8 @@ from datetime import date, datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # knowledge.py, its sibling
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import knowledge as kg  # noqa: E402
+from fact_hygiene import distinct_context, distinct_news, readable_conflicts, readable_facts  # noqa: E402
+from person_candidates import candidates as name_candidates  # noqa: E402
 from personal_context import (  # noqa: E402
     PARTICIPANT_LIMIT, TOPIC_CHARS, participant_identifiers, participant_topics, topic_for_identifiers,
 )
@@ -237,12 +239,9 @@ def interactive_projection(value: dict, *, selected_index: list | None = None,
     omitted = {'people': unselected_people, 'assertions': 0, 'contacts': 0, 'reason': None}
     result = {'person_knowledge': {}, 'contact_index': [], 'memory_participants': [],
               'omitted': omitted, 'suggestion': NARROWER_QUERY}
-    if 'coverage' in value:
-        result['coverage'] = value['coverage']
-    if 'obligation_history' in value:
-        result['obligation_history'] = value['obligation_history']
-    if 'fact_evidence' in value:
-        result['fact_evidence'] = value['fact_evidence']
+    for key in ('coverage', 'obligation_history', 'fact_evidence', 'candidates'):
+        if key in value:
+            result[key] = value[key]
     source_index = selected_index if selected_index is not None else value.get('contact_index', [])
     selected = value.get('person_knowledge', {})
     retained_weights = {}
@@ -351,8 +350,7 @@ def interactive_projection(value: dict, *, selected_index: list | None = None,
 
 LOW_CONFIDENCE = 0.6   # below this a fact must be visibly labeled in the packed context
 
-# Company context is a garnish on the brief, not a second brief: a handful of the companies in
-# today's cast, each a couple of sentences. Same spirit as the per-person compact caps above.
+# Company context is a garnish: a few of today's companies, a couple of sentences each.
 MAX_COMPANIES_PACKED = 5
 MAX_COMPANY_ENTRY_CHARS = 600
 MAX_COMPANY_NEWS_LINES = 3   # the file stores news newest-first (knowledge_update inserts at 0)
@@ -396,16 +394,6 @@ def _rank_facts(facts: list, topic: str) -> list:
     return [fact for _, fact in indexed]
 
 
-def _conflicts(p, state):
-    """Only live fact IDs participate; an edit/archive immediately removes stale conflict prose."""
-    people = state.get('people')
-    record = people.get(p.canonical_id) if isinstance(people, dict) else None
-    pairs = record.get('pairs') if isinstance(record, dict) else None
-    if not isinstance(pairs, list):
-        return []
-    return kg.live_conflict_pairs(p, pairs[:kg.CONFLICT_PAIRS])
-
-
 def _related_facts(p, topic, now, state):
     """One exact graph edge, never a name match, recursion, or a second person's full profile."""
     words = _topic_words(topic)
@@ -424,9 +412,9 @@ def _related_facts(p, topic, now, state):
         if other.canonical_id != cid:
             continue
         # An indirect excerpt must not silently choose one side of a known disagreement.
-        disputed = {fid for pair in _conflicts(other, state) for fid in pair}
-        facts = [(fid, f) for fid, f in _rank_facts(kg.sorted_active_facts(other.facts, now), topic)
-                 if fid not in disputed and words & _topic_words(f.text)][:MAX_RELATED_FACTS]
+        ranked = _rank_facts(kg.sorted_active_facts(other.facts, now), topic)
+        facts = [(fid, f) for fid, f in readable_facts(ranked, other, readable_conflicts(other, state))
+                 if words & _topic_words(f.text)][:MAX_RELATED_FACTS]
         if facts:
             found.append((other, relation, facts))
     # Choose by relevance, not edge insertion order; bounded inspection is the displayed edges.
@@ -499,10 +487,9 @@ def pack_person(p: kg.PersonFile, expanded: bool, now: datetime, topic: str = ''
 
     # Summary refs influence selection but never emit another copy. Recent observations compete
     # inside the same cap. Owner corrections outrank every automatic selection, even without a topic.
-    active = _rank_facts(kg.sorted_active_facts(p.facts, now), topic)
-    pairs = _conflicts(p, state)
-    disputed = {fid for pair in pairs for fid in pair}
-    candidates = [(p, [(fid, f)], '') for fid, f in active if fid not in disputed]
+    pairs = readable_conflicts(p, state)
+    active = readable_facts(_rank_facts(kg.sorted_active_facts(p.facts, now), topic), p, pairs)
+    candidates = [(p, [(fid, f)], '') for fid, f in active]
     if pairs:
         candidates.append((p, [(fid, p.facts[fid]) for fid in dict.fromkeys(pairs[0])], 'conflict'))
         omitted |= len(pairs) > 1
@@ -586,7 +573,6 @@ def _load(path):
     with open(path, encoding="utf-8") as f:
         person = kg.parse_person_file(f.read())
     return person
-
 
 
 def _unique_person(selector):
@@ -698,7 +684,7 @@ def editable_person(p: kg.PersonFile, now: datetime, topic: str = '',
                     stats: dict | None = None) -> dict:
     """Bounded active fact inventory used to bind an owner correction to one existing fact."""
     p = kg.projected_person(p)
-    ranked = _rank_facts(kg.sorted_active_facts(p.facts, now), topic)
+    ranked = readable_facts(_rank_facts(kg.sorted_active_facts(p.facts, now), topic), p)
     if stats is not None:
         stats['assertions'] = max(0, len(ranked) - kg.MAX_FACTS_FOR_LLM)
     facts = ranked[:kg.MAX_FACTS_FOR_LLM]
@@ -757,7 +743,7 @@ def _company_entry(known: dict) -> str:
     name = (known.get("name") or known.get("slug") or "").strip()
     about = " ".join((known.get("about") or "").split())
     lines.append(f"{name} — {about}" if about else name)
-    for n in (known.get("news") or [])[:MAX_COMPANY_NEWS_LINES]:
+    for n in distinct_news(known.get("news") or [])[:MAX_COMPANY_NEWS_LINES]:
         text = " ".join(str(n).split())
         if text:
             lines.append("- " + text)
@@ -767,9 +753,8 @@ def _company_entry(known: dict) -> str:
 def pack_companies(domains, companies) -> dict:
     """{slug: packed block} for today's companies — the read side of the company files the Learn
     step writes. Sources, in order: today's attendees' email domains, then the packed people's
-    `company` field. Resolution and dedup are knowledge_update's (`company_knowledge` runs the same
-    slug → alias → domain ladder the writer does), so a domain and a name that mean one company
-    pack once. Best-effort: no companies dir, or an unreadable one, packs nothing."""
+    `company` field. Resolution and dedup are knowledge_update's, so a domain and a name that
+    mean one company pack once. Best-effort: a missing or unreadable companies dir packs nothing."""
     try:
         import knowledge_update as ku  # noqa: PLC0415 — lazy: reading companies must never break a query
     except Exception:  # noqa: BLE001
@@ -946,7 +931,7 @@ def query(args, now):
                 about = " ".join(known.get('about', '').split())
                 if about:
                     full_lines[0] += ' — ' + about
-                full_lines += ['- ' + " ".join(str(n).split()) for n in known.get('news', []) if str(n).strip()]
+                full_lines += ['- ' + " ".join(str(n).split()) for n in distinct_news(known.get('news', [])) if str(n).strip()]
                 domain = known.get('domain', '').strip().lower().lstrip('@')
                 if len(domain) > 253 or not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', domain):
                     domain = ''
@@ -963,7 +948,7 @@ def query(args, now):
                     # and no inference of source freshness or completion from saved prose.
                     content = '\n'.join(full_lines)
                     if known.get('context'):
-                        content += '\n\nSaved context\n' + str(known['context'])
+                        content += '\n\nSaved context\n' + distinct_context(known['context'])
                     version = hashlib.sha256(content.encode()).hexdigest()
                     match = re.fullmatch(r'([a-f0-9]{64}):([0-9]{1,9})', cursor)
                     if cursor != 'first' and (not match or match[1] != version or int(match[2]) >= len(content)):
@@ -979,7 +964,7 @@ def query(args, now):
         print(json.dumps(interactive_projection(out) if args.interactive else out))
         return
     if args.person:
-        # Accept a name, an email, or a phone — resolved through the same identity map as writes.
+        # A name, email or phone, resolved through the identity map writes use.
         p, identifiers, identity_status = _unique_person(args.person)
         out = {}
         groups = {}
@@ -1000,6 +985,8 @@ def query(args, now):
                                                                             interactive=args.interactive)}
                   if args.person_coverage else out)
         if args.person_coverage:
+            if identity_status in ('ambiguous', 'no_match'):
+                result["candidates"] = name_candidates(args.person)
             if identity_status in ('ambiguous', 'unavailable'):
                 result['coverage']['identity_resolution'] = {
                     'status': identity_status,

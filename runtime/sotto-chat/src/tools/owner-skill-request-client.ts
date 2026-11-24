@@ -1,3 +1,4 @@
+import {prepWindowClosedReply} from './owner-meeting-prep-client.js';
 import {createHash} from 'node:crypto';
 import {z} from 'zod';
 import {createOwnerToolTransport} from './owner-tool-transport.js';
@@ -53,9 +54,11 @@ export interface OwnerSkillRequest {
   actionId: string; eventId: string; payloadHash: string; text: string; admittedAtMs: number;
   providerThreadId: string; args: OwnerSkillRequestArgs;
 }
+export const ownerSkillRequestRejectionSchema = z.enum(['event_conflict', 'source_unavailable', 'meeting_notes_not_connected', 'needs_context', 'unavailable', 'prep_window_closed']);
+export type OwnerSkillRequestRejection = z.infer<typeof ownerSkillRequestRejectionSchema>;
 const responseSchema = z.discriminatedUnion('status', [ownerSkillRequestReceiptSchema,
   z.object({version: z.literal(1), status: z.literal('not_found')}).strict(),
-  z.object({version: z.literal(1), status: z.literal('rejected'), code: z.enum(['event_conflict', 'source_unavailable', 'meeting_notes_not_connected', 'needs_context', 'unavailable'])}).strict(),
+  z.object({version: z.literal(1), status: z.literal('rejected'), code: ownerSkillRequestRejectionSchema}).strict(),
 ]);
 export function createOwnerSkillRequestClient(options: OwnerToolClientOptions) {
   const transport = createOwnerToolTransport(options, '/runtime/owner-skill-request');
@@ -85,9 +88,8 @@ export function createOwnerSkillRequestClient(options: OwnerToolClientOptions) {
 }
 export type OwnerSkillRequestClient = ReturnType<typeof createOwnerSkillRequestClient>;
 
-export const ownerSkillRequestRejectionSchema = z.enum(['event_conflict', 'source_unavailable', 'meeting_notes_not_connected', 'needs_context', 'unavailable']);
-export type OwnerSkillRequestRejection = z.infer<typeof ownerSkillRequestRejectionSchema>;
 export function skillRejectionAcknowledgement(skill: OwnerSkillRequestArgs['skill'], code: OwnerSkillRequestRejection): string {
+  if (code === 'prep_window_closed') return prepWindowClosedReply;
   if (skill === 'followup' && code === 'meeting_notes_not_connected') return 'I can’t verify those promises because your meeting notes aren’t connected. You can connect Granola in setup when you’re ready.';
   if (code === 'source_unavailable') return 'I could not check the sources needed for that work, so I did not queue it. Please try again when those sources are available.';
   if (code === 'event_conflict') return 'This message conflicts with a saved request, so I did not queue new work. Please send one specific request in a new message.';

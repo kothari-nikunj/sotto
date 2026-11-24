@@ -21,7 +21,11 @@ const OWNER_ONLY_BASELINE = createHash('sha256').update('sotto:owner-only-histor
 export const ownerOnlyAuthority = (): SourceAuthority => ({ version: 2, revision: OWNER_ONLY_BASELINE, complete: true, bridge_sources: [], google_sources: [], connector_sources: [] });
 export const unavailableAuthority = (): SourceAuthority => ({ version: 2, revision: null, complete: false, bridge_sources: [], google_sources: [], connector_sources: [] });
 export class SourceAuthorityChanged extends Error {
-  constructor() { super('Source permissions changed or could not be verified; the result was withheld.'); }
+  constructor(readonly confirmedChange = false) { super('Source permissions changed or could not be verified; the result was withheld.'); }
+  get notice(): string {
+    return (this.confirmedChange ? 'Source access changed while I was working.' : 'I couldn’t verify access to the source for that answer.')
+      + ' You can paste the relevant text here or check source access. If you requested a change, check its status before retrying.';
+  }
 }
 
 /** One authenticated receiver route; no redirects, ambient credentials, or arbitrary remote URL. */
@@ -56,18 +60,27 @@ export function createSourceAuthorityReader(options: { bridgeUrl: string; bearer
           new Set(parsed.data.google_sources).size !== parsed.data.google_sources.length ||
           new Set(parsed.data.connector_sources).size !== parsed.data.connector_sources.length) return unavailableAuthority();
       return parsed.data;
-    } catch { return unavailableAuthority(); }
+    } catch { signal?.throwIfAborted(); return unavailableAuthority(); }
   } };
 }
 
 export async function readAuthority(reader: SourceAuthorityReader, signal?: AbortSignal): Promise<SourceAuthority> {
+  signal?.throwIfAborted();
   let value: unknown;
-  try { value = await reader.read(signal); } catch { return unavailableAuthority(); }
+  try { value = await reader.read(signal); } catch { signal?.throwIfAborted(); return unavailableAuthority(); }
   const result = schema.safeParse(value);
-  return result.success && result.data.complete && result.data.revision &&
+  if (result.success && result.data.complete && result.data.revision &&
     new Set(result.data.bridge_sources).size === result.data.bridge_sources.length &&
     new Set(result.data.google_sources).size === result.data.google_sources.length &&
-    new Set(result.data.connector_sources).size === result.data.connector_sources.length ? result.data : unavailableAuthority();
+    new Set(result.data.connector_sources).size === result.data.connector_sources.length) return result.data;
+  signal?.throwIfAborted();
+  return unavailableAuthority();
+}
+
+/** Check an existing verified revision. An unavailable snapshot gets one fresh read. */
+export async function confirmAuthority(reader: SourceAuthorityReader, signal?: AbortSignal): Promise<SourceAuthority> {
+  const first = await readAuthority(reader, signal);
+  return first.complete ? first : readAuthority(reader, signal);
 }
 
 /** Consent equality, not an access grant. Bridge availability may change with the same
@@ -124,9 +137,10 @@ export class ConversationSourceGuard {
 
   async begin(signal?: AbortSignal): Promise<SourceAuthority> {
     // Independent reads: no purge or baseline write starts until both settle.
-    const [authority, baseline] = await Promise.all([
+    const [initial, baseline] = await Promise.all([
       readAuthority(this.options.reader, signal), this.baseline(),
     ]);
+    const authority = !initial.complete && baseline !== null ? await readAuthority(this.options.reader, signal) : initial;
     // Unknown is not a new permission revision. Callers suspend recall/projection until
     // verification returns; keep the last verified baseline to detect a real change then.
     if (!authority.complete) return authority;
@@ -138,9 +152,10 @@ export class ConversationSourceGuard {
     return authority;
   }
 
-  async finish(expected: SourceAuthority, signal?: AbortSignal): Promise<void> {
-    const current = await readAuthority(this.options.reader, signal);
-    if (sameConsent(expected, current)) return;
+  async finish(expected: SourceAuthority, signal?: AbortSignal, recheckUnavailable = false): Promise<void> {
+    const read = recheckUnavailable && expected.complete ? confirmAuthority : readAuthority;
+    const current = await read(this.options.reader, signal);
+    if (sameConsent(expected, current)) { signal?.throwIfAborted(); return; }
     // No result is released across an uncertain check. Only a verified change can
     // destroy previously verified history; an outage never grants access to it.
     if (current.complete && (expected.complete || await this.baseline() !== current.revision)) {
@@ -148,6 +163,6 @@ export class ConversationSourceGuard {
       this.lastPurge = {reason:'authority_changed_during_turn',atMs:Date.now()};
       await this.cleaned(current.revision);
     }
-    throw new SourceAuthorityChanged();
+    throw new SourceAuthorityChanged(expected.complete && current.complete);
   }
 }

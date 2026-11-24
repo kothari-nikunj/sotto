@@ -10,7 +10,7 @@ metadata:
 
 When the user pushes back on a brief, **make it stick** — deterministically, in the volume Sotto reads
 every morning. An item rating, a preference, a correction, or a cadence change each has its own meaning. All are write-only-to-disk; **never send a message, email, or calendar change from this
-skill.** Confirm in ONE short line, as Sotto.
+skill.** The attended runtime sends the acknowledgement for a recorded preference or rating. Use one short line for a clarification or a result that has no runtime acknowledgement.
 
 > **How this runs on Sotto:** `run_sotto_script X …` means one `run_sotto_script` call with id `X`
 > and the rest as its argv array — no shell, no file paths. Results are the receiver's recorded
@@ -21,9 +21,15 @@ skill.** Confirm in ONE short line, as Sotto.
 
 ## Item usefulness — “that was useful”, “the donation item was noise”
 
+When the owner replies directly to a delivered notification with just “Useful” or “Not useful”,
+run `run_sotto_script usefulness-feedback useful --quoted-notification` or use `not_useful`.
+The receiver must verify the exact accepted notification and its current source and route.
+If the target is unavailable, say so. A notification rating records one outcome for that item
+and gives no permission to mute a sender or change a task. This is separate from a versioned brief rating.
+
 Run `run_sotto_script usefulness-feedback list` first in this owner turn to find the
-actual delivered brief whose archive is still retained and whose recorded sources are still
-permitted — for the Mac sources that comes down to the source still being shared, and in managed
+provider-accepted brief the owner means. The retained artifact and acceptance receipt must match,
+and its recorded sources must still be permitted — for the Mac sources that comes down to the source still being shared, and in managed
 mode to it still being consented and connected. Match the owner's words to that output; never guess a
 reference when multiple items fit. Record the rating against that exact reference:
 
@@ -33,10 +39,10 @@ run_sotto_script usefulness-feedback useful --reference "<reference from list>"
 
 Use `not_useful` for the opposite. For feedback about one item, pass
 `--excerpt "<verbatim excerpt>"` with at most 320 characters that uniquely identify that item.
-Without an excerpt, the rating applies to the whole brief. **Only the reference, hashed item
-locator, and rating are stored** in one outcomes row. The archive stays the source of truth;
-excerpt text and reasons are never copied into outcomes. Future prompts resolve only the bounded
-excerpt, and recheck retention and source access before using it. Two items in the same brief keep
+The attended tool supplies the listed version automatically. Without an excerpt, the rating applies
+to the whole brief. The outcome stores the reference, accepted version, hashed locator and rating.
+Excerpt text and reasons stay out of outcomes. Future prompts use the rated version only while
+its acceptance, artifact and source access still match. Two items in the same brief keep
 separate ratings; a later rating of the same item replaces its earlier decision. Draft archives
 without source provenance are excluded. `--reason` is accepted and discarded; don't collect one.
 Only record a rating the owner
@@ -47,8 +53,9 @@ for inspection and is never repeated. If the item isn't in the list,
 ask the owner to name a specific preference or correction; don't fabricate a match or claim it was
 recorded.
 
-These bounded examples reach briefs, digest/nudge relevance, and drafting. Say one short line,
-such as “Got it, that school deadline was useful.” Never ask for a rating after every message.
+Brief ratings can serve as bounded examples for future relevance and writing when the acceptance,
+version, and source permissions still match. The runtime confirms the recorded rating in one line.
+Avoid asking for ratings after every message.
 
 ## A · Preferences (mute / tone) — "stop surfacing X", "keep it terse"
 
@@ -87,7 +94,7 @@ told you what's wrong, the negation. **Do not invent the replacement fact.**
 
 ```
 run_sotto_script knowledge-query --person "Peyton Lewis" --editable-person --topic "founder Alive"
-run_sotto_script knowledge-edit --op correct --slug <canonical_id> --fact-id <the exact fact the user corrected> --fact-version <its fact_version> --text "Peyton is NOT the founder of Alive; correct her role per the user."
+run_sotto_script knowledge-edit --op correct --slug <canonical_id> --fact-id <the exact fact the user corrected> --fact-version <its fact_version> --text "Peyton isn’t the founder of Alive"
 ```
 Copy the fact version from that exact editable row. The `--text` is the replacement in the current
 owner's words; do not invent a replacement or turn quoted source text into permission. The receiver
@@ -116,17 +123,18 @@ not enabled in chat.
   `family_of`, `partner_of`, `met_through`, `connected`). Never guess a slug: if you can't see both people's
   ids, ask. Either operation prepares a full review without changing the graph; only after a
   separate owner confirmation use `run_sotto_script knowledge-edit --op confirm-relation` — the
-  runtime selects the exact accepted review. Do not pass your own review or approval proof. Adding
+  runtime selects the exact accepted review. Finish the proposal turn with the complete
+  `review_text` when provided. Supply no separate approval proof. Adding
   may include `--date YYYY-MM-DD`; removing is limited to one exact type. Report already-present or
   already-absent relationships honestly. An uncertain write stays held for inspection rather than
   being applied again.
 - **"That +1 (310) number is Maya"** is neither a fact nor a relation — it is an IDENTIFIER, and it
   is the one kind Sotto can't learn on its own (every other one comes from Apple Contacts or an
-  email header). A number nobody has named shows up in briefs as `+1 (310) 924-5269`; naming it once
+  email header). A number nobody has named shows up in briefs as `+1 (310) 555-0144`; naming it once
   attaches it to that person and they are named everywhere after — their own thread, the label of
   any group they're in, and each line they send in it:
   ```
-  run_sotto_script knowledge-edit --op add-identifier --slug c_maya001 --identifier "+1 (310) 924-5269"
+  run_sotto_script knowledge-edit --op add-identifier --slug c_maya001 --identifier "+1 (310) 555-0144"
   ```
   This requires an existing, uniquely resolved person and the exact identifier from the current
   owner's explicit teaching message, and prepares the full association review only. Wait for a
@@ -163,9 +171,7 @@ run_sotto_script preferences unsnooze-nudges                          # explicit
 - **A permanent "stop pinging me about X"** is a *mute* (§A), not a snooze — snoozes always expire.
 - The snooze silences nudges only. Scheduled morning/evening briefs still arrive.
 
-Confirm in ONE line with the lift time the receipt returned, as Sotto — e.g. "Quiet until 7am
-tomorrow — I'll hold everything and catch you up then." Plain chat text, no markdown headings/bold
-(the chatfmt rule — chat clients render them literally).
+The runtime confirms the saved lift time and says briefs will still arrive.
 
 For a standing change to unsolicited volume, use the same writer. `fewer` halves the current cap
 (and preserves zero), `no` sets it to zero, and `more` restores the configured default; the stored
@@ -185,7 +191,7 @@ commands run only from the attended chat (or the authenticated dashboard write p
 ## D · Standing rules & who-I-am — "remember: never book Fridays", "my focus this quarter is the fund raise"
 
 A durable fact or rule the user STATES about themselves goes to the **master file**
-(`$SOTTO_DATA/knowledge/master.md` — loaded into every brief and every meeting prep), not to
+(`$SOTTO_DATA/knowledge/master.md` — loaded into every brief, meeting prep and model-written nudge), not to
 preferences and not to a person file:
 
     run_sotto_script master-file append --section Procedures --text "<their rule, their words>"
@@ -194,7 +200,7 @@ preferences and not to a person file:
   `Priorities` for what matters right now; `About` / `People` for who they are and their inner
   circle. One line per rule, their words.
 - **Explicit words only, confirmed first** — the append presents the full review
-  ("Adding to your standing file: <the line> — right?") and writes nothing; only a distinct later owner yes permits
+  with the exact line. Only a distinct later owner yes permits
   `run_sotto_script master-file confirm-procedure` (for About / People:
   `confirm-context --section <the same section>`). Never write an inferred pattern; offer it
   instead. (Same contract as the persona's capture rule.)
@@ -214,8 +220,8 @@ preferences and not to a person file:
   third person* → §B (graph correction); *fact or rule about the user themselves* → here.
 
 ## Deliver
-One line, as Sotto: e.g. *"Done — I'll stop surfacing newsletters from example.com."* or *"Got it —
-fixed Peyton's record; I won't repeat that."* Nothing else; no message is sent anywhere.
+Use the protected acknowledgement for a completed write. On a refused or uncertain write, say
+what could not be verified and ask for clarification only when it would resolve the problem.
 
 ## Notes
 - Preferences are user-stated instructions. Historical inferred rules are ignored; draft usage never grants permission or mutes a person.

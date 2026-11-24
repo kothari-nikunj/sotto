@@ -54,7 +54,7 @@ for (const mode of ['valid','route','aged','session','unknown','multipart','corr
   } finally {f.close();}
  });
 
-for(const mode of ['current','revoked','new-session','fresh-after-reset','wrong-route','unknown'] as const)
+for(const mode of ['current','revoked','new-session','catch-up','fresh-after-reset','wrong-route','unknown'] as const)
  test(`application exposes exact scheduled quote only as source-bound model context: ${mode}`,async t=>{
   const {startApplication}=await import('../src/application.js');
   t.mock.timers.enable({apis:['Date'],now:Date.UTC(2026,10,3,18)});
@@ -84,10 +84,23 @@ for(const mode of ['current','revoked','new-session','fresh-after-reset','wrong-
    journal.beginDispatch('scheduled-quote');journal.settleDispatch('scheduled-quote',1,mode==='unknown'?'unknown':'accepted','background-provider',['background-provider'],sentAt+10);
    if(mode==='revoked')current='b'.repeat(64);
    if(mode==='new-session')await app.rotateSessions();
+   if(mode==='catch-up') {
+    const cutoff=new Date(Date.now()-1).toISOString();
+    const resp=await fetch('http://127.0.0.1:'+app.port+'/v1/sessions',{method:'POST',
+      headers:{authorization:'Bearer local-scheduled-quote-test-token-000000','content-type':'application/json'},
+      body:JSON.stringify({action:'rotate',before:cutoff})});
+    assert.deepEqual(await resp.json(),{rotated:true,count:0});
+    // Preserve a background dispatch created after the sweep even if the native thread predates it.
+    journal.db.prepare('UPDATE memory_sessions SET created_at=?').run(Date.now()-1000);
+    const second=await fetch('http://127.0.0.1:'+app.port+'/v1/sessions',{method:'POST',
+      headers:{authorization:'Bearer local-scheduled-quote-test-token-000000','content-type':'application/json'},
+      body:JSON.stringify({action:'rotate',before:cutoff})});
+    assert.deepEqual(await second.json(),{rotated:true,count:1});
+   }
    await app.receive({...inbound,eventId:'quoted',text:'What is this about?',replyBound:true,replyToMessageId:'background-provider'},
     {threadId:'thread',sentAtMs:sentAt+100});
    if(mode==='new-session')assert.equal(journal.getDispatch('scheduled-quote')!.created_at,journal.db.prepare('SELECT created_at FROM memory_sessions').get()!.created_at);
-   assert.equal(calls,mode==='fresh-after-reset'?3:2);assert.equal(quoteVisible,mode==='current'||mode==='fresh-after-reset');
+   assert.equal(calls,mode==='fresh-after-reset'?3:2);assert.equal(quoteVisible,mode==='current'||mode==='fresh-after-reset'||mode==='catch-up');
    const event=String(journal.db.prepare("SELECT id FROM inbound_events WHERE source_id='quoted'").get()!.id);
    assert.equal(journal.continuationArgs(event),null);
    assert.throws(()=>journal.ownerWebReadReplyTarget(event,'https://planted.example/',revision),/Accepted reply URL unavailable/);

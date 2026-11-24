@@ -292,3 +292,27 @@ def test_selected_unthreaded_decline_no_match_no_effect(context,monkeypatch):
     body=selected_request('ordinary-question','preview',text='No.')
     assert call(body,context)=={'version':1,'status':'no_match'}
     assert path.read_bytes()==before and pending_offer.get_offer(message_id='accepted-source-offer')
+
+
+def test_hide_ignores_other_questions_on_same_delivery_and_leaves_task(context, monkeypatch):
+    data, policy, _activation = context
+    policy.update(SOTTO_DATA=str(data), SOTTO_RUNTIME_PROFILE='managed-photon-fixed-five-v1')
+    monkeypatch.setattr(pending_offer, '_now', lambda: WHEN)
+    monkeypatch.setenv('SOTTO_DELIVERY_RUN_ID', '1' * 32)
+    receipt = {'message_id': 'offered-in-brief', 'target': 'photon',
+               'chat_id': 'iMessage;-;owner', 'accepted_at': WHEN.timestamp() - 1}
+    prep = pending_offer.set_offer('meeting_prep', 'Want the prep?', prepare_only=True)
+    draft = pending_offer.set_offer('followup_draft', 'Review draft or Hide?',
+        anchor_key='unchanged-loop', action='contextual_draft', prepare_only=True)
+    pending_offer.activate_offer(prep, receipt)
+    pending_offer.activate_offer(draft, receipt)
+    ledger = data / 'knowledge/continuity'
+    ledger.mkdir(parents=True, exist_ok=True)
+    existing = ledger / 'unchanged.md'
+    original = '---\nanchor_key: unchanged-loop\nstatus: open\n---\n'
+    existing.write_text(original)
+    result = call(request('Hide', anchor='offered-in-brief'), context)
+    assert result['status'] == 'committed' and result['outcome']['loop_changed'] is False
+    assert not pending_offer.get_offer(offer_id=draft['offer_id'])
+    assert pending_offer.get_offer(offer_id=prep['offer_id'])
+    assert existing.read_text() == original

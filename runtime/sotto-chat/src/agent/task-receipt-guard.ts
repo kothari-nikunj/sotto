@@ -12,6 +12,8 @@ export function taskReceiptGuard():OutputProcessor {
  return {id:'sotto-task-receipt-guard',
   processOutputStep:({text,toolCalls,messages,requestContext,state,abort,retryCount})=>{
    if(requestContext?.get('answerOnly')===true)return messages;
+   if(toolCalls && (toolCalls.length>1 || text?.trim()) && toolCalls.some(call=>call.toolName==='owner_meeting_prep_offer'))
+    requestContext?.set('ownerPrepOfferHandoff','deferred');
    // Conservatively permit correction only before any tool attempt. The catalog
    // has no universal read-only marker; a name list cannot prove effect absence.
    if(toolCalls?.length)state.toolAttempted=true;
@@ -34,14 +36,14 @@ export function taskReceiptGuard():OutputProcessor {
 }
 
 
-type HandoffKey = 'ownerSkillQueued' | 'ownerPreferenceSettled' | 'ownerTaskSettled' | 'ownerTaskClarification';
+type HandoffKey = 'ownerSkillQueued' | 'ownerPrepOfferHandoff' | 'ownerPreferenceSettled' | 'ownerTaskSettled' | 'ownerTaskClarification';
 export type OwnerTurnOutcome = {kind:'continue'} | {kind:'handoff'} | {kind:'clarification'; text:string};
 
 /** Interpret loop control once; receipt evidence remains independent for parallel tool results. */
 export function ownerTurnOutcome(context:{get(key:HandoffKey):unknown}):OwnerTurnOutcome {
  const clarification=context.get('ownerTaskClarification');
  if(typeof clarification==='string'&&clarification)return {kind:'clarification',text:clarification};
- if(['ownerSkillQueued','ownerPreferenceSettled','ownerTaskSettled'].some(key=>context.get(key as HandoffKey)===true))
+ if(context.get('ownerPrepOfferHandoff')==='settled' || ['ownerSkillQueued','ownerPreferenceSettled','ownerTaskSettled'].some(key=>context.get(key as HandoffKey)===true))
   return {kind:'handoff'};
  return {kind:'continue'};
 }

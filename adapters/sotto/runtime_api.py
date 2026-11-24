@@ -358,10 +358,13 @@ def validate_fixed_work(kind, payload):
         _fixed_five_module().validate_work(kind, payload, os.environ)
 
 
-def send_receipt(body, target, timeout=60, dispatch_id=None, attempt=1, *, source_revision=None):
+def send_receipt(body, target, timeout=60, dispatch_id=None, attempt=1, *, source_revision=None, valid_until_ms=None):
     if not isinstance(dispatch_id, str) or not dispatch_id:
         return False, 'stable dispatch identity required', {'acceptance': 'not_attempted', 'target': target}
-    return _client(timeout).send_receipt(body, target, dispatch_id, attempt=attempt, **({'source_revision': source_revision} if source_revision is not None else {}))
+    context = {'source_revision': source_revision} if source_revision is not None else {}
+    if valid_until_ms is not None:
+        context['valid_until_ms'] = valid_until_ms
+    return _client(timeout).send_receipt(body, target, dispatch_id, attempt=attempt, **context)
 
 
 def gallery_available():
@@ -436,7 +439,7 @@ def _read_private_gallery(paths, data_root):
             os.close(descriptor)
 
 
-def send_gallery(presentation, target, dispatch_id, timeout=60):
+def send_gallery(presentation, target, dispatch_id, timeout=60, *, valid_until_ms=None):
     if not isinstance(presentation, dict) or not isinstance(presentation.get('images'), list) \
             or not isinstance(presentation.get('summary'), str):
         return False, 'gallery payload invalid', {'acceptance': 'not_attempted'}
@@ -444,7 +447,8 @@ def send_gallery(presentation, target, dispatch_id, timeout=60):
         images = _read_private_gallery(presentation['images'], os.environ.get('SOTTO_DATA', '/data'))
     except (OSError, ValueError, TypeError):
         return False, 'gallery files unavailable', {'acceptance': 'not_attempted'}
-    return _client(timeout).send_gallery_bytes(images, presentation['summary'], target, dispatch_id)
+    deadline = {'valid_until_ms': valid_until_ms} if valid_until_ms is not None else {}
+    return _client(timeout).send_gallery_bytes(images, presentation['summary'], target, dispatch_id, **deadline)
 
 
 def gallery_receipt(dispatch_id, timeout=5):
@@ -670,10 +674,10 @@ def personal_routines_supported():
             and re.fullmatch('[a-f0-9]{32}', os.environ.get('SOTTO_ROUTINE_EPOCH', '')) is not None)
 
 
-def archive_sessions():
+def archive_sessions(before):
     """Rotate runtime chat sessions through the existing private loopback API."""
     try:
-        result = _client(timeout=30).sessions('rotate')
+        result = _client(timeout=30).sessions('rotate', before=before)
         count = result.get('count') if isinstance(result, dict) else None
         return count if type(count) is int and count >= 0 else None
     except (ValueError, OSError, RuntimeError, TypeError):

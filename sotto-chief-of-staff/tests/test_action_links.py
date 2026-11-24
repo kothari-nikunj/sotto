@@ -16,7 +16,7 @@ def test_imessage_link():
 
 
 @pytest.mark.parametrize('identifier', [
-    'ramp_cf8gd1ek_agent', 'ramp_cf8gd1ek_agent@rbm.goog', 'contact_14155551234', '81', '123@lid',
+    'ramp_cf8gd1ek_agent', 'ramp_cf8gd1ek_agent@rbm.goog', 'contact_14155550107', '81', '123@lid',
     '120363012345678@g.us', '+1415***1234', '', '+1?body=oops', '1234567890123456',
 ])
 @pytest.mark.parametrize('channel', ['imessage', 'sms', 'whatsapp', 'phone', 'email', 'gmail'])
@@ -41,7 +41,7 @@ def test_real_short_codes_and_whatsapp_phone_jids_work():
     assert al.link_for('phone', '12345') == ''
     assert al.link_for('whatsapp', '15551234567@s.whatsapp.net', 'Hi') == \
         'https://wa.me/15551234567?text=Hi'
-    assert al.link_for('imessage', '(415) 555-1234', 'Hi') == 'imessage://4155551234?body=Hi'
+    assert al.link_for('imessage', '(415) 555-0107', 'Hi') == 'imessage://4155550107?body=Hi'
 
 
 def test_whatsapp_https_form():
@@ -155,7 +155,7 @@ def test_the_brief_stops_pasting_mailto_urls_too():
 def test_the_deep_link_fallback_is_untouched():
     """The mailto builder stays — it is what a host without Google, and every non-email channel,
     still runs on. Removing it would leave those cases with nothing."""
-    assert al.link_for("email", "pegah@example.com", "Hey Pegah", subject="Railway SAFE") \
-        .startswith("mailto:pegah@example.com?")
+    assert al.link_for("email", "odile@example.com", "Hey Odile", subject="Railway SAFE") \
+        .startswith("mailto:odile@example.com?")
     assert al.link_for("whatsapp", "+15551234567", "hi") == "https://wa.me/15551234567?text=hi"
     assert al.link_for("imessage", "+15551234567", "hi") == "imessage://+15551234567?body=hi"

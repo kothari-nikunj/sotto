@@ -3,6 +3,7 @@ import re
 from urllib.parse import unquote
 
 
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _LINK = re.compile(
     r'(?<![A-Za-z0-9/])(?:\[(?P<label>[^\]]*)\]\(\s*)?'
     r'<?(?P<scheme>imessage://|sms:|tel:|https://wa\.me/)'
@@ -85,3 +86,34 @@ def strip_invalid_links(text: str) -> str:
                 continue
         lines.append(clean)
     return '\n'.join(lines)
+
+
+# Remove unsupported recipient links and mailto URLs from unattended output.
+_MAILTO_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(\s*mailto:[^)]*\)")
+_MAILTO_URL_RE = re.compile(r"<?mailto:[^\s<>\]\)]+>?")
+
+
+def strip_unattended_links(text: str) -> str:
+    """Remove every `mailto:` link, and every other tap link whose recipient message_targets does
+    not validate (phone 7-15 digits, a Messages short code, or an Apple ID email) — keeping its
+    label text if it had one — from a message body, and any line that was nothing but one."""
+    text = strip_invalid_links(text)
+    if "mailto:" not in text:
+        return text
+    kept = []
+    for line in text.split("\n"):
+        rest = line
+        if "mailto:" in rest:
+            rest = _MAILTO_URL_RE.sub("", _MAILTO_MD_LINK_RE.sub(r"\1", rest))
+        if rest == line:
+            kept.append(line)
+            continue
+        if _STUB.fullmatch(rest):
+            continue
+        kept.append(rest.rstrip())
+    return "\n".join(kept)
+
+
+def delivery_body(text: str) -> str:
+    body = strip_unattended_links(HTML_COMMENT_RE.sub('', text or ''))
+    return re.sub(r'\n{3,}', '\n\n', body).strip()

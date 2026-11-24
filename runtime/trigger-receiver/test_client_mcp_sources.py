@@ -1,5 +1,6 @@
 """External source adapters use existing readers with scoped, current authority."""
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,10 @@ PACK = Path(__file__).resolve().parents[2] / 'sotto-chief-of-staff'
 _spec = importlib.util.spec_from_file_location('mcp_source_catalog_fixture', PACK / '_shared/lib/source_catalog.py')
 CATALOG = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(CATALOG)
+sys.path.insert(0, str(PACK / '_shared/lib'))
+import render_local  # noqa: E402
+import textutil  # noqa: E402
+LIBS = {'source_catalog': CATALOG, 'render_local': render_local, 'textutil': textutil}
 REVISION = 'a' * 64
 
 
@@ -20,10 +25,10 @@ def receiver(payload, *, bridge=(), google=(), connectors=(), after=None):
     states = iter([before, after if after is not None else before])
     calls = []
     rec = SimpleNamespace(_runtime_source_authority=lambda **_: next(states),
-        RELAY=SimpleNamespace(mcp_call=lambda request, **_: calls.append(request) or
+        RELAY=SimpleNamespace(bridge_connected=lambda: True, mcp_call=lambda request, **_: calls.append(request) or
             {'result': {'structuredContent': payload}}),
         _source_context=lambda: SimpleNamespace(unwrap_tool_result=lambda result: result['structuredContent']),
-        _load_shared_lib=lambda name: CATALOG if name == 'source_catalog' else None,
+        _load_shared_lib=LIBS.get,
         _sotto_adapter=lambda name: SimpleNamespace(read_owner=lambda operation, arguments:
             calls.append((operation, arguments)) or payload))
     return rec, calls, before
@@ -66,14 +71,17 @@ def test_local_reads_check_source_before_and_after(name, args, source):
     with pytest.raises(RuntimeError, match='source unavailable'):
         backend.read(rec, name, args)
     assert calls == []
-    for patch in ({'bridge_sources': []}, {'revision': 'b' * 64}, {'complete': False}):
-        before = {'complete': True, 'revision': REVISION, 'bridge_sources': [source],
-                  'google_sources': [], 'connector_sources': []}
-        payload = {'source_status': {source: 'ok'}} if name == 'sotto_mac_context' else {'status': 'ok'}
+    before = {'complete': True, 'revision': REVISION, 'bridge_sources': [source],
+              'google_sources': [], 'connector_sources': []}
+    payload = {'source_status': {source: 'ok'}} if name == 'sotto_mac_context' else {'id': 42, 'status': 'ok', 'body': 'Original note'}
+    for patch in ({'revision': 'b' * 64}, {'complete': False}):
         rec, calls, _ = receiver(payload, bridge=[source], after={**before, **patch})
         with pytest.raises(RuntimeError):
             backend.read(rec, name, args)
         assert len(calls) == 1
+    # The after-read check verifies consent only: a Mac that sleeps after answering keeps the result.
+    rec, calls, _ = receiver(payload, bridge=[source], after={**before, 'bridge_sources': []})
+    assert backend.read(rec, name, args) and len(calls) == 1
 
 
 def test_failed_mac_reads_carry_a_fix_hint_for_their_failure():
@@ -283,7 +291,8 @@ def test_mac_invalid_cursor_requires_restart(cursor):
 
 
 def test_mac_oversized_individual_row_fails_without_silent_loss():
-    payload = {'contacts': [{'name': 'Synthetic', 'notes': 'x' * 40000}],
+    # Notes are capped for clients, so an oversized address is the oversized row.
+    payload = {'contacts': [{'name': 'Synthetic', 'emails': ['x' * 40000]}],
                'contacts_total': 1, 'source_status': {'contacts': 'ok'}}
     with pytest.raises(RuntimeError, match='page byte limit'):
         _mac_read(payload, {'sources': ['contacts']})
@@ -359,3 +368,50 @@ def test_native_note_page_rejects_malformed_or_oversized_payload(patch):
     rec, _, _ = receiver({**page, **patch}, bridge=['apple_notes'])
     with pytest.raises(RuntimeError, match='Bridge note page invalid'):
         backend.read(rec, 'sotto_note_get', {'id': 42})
+
+
+def test_three_parallel_mac_reads_all_succeed_through_a_serial_bridge(tmp_path, monkeypatch):
+    # The Bridge runs one request at a time (poll, execute, respond). A 2 s after-read health probe
+    # queued behind two other reads timed out and discarded a good result (audit R1).
+    import threading
+    import time
+    from relay import Relay
+    from test_source_authority import rec, _setup, _health, managed
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.delenv('SOTTO_HOME', raising=False)
+    managed.record_bridge_consent(tmp_path, ['imessage'], ['imessage'])
+    relay = Relay()
+    monkeypatch.setattr(rec, 'RELAY', relay)
+    monkeypatch.setattr(rec, '_BRIDGE_PROBE_CACHE', {})
+    executed = []
+
+    def bridge():
+        while True:
+            req = relay.poll(timeout=5)
+            if req is None:
+                continue
+            name = req['params']['name']
+            executed.append(name)
+            time.sleep(1.5 if name == 'read_history' else 0.02)
+            payload = _health() if name == 'health' else {'messages': [], 'coverage': {'status': 'ok'}}
+            relay.respond({'jsonrpc': '2.0', 'id': req['id'],
+                           'result': {'structuredContent': payload, 'isError': False}})
+            time.sleep(0.3)  # the next poll reconnects (curl + TLS)
+    threading.Thread(target=bridge, daemon=True).start()
+    while not relay.bridge_connected():
+        time.sleep(0.01)
+    results, errors = [], []
+
+    def read():
+        try:
+            results.append(backend.read(rec, 'sotto_message_history',
+                                        {'source': 'imessage', 'since': 1, 'until': 2}))
+        except Exception as error:  # noqa: BLE001 - the assertion reports it
+            errors.append(repr(error))
+    threads = [threading.Thread(target=read) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert errors == [] and len(results) == 3
+    assert executed.count('read_history') == 3 and executed.count('health') <= 3

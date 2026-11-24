@@ -25,6 +25,18 @@ def _timed_call(stage, function, *args, **kwargs):
         return function(*args, **kwargs)
 
 
+def record_attendee_search(inputs, comms, attendee_emails, sources):
+    """A failed attendee search is a gap, not an empty mailbox: Gmail reads `partial` so the prep
+    says so, and counts as consulted only when at least one attendee's search actually ran."""
+    from compose_meeting_prep import attendee_search_failures
+    failed = attendee_search_failures(comms)
+    availability = inputs['google']['_source_availability']
+    if failed and availability.get('gmail', 'available') == 'available':
+        availability['gmail'] = 'partial'
+    if any(str(email).strip().lower() not in failed for email in attendee_emails):
+        sources.add('gmail')
+
+
 def run(pack, selection, command, *, exact_meeting=None):
     from source_context import allowed, read_local, project_local, project_emails, project_x, used_sources
     from textutil import unwrap_tool_result
@@ -32,7 +44,7 @@ def run(pack, selection, command, *, exact_meeting=None):
     from local_snapshot import resolve_effective_local
     from timeutil import configured_tz, configured_user_email, _now_local
     sys.path.insert(0, str(Path(pack) / 'meeting-prep/scripts'))
-    from compose_meeting_prep import compose
+    from compose_meeting_prep import compose, refresh_prep_conversation
     from prep_selection import require_exact_meeting, upcoming, focus_hits, time_focus_hits, title_focus_hits
     if not allowed('calendar'):
         raise RuntimeError('Calendar prep source unavailable')
@@ -195,7 +207,7 @@ def run(pack, selection, command, *, exact_meeting=None):
                 command('_shared/scripts/gather_google.py', '--attendee-comms', comms_attendees,
                         '--comms-out', comms_path, *(['--expand-threads'] if focus or exact_meeting is not None else []), decode=False)
                 comms = json.loads(comms_path.read_text())
-                sources.add('gmail')
+                record_attendee_search(inputs, comms, all_attendees, sources)
             comms_path.write_text(json.dumps(comms))
             inputs['attendee_comms'] = comms
             guard('preparation')
@@ -225,6 +237,8 @@ def run(pack, selection, command, *, exact_meeting=None):
                 inputs['x_context'] = project_x(raw_x)
             guard('X gather')
         with _timed('compose'):
+            refresh_prep_conversation(inputs)
+            guard('conversation read')
             result = compose(inputs)
             guard('composition')
             if not result.get('prep_markdown', '').strip():

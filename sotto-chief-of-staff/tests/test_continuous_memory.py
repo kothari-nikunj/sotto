@@ -687,59 +687,65 @@ def test_unsupported_proxy_model_holds_before_reading_history(tmp_path, monkeypa
     assert 'sources' not in json.loads(Path(memory_cycle.state_path()).read_text())
 
 
+def _accepted_feedback_fixture(root, text, sources=()):
+    import hashlib
+    import time
+
+    run = 'b' * 32
+    artifact = root / 'events/work-inputs/brief-fixture/artifact.json'
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(json.dumps({'brief_text': text, '_source_permissions': list(sources),
+                                    '_delivery_run_ids': [run]}))
+    outbox = root / 'events/outbox.json'
+    outbox.write_text(json.dumps({'rows': [{'id': run, 'day': '2026-09-07', 'status': 'delivered',
+        'acceptance': 'accepted', 'acceptance_uncertain': False, 'contacted_at': time.time(),
+        'payload': {'label': 'cron:sotto-morning-brief'},
+        'receipt': {'accepted_at': time.time(), 'brief_body_sha256': hashlib.sha256(text.encode()).hexdigest()}}]}))
+    return '2026-09-07_morning', artifact, outbox
+
+
 def test_feedback_is_an_explicit_bound_example_not_a_permission(tmp_path, monkeypatch):
-    brief = tmp_path / 'briefs/2026-09-07_morning.json'
-    brief.parent.mkdir()
     text = 'The preschool sunscreen waiver still needs completing before tomorrow.'
-    brief.write_text(json.dumps({'brief_text': text, '_source_permissions': []}))
-    brief.with_name('2026-09-07.morning.delivered').write_text('run')
-    usefulness_feedback.record(brief.stem, 'useful', text, 'This is exactly what I need help remembering.')
+    reference, _, _ = _accepted_feedback_fixture(tmp_path, text)
+    usefulness_feedback.record(reference, 'useful', text, 'This is exactly what I need help remembering.')
     rendered = personal_context.render_feedback()
-    assert brief.stem in rendered and '"outcome": "useful"' in rendered
+    assert reference in rendered and '"outcome": "useful"' in rendered
     assert text in rendered
     assert text in relevance.judgment_prompt('another school deadline')
     assert not (tmp_path / 'preferences.json').exists()
     with pytest.raises(ValueError, match='verbatim'):
-        usefulness_feedback.record(brief.stem, 'not_useful', 'invented text')
+        usefulness_feedback.record(reference, 'not_useful', 'invented text')
     monkeypatch.setenv('SOTTO_UNATTENDED', 'true')
     with pytest.raises(ValueError, match='owner'):
-        usefulness_feedback.record(brief.stem, 'not_useful')
+        usefulness_feedback.record(reference, 'not_useful')
 
 
 def test_feedback_keeps_items_independent_and_archive_controls_retention(tmp_path):
-    brief = tmp_path / 'briefs/2026-09-07_morning.json'
-    brief.parent.mkdir()
     first = 'The preschool waiver is due tomorrow.'
     second = 'The quarterly tax estimate is due Friday.'
-    brief.write_text(json.dumps({'brief_text': first + '\n\n' + second,
-                                 '_source_permissions': []}))
-    marker = brief.with_name('2026-09-07.morning.delivered')
-    marker.write_text('run')
-    usefulness_feedback.record(brief.stem, 'useful', first)
-    usefulness_feedback.record(brief.stem, 'not_useful', second)
+    reference, _, outbox = _accepted_feedback_fixture(tmp_path, first + '\n\n' + second)
+    usefulness_feedback.record(reference, 'useful', first)
+    usefulness_feedback.record(reference, 'not_useful', second)
     examples = personal_context.feedback()
     assert [(e['outcome'], e['item']) for e in examples] == [('useful', first), ('not_useful', second)]
     # A correction replaces only the matching item in the bounded reader.
-    usefulness_feedback.record(brief.stem, 'useful', second)
+    usefulness_feedback.record(reference, 'useful', second)
     examples = personal_context.feedback()
     assert [(e['outcome'], e['item']) for e in examples] == [('useful', first), ('useful', second)]
     outcomes = (tmp_path / 'outcomes.jsonl').read_text()
     assert first not in outcomes and second not in outcomes
-    marker.unlink()
+    outbox.unlink()
     assert personal_context.feedback() == []
 
 
 def test_feedback_archive_requires_current_source_consent(tmp_path, monkeypatch):
-    brief = tmp_path / 'briefs/2026-09-07_morning.json'
-    brief.parent.mkdir()
     text = 'A private message-derived item.'
-    brief.write_text(json.dumps({'brief_text': text, '_source_permissions': ['imessage']}))
-    brief.with_name('2026-09-07.morning.delivered').write_text('run')
+    reference, artifact, _ = _accepted_feedback_fixture(tmp_path, text, ['imessage'])
     source_state = tmp_path / 'config/source-state.json'
     source_state.parent.mkdir()
     source_state.write_text(json.dumps({'sources': {'imessage': {'status': 'ok'}}}))
     assert usefulness_feedback.items()[0]['text'] == text
-    usefulness_feedback.record(brief.stem, 'useful', text)
+    usefulness_feedback.record(reference, 'useful', text)
     source_state.write_text(json.dumps({'sources': {'imessage': {'status': 'disabled'}}}))
     assert usefulness_feedback.items() == []
     assert personal_context.feedback() == []
@@ -752,7 +758,7 @@ def test_feedback_archive_requires_current_source_consent(tmp_path, monkeypatch)
     assert usefulness_feedback.items() == []
 
     # Legacy archives and offered drafts cannot prove source consent, so neither exposes prose.
-    brief.write_text(json.dumps({'brief_text': text}))
+    artifact.write_text(json.dumps({'brief_text': text}))
     assert usefulness_feedback.items() == []
     drafts = tmp_path / 'events/drafts.jsonl'
     drafts.parent.mkdir(exist_ok=True)
@@ -761,53 +767,41 @@ def test_feedback_archive_requires_current_source_consent(tmp_path, monkeypatch)
 
 
 def test_feedback_excerpt_must_identify_one_item(tmp_path):
-    brief = tmp_path / 'briefs/2026-09-07_morning.json'
-    brief.parent.mkdir()
     repeated = 'Same item.'
-    brief.write_text(json.dumps({'brief_text': repeated + '\n' + repeated,
-                                 '_source_permissions': []}))
-    brief.with_name('2026-09-07.morning.delivered').write_text('run')
+    reference, _, _ = _accepted_feedback_fixture(tmp_path, repeated + '\n' + repeated)
     with pytest.raises(ValueError, match='exactly one'):
-        usefulness_feedback.record(brief.stem, 'useful', repeated)
+        usefulness_feedback.record(reference, 'useful', repeated)
 
 
 def test_feedback_excerpt_counts_overlapping_occurrences(tmp_path):
     """A self-overlapping excerpt has two equally valid starts; a non-overlapping scan sees one."""
-    brief = tmp_path / 'briefs/2026-09-07_morning.json'
-    brief.parent.mkdir()
-    brief.write_text(json.dumps({'brief_text': 'na na na batman.', '_source_permissions': []}))
-    brief.with_name('2026-09-07.morning.delivered').write_text('run')
+    reference, _, _ = _accepted_feedback_fixture(tmp_path, 'na na na batman.')
     with pytest.raises(ValueError, match='exactly one'):
-        usefulness_feedback.record(brief.stem, 'useful', 'na na')
+        usefulness_feedback.record(reference, 'useful', 'na na')
 
 
-@pytest.mark.parametrize('lost', ['archive', 'marker', 'consent', 'provenance'])
+@pytest.mark.parametrize('lost', ['artifact', 'outbox', 'consent', 'provenance'])
 @pytest.mark.parametrize('legacy', [False, True])
 def test_whole_brief_feedback_requires_authorized_archive(tmp_path, lost, legacy):
-    brief = tmp_path / 'briefs/2026-09-07_morning.json'
-    brief.parent.mkdir()
-    brief.write_text(json.dumps({'brief_text': 'A useful morning brief.',
-                                 '_source_permissions': ['imessage']}))
-    marker = brief.with_name('2026-09-07.morning.delivered')
-    marker.touch()
+    reference, artifact, outbox = _accepted_feedback_fixture(tmp_path, 'A useful morning brief.', ['imessage'])
     source = tmp_path / 'config/source-state.json'
     source.parent.mkdir()
     source.write_text(json.dumps({'sources': {'imessage': {'status': 'ok'}}}))
-    usefulness_feedback.record(brief.stem, 'useful')
+    usefulness_feedback.record(reference, 'useful')
     if legacy:
         outcomes = tmp_path / 'outcomes.jsonl'
         row = json.loads(outcomes.read_text())
-        row.pop('item_locator')
+        row.pop('archive_version')
         outcomes.write_text(json.dumps(row) + '\n')
-    assert len(personal_context.feedback()) == 1
-    if lost == 'archive':
-        brief.unlink()
-    elif lost == 'marker':
-        marker.unlink()
+    assert len(personal_context.feedback()) == (0 if legacy else 1)
+    if lost == 'artifact':
+        artifact.unlink()
+    elif lost == 'outbox':
+        outbox.unlink()
     elif lost == 'consent':
         source.write_text(json.dumps({'sources': {'imessage': {'status': 'disabled'}}}))
     else:
-        brief.write_text(json.dumps({'brief_text': 'Legacy archive without provenance.'}))
+        artifact.write_text(json.dumps({'brief_text': 'Legacy archive without provenance.'}))
     assert personal_context.feedback() == []
 
 
@@ -900,6 +894,21 @@ def test_default_cycle_hands_the_dreamer_one_frozen_evidence_batch(tmp_path, mon
     assert len(prepared) == 2 and len(prompts) == 1
 
 
+def test_memory_cycle_retires_legacy_dreamer_latch_after_import(monkeypatch):
+    _quiet_memory_inputs(monkeypatch)
+    ku.apply(fact(), NOW)
+    path = Path(memory_cycle.state_path())
+    legacy = {'request': 'pre-upgrade', 'candidates': 'unmappable', 'attempts': 2}
+    dreamer.jsonstore.write_atomic(str(path), {'dreamer_failure': legacy})
+    monkeypatch.setattr(dreamer.model_work, 'call', lambda *a, **k: pytest.fail('legacy hold'))
+    complete = lambda *a: {'status': 'ok', 'rows': [], 'next_cursor': None, 'complete': True}
+    for hour in range(2):
+        receipt = memory_cycle.run(NOW + timedelta(hours=hour), fetch=complete)
+        assert receipt['dreamer']['legacy_unmapped']
+        assert 'dreamer_failure' not in json.loads(path.read_text())
+    assert dreamer.jsonstore.read(dreamer._state_path())['legacy_import'] == legacy
+
+
 def test_background_hold_is_reported_even_when_dreamer_preparation_also_failed(tmp_path, monkeypatch):
     """A held cycle reports the hold. HOW-SOTTO-DECIDES promises the actual hold reason is
     retained, and a preparation failure underneath it must not overwrite that with `failed`."""
@@ -965,7 +974,7 @@ def test_new_tuning_is_identical_in_both_explorable_docs():
                 'source_retry_seconds': memory_cycle.SOURCE_RETRY_SECONDS,
                 'unchanged_extraction_attempts': memory_cycle.UNCHANGED_EXTRACTION_ATTEMPTS,
                 'unchanged_protocol_attempts': memory_cycle.UNCHANGED_PROTOCOL_ATTEMPTS,
-                'unchanged_dreamer_attempts': memory_cycle.UNCHANGED_DREAMER_ATTEMPTS,
+                'unchanged_dreamer_attempts': dreamer.ATTEMPTS,
                 'protocol_recheck_seconds': memory_cycle.PROTOCOL_RECHECK_SECONDS,
                 'conversation_messages': personal_context.CONVERSATION_MESSAGES,
                 'conversation_text_chars': personal_context.CONVERSATION_TEXT_CHARS,
@@ -1382,28 +1391,28 @@ def test_unchanged_dreamer_failure_parks_but_changed_evidence_same_person_releas
     _quiet_memory_inputs(monkeypatch)
     ku.apply(fact(), NOW)
     calls = []
-    def malformed(now=None):
-        def model(*args, **kwargs):
-            calls.append(True)
-            return '{bad json'
-        return dreamer.run(model, now)
+    def malformed(*args, **kwargs):
+        calls.append(True)
+        return '{bad json'
+    monkeypatch.setattr(dreamer.model_work, 'call', malformed)
     complete = lambda *a: {'status': 'ok', 'rows': [], 'next_cursor': None, 'complete': True}
     learned = lambda *a, **k: {'reviewed': 0, 'facts': 0}
     for hour in range(3):
-        memory_cycle.run(NOW + timedelta(hours=hour), complete, learned, malformed)
+        memory_cycle.run(NOW + timedelta(hours=hour), complete, learned)
     state = json.loads(Path(memory_cycle.state_path()).read_text())
-    assert len(calls) == memory_cycle.UNCHANGED_DREAMER_ATTEMPTS == 2
+    assert len(calls) == dreamer.ATTEMPTS == 2
     assert state['receipt']['dreamer']['parked'] == 1
     assert all(row['attempts'] == 2 for rows in dreamer.jsonstore.read(dreamer._state_path())['facts'].values()
                for row in rows.values())
 
     # The identity is unchanged; new durable evidence alone must release the parked request.
     ku.apply(fact('Alex is advising a climate startup.', ['gmail:new']), NOW + timedelta(hours=3))
-    def valid(now=None):
+    def valid(task, prompt, *args, **kwargs):
         calls.append(True)
-        return dreamer.run(lambda prompt, *a, **k: json.dumps({'people': [
-            {'id': row['id'], 'summary_refs': [], 'conflicts': []} for row in json.loads(prompt)]}), now)
-    memory_cycle.run(NOW + timedelta(hours=3), complete, learned, valid)
+        return json.dumps({'people': [
+            {'id': row['id'], 'summary_refs': [], 'conflicts': []} for row in json.loads(prompt)]})
+    monkeypatch.setattr(dreamer.model_work, 'call', valid)
+    memory_cycle.run(NOW + timedelta(hours=3), complete, learned)
     state = json.loads(Path(memory_cycle.state_path()).read_text())
     assert len(calls) == 3 and 'dreamer_failure' not in state
 
@@ -1553,16 +1562,20 @@ def test_dreamer_empty_provider_response_is_bounded(tmp_path, monkeypatch):
     _quiet_memory_inputs(monkeypatch)
     ku.apply(fact(), NOW)
     calls = []
-    def unavailable(now=None):
+    def unavailable(*args, **kwargs):
         calls.append(True)
         raise learning.gemini.ModelResponseError('model_no_candidates', 'SAFETY')
+    monkeypatch.setattr(dreamer.model_work, 'call', unavailable)
     for hour in range(5):
-        memory_cycle.run(NOW + timedelta(hours=hour),
+        receipt = memory_cycle.run(NOW + timedelta(hours=hour),
             lambda *a: {'status': 'ok', 'rows': [], 'next_cursor': None, 'complete': True},
-            lambda *a, **k: {'reviewed': 0, 'facts': 0}, unavailable)
+            lambda *a, **k: {'reviewed': 0, 'facts': 0})
+        if hour < dreamer.ATTEMPTS:
+            assert receipt['dreamer']['error_code'] == 'model_no_candidates'
     state = json.loads(Path(memory_cycle.state_path()).read_text())
-    assert len(calls) == 2 and state['receipt']['dreamer']['status'] == 'blocked'
-    assert state['dreamer_failure']['code'] == 'model_no_candidates'
+    assert len(calls) == dreamer.ATTEMPTS == 2
+    assert state['receipt']['dreamer']['parked'] == 1
+    assert 'dreamer_failure' not in state
 
 
 def test_bridge_timeout_retains_page_and_retries_without_extraction_latch(tmp_path, monkeypatch):

@@ -10,6 +10,7 @@ import sys
 sys.path[:0] = [str(Path(__file__).resolve().parent),
                str(Path(__file__).resolve().parents[1] / 'lib')]
 import ledger_io  # noqa: E402
+from ledger_provenance import source_refs, ref_fields  # noqa: E402
 from source_context import allowed  # noqa: E402
 
 MAX_MEETING_ITEMS = 20
@@ -25,10 +26,8 @@ def obligations(meeting_id, rows=None, permitted=None):
     result = []
     for row in rows:
         thread = row.get('source_thread_id') or ''
-        refs = row.get('source_refs') or []
-        meeting_ref = next((ref for ref in refs if isinstance(ref, dict)
-                            and (ref.get('source') or ref.get('sourceType')) == 'granola'
-                            and (ref.get('source_id') or ref.get('sourceId')) == meeting_id), None)
+        meeting_ref = next((ref for ref in source_refs(row)
+                            if ref_fields(ref)[:2] == ('granola', meeting_id)), None)
         direct = isinstance(thread, str) and thread.startswith(f'granola:{meeting_id}:')
         if not direct and meeting_ref is None:
             continue

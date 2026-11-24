@@ -17,9 +17,9 @@ a wide window of message/call history from the Bridge and diffing recent vs. bas
 > losing-touch thresholds). Do NOT guess who someone is drifting from. Deliver as **Sotto**, calm and
 > matter-of-fact — this is a gentle nudge, not an alarm.
 
-## Attended Sotto runtime
+## Current Sotto runtime
 
-Use the runtime's relationship-pulse procedure for an attended request. It reads the existing
+Scheduled and attended pulses use the same receiver procedure. It reads the existing
 permitted continuity ledger first, then reuses `relationship_state.json`, the canonical local
 snapshot and `history-state.json` progress. It does **not** run the full backfill below on every
 request. Open commitments retain their recorded direction, deadline and source; birthdays alone,
@@ -39,22 +39,17 @@ A complete original history traversal plus contiguous complete fresh evidence ca
 `lapsed`; excluded history pages, capped refreshes or missing channels cannot. Calls have no
 background history traversal, so a calls channel never counts as fully read here. When a lapse is
 held back, the one-line disclaimer follows any open commitments too. The cadence and
-reply-review thresholds below are unchanged. The deliberate manual/scheduled full-read procedure
-below remains available; it is not the attended request path.
+reply-review thresholds below use the underlying history and cadence.
 
 ## Procedure
 
-> **How this runs on Sotto:** the weekly pulse is a receiver-owned procedure. When the owner asks
-> for it in chat, run `run_sotto_script relationship-pulse` (no arguments): it queues the complete
-> original deterministic pulse — gather, compute, persist, deliver. Stop after the queued receipt;
-> the pulse arrives separately as written, without a rewrite from you. It does not promise complete
-> coverage of unavailable sources.
+> **How this runs on Sotto:** the weekly pulse is receiver-owned. For a current request in chat,
+> call `run_sotto_script relationship-pulse` with no arguments. Stop after its queued receipt.
+> The worker does the bounded refresh described above and delivers the pulse separately.
 
-1. **Gather a wide window, both halves.** Messages and calls from the Bridge over ≈6 weeks
-   (`read_local`, 1,008 hours), and email — the other half of a relationship — over the same 42
-   days (inbox and sent, no bodies). If the Bridge is unreachable it runs on email alone; if Google
-   isn't connected, on messages alone. Only when BOTH are missing is there nothing to compute — the
-   pulse says so in one line.
+1. **Use the permitted history.** The compute window covers up to 42 days of messages, calls
+   and known-contact inbox and sent mail. The bounded refresh adds current evidence to retained
+   observations. Report a missing or partial expected read and limit conclusions to available history.
 2. **Compute** — the pulse produces `attention_queue[]`, `relationship_insights[]`, `lapsed[]` and
    `pulse_markdown`. It also writes `$SOTTO_DATA/knowledge/relationship_state.json` so the **daily
    brief** can surface the same flags (the composer merges it automatically) — including a

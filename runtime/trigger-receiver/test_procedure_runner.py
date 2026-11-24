@@ -142,11 +142,22 @@ def test_pulse_routes_through_shared_checkpointed_pipeline_and_stages_permission
 @pytest.mark.parametrize('result,expected', [
     ({'deliver': False}, 'NO_NUDGES'),
     ({'deliver': False, 'retryable': True}, None),
-    ({'deliver': True, 'items': [{'sender': 'A', 'why': 'Unanswered invitation'}],
+    ({'deliver': True, 'items': [{'display_sender': 'A', 'excerpt': 'Can you make the workshop?',
+                                    'why': 'Do not render this unverified claim'}],
       'item_ids': ['digest-item-a'],
       'coverage_until': '2026-09-08T12:30:00Z',
       'effects': [{'kind': 'eligibility', 'source': 'imessage'}], 'valid_until': 2000000000},
-     'Midday catch-up\n\nA: Unanswered invitation'),
+     'Midday catch-up\n\nA: “Can you make the workshop?”'),
+    ({'deliver': True, 'items': [{'display_sender': 'You', 'excerpt': 'I can make Thursday.',
+                                    'request_sender': 'Alex', 'status': 'waiting'}],
+      'item_ids': ['digest-item-a'], 'effects': [{'kind': 'eligibility', 'source': 'imessage'}],
+      'valid_until': 2000000000},
+     'Midday catch-up\n\nWaiting for a reply about the request from Alex. You wrote: “I can make Thursday.”'),
+    ({'deliver': True, 'items': [{'display_sender': 'You', 'excerpt': 'I can make Thursday.',
+                                    'status': 'waiting'}],
+      'item_ids': ['digest-item-a'], 'effects': [{'kind': 'eligibility', 'source': 'whatsapp'}],
+      'valid_until': 2000000000},
+     'Midday catch-up\n\nWaiting for a reply. You wrote: “I can make Thursday.”'),
 ])
 def test_digest_silence_failure_and_acceptance_cutoff(result, expected, tmp_path, monkeypatch):
     monkeypatch.setenv('SOTTO_DATA', str(tmp_path))

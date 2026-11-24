@@ -40,11 +40,11 @@ from datetime import datetime, timezone
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "sotto-bridge", "version": "1.0"}
 BRIDGE_REQUEST_STARTED_AT = "_bridge_request_started_at"
-# Optional Bridge result fields this receiver accepts, stamped on every forwarded request's
-# `params._meta`. A Bridge sends such a field only when it is listed here (mcp.rs ACCEPTS_META), so
-# a newer Bridge still reads cleanly into an older receiver that would reject the unknown key.
+# Receiver capabilities are stamped on each forwarded request's `params._meta`. The Bridge uses
+# them to preserve compatible result shapes and to require source-aware consent for new reads.
 BRIDGE_ACCEPTS_META = "sotto/accepts"
-BRIDGE_ACCEPTS = ("source_coverage", "source_coverage_v2", "search_metadata_v1")
+BRIDGE_ACCEPTS = ("source_coverage", "source_coverage_v2", "search_metadata_v1",
+                  "history_reactions_coverage_v1", "history_failure_reason_v1", "whatsapp_chat_read_v1")
 # A connected Bridge re-lists its tools in the background at most this often (send policy and
 # Bridge upgrades change the listing without a reconnect).
 TOOLS_RELIST_SECONDS = 300.0
@@ -84,6 +84,7 @@ class Relay:
         # monotonic time of the last Bridge poll/respond. -inf, NOT 0.0: monotonic() is host uptime
         # on Linux, so a 0.0 start read as "connected" for the first bridge_timeout seconds after boot.
         self._last_poll = float("-inf")
+        self.bridge_last_seen_at = None
         self._bridge_timeout = bridge_timeout
         self.on_response = lambda request, result: None
         # Both hooks default to ALLOW, so self-host forwards exactly what it always did. The
@@ -110,6 +111,7 @@ class Relay:
             # a long tool call is not a reconnect, so only poll() decides this.
             self._tools_listed_at = float("-inf")
         self._last_poll = now
+        self.bridge_last_seen_at = datetime.now(timezone.utc).isoformat(timespec='seconds')
 
     def _store_tools(self, catalog):
         self._tools_cache = catalog

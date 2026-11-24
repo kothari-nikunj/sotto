@@ -40,7 +40,7 @@ def ask(tmp_path, monkeypatch):
     return pipeline, kg, calls, answers, invoke, tmp_path
 
 
-def seed(kg, name='Dana', cid='dana', email='dana@cedar.com'):
+def seed(kg, name='Dana', cid='dana', email='dana@cedar.test'):
     path = Path(kg.people_dir()) / (cid+'.md')
     path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(kg.serialize_person_file(kg.PersonFile(name=name,canonical_id=cid,identifiers=[email])))
@@ -53,7 +53,7 @@ def test_canonical_graph_first_real_persistence_answer_and_restart_reuses_all_co
     assert result['text']=='Dana founded Cedar.' and result['sources']==[]
     assert len(calls)==2 and len(answers)==1
     assert 'Canonical person matched' in answers[0][0] and 'Research Dana deeply' in answers[0][0]
-    assert 'dana@cedar.com' in answers[0][0]
+    assert 'dana@cedar.test' in answers[0][0]
     people_before={path.name:path.read_bytes() for path in Path(kg.people_dir()).glob('*.md')}
     assert invoke()==result
     assert len(calls)==2 and len(answers)==1
@@ -64,7 +64,7 @@ def test_canonical_graph_first_real_persistence_answer_and_restart_reuses_all_co
 
 def test_ambiguous_graph_name_clarifies_without_research_write_or_answer(ask):
     _,kg,calls,answers,invoke,_=ask
-    seed(kg,cid='first');seed(kg,cid='second',email='different@cedar.com')
+    seed(kg,cid='first');seed(kg,cid='second',email='different@cedar.test')
     assert 'More than one' in invoke()['text']
     assert calls==[] and answers==[]
 
@@ -133,7 +133,7 @@ def test_standalone_procedure_adds_canonical_knowledge_path(tmp_path):
     runner = Path(__file__).with_name('procedure_runner.py')
     people = tmp_path / 'knowledge/people'
     people.mkdir(parents=True)
-    (people / 'dana.md').write_text('---\ncanonical_id: dana\nname: Dana\nidentifiers: [dana@cedar.com]\n---\n')
+    (people / 'dana.md').write_text('---\ncanonical_id: dana\nname: Dana\nidentifiers: [dana@cedar.test]\n---\n')
     script = """
 import json, sys
 from pathlib import Path
@@ -144,7 +144,7 @@ sys.path.insert(0, str(Path(sys.argv[2]) / '_shared/scripts'))
 import ask_research_pipeline
 def run(*args, **kwargs):
     result = ask_research_pipeline.resolve_person('Dana')
-    assert result[0]['name'] == 'Dana' and result[0]['email'] == 'dana@cedar.com'
+    assert result[0]['name'] == 'Dana' and result[0]['email'] == 'dana@cedar.test'
     assert 'dana' in result[1]
     raise LookupError('canonical imports reached')
 ask_research_pipeline.run = run
@@ -508,3 +508,64 @@ def test_known_partial_persistence_retries_retained_research_before_any_answer(a
     assert len(replies) == 1 and '"complete": true' in replies[0]
     assert invoke() == result
     assert stages == ['research', 'persistence', 'persistence'] and len(replies) == 1
+
+
+@pytest.mark.parametrize('mode', ['company', 'person'])
+@pytest.mark.parametrize('has_source', [False, True])
+def test_resumed_answer_projects_legacy_research_without_replaying_receipts(ask, monkeypatch, mode, has_source):
+    pipeline, kg, _, _, _, root = ask
+    import jsonstore
+    seed(kg)
+    selection = {'mode': 'company', 'company': 'cedar.test'} if mode == 'company' else {
+        'mode': 'person', 'person': 'Dana'}
+    key = 'companies' if mode == 'company' else 'attendees'
+    wrong = 'Cedar was certified for an unrelated standard.'
+    checked = 'Cedar (cedar.test) is a contributing member.'
+    source = 'https://directory.test/cedar'
+    research = {key: [{'email': 'dana@cedar.test', 'domain': 'cedar.test',
+        'summary': 'Profile says Cedar has been certified.',
+        'relevance': ['Helpful profile detail.', 'Relevance says Cedar is accredited.'],
+        'recent_activity': [{'what': 'Recent claim says Cedar is certified.', 'source_url': source}],
+        'personal': [f'Personal blurb says Cedar is certified. {source}'],
+        'company_summary': 'Cedar holds a different certificate.',
+        'company_deep': {'company': 'Cedar', 'builds': ['Scheduling tools', 'Cedar is certified.'],
+                         'traction': [f'{wrong} ({source})', f'{checked} ({source})']}}],
+        'research_evidence': {'records': [{'response_json': 'RAW_UNQUALIFIED_RESPONSE'}]}}
+    if has_source:
+        research[key][0]['traction_sources'] = {source: [checked]}
+    contacts, prompts = [], []
+    write = jsonstore.write_atomic
+
+    def command(script, *_):
+        contacts.append(script)
+        return research if script.endswith('research_attendees.py') else {'complete': True}
+
+    def interrupt(path, value, *args, **kwargs):
+        write(path, value, *args, **kwargs)
+        if value.get('persistence', {}).get('status') == 'completed' and 'answer' not in value:
+            raise InterruptedError('stopped after persistence, before answer')
+
+    def invoke():
+        return pipeline.run(PACK, selection, 'Research Cedar', command,
+            lambda prompt, _: prompts.append(prompt) or {'text': 'Cedar makes scheduling tools.'},
+            authority=lambda: {'complete': True, 'revision': 'b'*64})
+
+    with monkeypatch.context() as patch:
+        patch.setattr(jsonstore, 'write_atomic', interrupt)
+        with pytest.raises(InterruptedError):
+            invoke()
+    checkpoint = next((root/'events/research-artifacts').glob('ask-*.json'))
+    before = json.loads(checkpoint.read_text())
+    assert 'answer' not in before and before['research']['result'] == research
+
+    result = invoke()
+    assert len(contacts) == 2 and len(prompts) == 1
+    assert (checked in prompts[0]) is has_source and 'Scheduling tools' in prompts[0]
+    assert wrong not in prompts[0] and 'RAW_UNQUALIFIED_RESPONSE' not in prompts[0]
+    assert 'Cedar is certified.' not in prompts[0] and 'Cedar holds a different certificate.' not in prompts[0]
+    assert 'Helpful profile detail.' in prompts[0]
+    assert not any(marker in prompts[0] for marker in ('Profile says', 'Relevance says', 'Recent claim', 'Personal blurb'))
+    after = json.loads(checkpoint.read_text())
+    assert after['research'] == before['research'] and after['persistence'] == before['persistence']
+    assert invoke() == result and len(contacts) == 2 and len(prompts) == 1
+    assert json.loads(checkpoint.read_text()) == after

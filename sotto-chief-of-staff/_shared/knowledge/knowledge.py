@@ -24,6 +24,8 @@ import yaml  # PyYAML
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import statmemo  # noqa: E402
+from yamlio import safe_load as yaml_load  # noqa: E402
 from canonical_identity import generate_canonical_id, default_canonical_id  # noqa: E402, F401
 
 # ── Constants (knowledge_files.rs:20-35) ──────────────────────────────────────
@@ -567,13 +569,13 @@ def project_person_content(content: str, data_dir=None) -> str:
     try:
         person = parse_person_file(content, invalid_refs=invalid)
         original_yaml, _ = split_frontmatter_body(content)
-        original_meta = (yaml.safe_load(original_yaml) if original_yaml else {}) or {}
+        original_meta = (yaml_load(original_yaml) if original_yaml else {}) or {}
         if not isinstance(original_meta, dict):
             raise ValueError('invalid person frontmatter')
         projected = serialize_person_file(person)
         projected_yaml, body = split_frontmatter_body(projected)
         # Keep dashboard identity/extensions that the graph model does not understand.
-        meta = {**original_meta, **(yaml.safe_load(projected_yaml) or {})}
+        meta = {**original_meta, **(yaml_load(projected_yaml) or {})}
         if not person.summary_refs:
             meta.pop('summary_refs', None)
         return '---\n' + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True) + '---\n' + body
@@ -595,7 +597,7 @@ def projected_person(person: PersonFile) -> PersonFile:
 
 def parse_person_file(content: str, *, invalid_refs=None) -> PersonFile:
     yaml_str, body = split_frontmatter_body(content)
-    fm = yaml.safe_load(yaml_str) if yaml_str else {}
+    fm = yaml_load(yaml_str) if yaml_str else {}
     fm = fm or {}
     facts = {fid: FactMeta.from_yaml_dict(fd) for fid, fd in (fm.get("facts") or {}).items()}
     b = _parse_body(body)
@@ -1205,6 +1207,7 @@ def migrate_people_dir(now: Optional[datetime] = None) -> dict:
     return {"moved": moved, "merged": merged}
 
 
+@statmemo.by_files(lambda: os.path.join(people_dir(), "*.md"))
 def build_people_index() -> dict:
     """One pass over people/*.md → {'by_cid', 'by_identifier' (normalized), 'by_name' (name slug;
     when two DIFFERENT people share a name, the most recently touched file wins the name key —

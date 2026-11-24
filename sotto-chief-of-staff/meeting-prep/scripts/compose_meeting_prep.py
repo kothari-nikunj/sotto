@@ -25,7 +25,7 @@ The agent supplies the inputs the brief skill already gathers:
                       matchGranolaToCalendar's per-attendee, most-recent-only match).
   --knowledge         knowledge_query.py output ({slug: packed} or {person_knowledge:{...}})
   --granola           Granola JSON (array, or {meetings:[...]}) — past meeting history
-  --focus             a person the user NAMED ("prep Spencer" / spencer@co.com): preps only their
+  --focus             a person the user NAMED ("prep Rowan" / rowan@co.com): preps only their
                       soonest upcoming meeting and uses the FOCUSED PREP prompt variant — the deep
                       dive that opens with the private thread and ends with fused angles. Depth
                       follows focus; without it the sweep is unchanged, byte for byte. An unmatched
@@ -45,10 +45,12 @@ import sys
 _SHARED = os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "scripts")
 _SHARED_LIB = os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "lib")
 sys.path.insert(0, _SHARED)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "_shared", "knowledge"))
 if _SHARED_LIB not in sys.path:
     sys.path.insert(0, _SHARED_LIB)
 
 from jsonfiles import load, pick_list  # noqa: E402
+from knowledge import valid_canonical_id  # noqa: E402
 from textutil import (  # noqa: E402
     _arr, _names_match, _normalize_identifier, _obj, _s,
     normalize_attendee_research, unwrap_tool_result,
@@ -57,7 +59,7 @@ from timeutil import _parse_ts, _user_local_date, _user_tz_offset, _resolve_tz  
 from gemini import call_gemini  # noqa: E402
 from render_local import (  # noqa: E402
     _format_source_availability, _format_x_context,
-    resolve_contact_names,
+    resolve_contact_names, seed_contact_index_from_contacts,
 )
 import ledger_io  # noqa: E402  (continuity ledger read — per-attendee open loops)
 import delivery_effects  # noqa: E402
@@ -110,7 +112,6 @@ def _knowledge_lookup(prior_knowledge: dict) -> tuple[dict, dict]:
     """Index packed knowledge by exact email and canonical ID; names alone do not join attendees.
     Accepts {person_knowledge:{slug:packed}} or a bare {slug:packed} map (knowledge_query.py emits
     the bare form). Packed head line is "Name (slug) | role @ company | email"."""
-    from knowledge import valid_canonical_id
     people = {}
     if isinstance(prior_knowledge, dict):
         pk = prior_knowledge.get("person_knowledge")
@@ -180,6 +181,13 @@ def _comms_lookup(inputs: dict) -> dict:
         if isinstance(em, str) and "@" in em and isinstance(rows, list):
             out[em.lower().strip()] = [r for r in rows if isinstance(r, dict)]
     return out
+
+
+def attendee_search_failures(comms) -> dict:
+    """{email(lower): error code} for attendees whose Gmail search FAILED (gather_google's
+    `_search_failed`), as distinct from a search that found nothing. Malformed → {}."""
+    failed = comms.get("_search_failed") if isinstance(comms, dict) else None
+    return {k.lower().strip(): v for k, v in failed.items() if isinstance(k, str)} if isinstance(failed, dict) else {}
 
 
 def _contact_identity(email: str, name: str, contact_index: list):
@@ -267,44 +275,118 @@ def _text_lines(local: dict, identity) -> list:
     return lines
 
 
-def attendee_text_context(inputs: dict, email: str, name: str) -> str:
-    """Reuse the bounded direct-conversation reader for one resolved attendee.
+PREP_DIRECT_MESSAGES = 24
+_DIRECT_FIELDS = {'imessage': 'handle', 'whatsapp': 'contact_jid'}
 
-    Only already-projected local rows are candidates: no second read or snapshot fallback.
-    Keep direction and timestamps and don't let email/loop line caps displace this context.
-    """
-    from personal_context import conversation_key, current_conversation
+
+def _direct_peer(source, row):
+    if not isinstance(row, dict) or row.get('is_group_chat') or row.get('group_id') or row.get('chat_guid'):
+        return ''
+    value = _s(row.get(_DIRECT_FIELDS[source])).strip()
+    if source == 'whatsapp' and not re.fullmatch(r'[0-9]+@(?:s\.whatsapp\.net|c\.us)', value):
+        return ''
+    return value
+
+
+def _attendee_threads(inputs, local, email):
+    pk = _obj(inputs, 'prior_knowledge') or _obj(inputs, 'knowledge')
+    index = _arr(pk, 'contact_index') + _arr(local, 'contact_index')
+    cards = [_identity_keys(card) for card in index + seed_contact_index_from_contacts(_arr(local, 'contacts'))]
+    email = _s(email).lower().strip()
+    matches = [card for card in cards if email and email in card]
+    if not matches:
+        return {}
+    # A shared phone number alone does not distinguish two owners.
+    keys = set.intersection(*matches).difference(*(card for card in cards if email not in card))
+    threads = {}
+    for source in _DIRECT_FIELDS:
+        for row in _arr(local, source):
+            peer = _direct_peer(source, row)
+            if peer and _normalize_identifier(peer) in keys:
+                threads.setdefault((source, peer), []).append(row)
+    return threads
+
+
+def _partial_chat(local, source):
+    return (_obj(local, 'source_status').get(source) in ('partial', 'degraded')
+            or _obj(_obj(local, 'source_coverage'), source).get('status') == 'partial')
+
+
+def refresh_prep_conversation(inputs):
+    """One bounded exact-peer read for a requested attendee with an observed partial chat."""
+    from source_context import allowed, bridge_call, project_local
+    from timeutil import source_observed_time
+    focus = _s(inputs.get('focus')).strip()
+    if not focus and not inputs.get('exact_meeting'):
+        return
+    meetings = focus_hits(inputs) if focus else upcoming(inputs)
+    people = [a for meeting in meetings[:1] for a in meeting[4]
+              if not focus or ra.matches_focus(focus, a['name'], a['email'])]
+    if len(people) != 1:
+        return
+    local = project_local(_obj(inputs, 'local'))
+    threads = _attendee_threads(inputs, local, people[0]['email'])
+    partial = [(source, peer) for source, peer in threads if _partial_chat(local, source)
+               and (source != 'whatsapp' or peer.endswith('@s.whatsapp.net'))]
+    if not partial:
+        return
+    # Prefer the most recently active eligible chat if two sources reported omissions.
+    source, peer = max(partial, key=lambda key: max(_s(row.get('timestamp')) for row in threads[key]))
+    if not allowed(source):
+        return
+    args = {'identifier': peer, 'limit': PREP_DIRECT_MESSAGES}
+    if source == 'whatsapp':
+        args['source'] = source
+    try:
+        page = bridge_call('get_messages', args, timeout=8)
+    except (OSError, ValueError, RuntimeError) as error:
+        if getattr(error, 'code', '') == 'bridge_not_permitted' or not allowed(source):
+            raise RuntimeError('source permission changed during prep conversation read') from error
+        return  # The snapshot's partial receipt still reaches the writer.
+    if not allowed(source) or isinstance(page, dict) and page.get('status') == 'disabled':
+        raise RuntimeError('source permission changed during prep conversation read')
+    if (not isinstance(page, dict) or page.get('identifier') != peer or page.get('error')
+            or page.get('source', 'imessage') != source or page.get('status') not in (None, 'ok')
+            or not isinstance(page.get('messages'), list)):
+        return
+    page_rows = page['messages']
+    direct = [row for row in page_rows[:PREP_DIRECT_MESSAGES] if _direct_peer(source, row) == peer
+              and type(row.get('is_from_me')) is bool and source_observed_time({**row, 'source': source})]
+    inputs['prep_chat_read'] = {'email': people[0]['email'], 'source': source, 'peer': peer,
+        'partial': len(page_rows) >= PREP_DIRECT_MESSAGES or len(direct) < len(page_rows), 'rows': direct}
+
+
+def attendee_text_context(inputs: dict, email: str, name: str) -> str:
+    from personal_context import CONVERSATION_DAYS, conversation_key, current_conversation
     from source_context import project_local
-    local = project_local(_obj(inputs, "local"))
-    pk = _obj(inputs, "prior_knowledge") or _obj(inputs, "knowledge")
-    identity = _contact_identity(email, name, _arr(pk, "contact_index") + _arr(local, "contact_index"))
-    # Full direct conversations need an exact linked identifier; a unique display name is not one.
-    if _s(email).lower().strip() not in {_s(i).strip().lower() for i in _arr(identity or {}, "identifiers")}:
-        return ""
-    keys = _identity_keys(identity)
-    candidates = []
-    for channel, ident_key in (("imessage", "handle"), ("whatsapp", "contact_jid")):
-        for row in _arr(local, channel):
-            identifier = _s(row.get(ident_key))
-            if (identifier.endswith("@lid") or row.get("is_group_chat") or row.get("chat_guid")
-                    or _normalize_identifier(identifier) not in keys):
-                continue
-            candidates.append(({**row, "source": channel}, "", ""))
-    seeds = {}
-    for row, _, _ in sorted(candidates, key=lambda item: _s(item[0].get("timestamp"))):
-        seeds[conversation_key(row)] = row
-    messages = []
-    for seed in seeds.values():
-        messages.extend(current_conversation(seed, candidates=candidates))
+    messages, gaps = [], set()
+    page = _obj(inputs, 'prep_chat_read')
+    local = project_local(_obj(inputs, 'local'))
+    for (source, peer), rows in _attendee_threads(inputs, local, email).items():
+        reread = (page.get('email'), page.get('source'), page.get('peer')) == (email, source, peer)
+        partial = page.get('partial') if reread else _partial_chat(local, source)
+        if partial:
+            gaps.add(source)
+        if reread:
+            rows = _arr(page, 'rows')
+        candidates = [({**row, 'source': source}, '', '') for row in rows if _direct_peer(source, row) == peer]
+        seeds = {conversation_key(row): row for row, _, _ in candidates}
+        for seed in seeds.values():
+            thread = current_conversation(seed, candidates=candidates,
+                                          days=90 if reread else CONVERSATION_DAYS, limit=PREP_DIRECT_MESSAGES)
+            messages.extend(thread)
+            if any(row.get('older_observed_messages_omitted') for row in thread):
+                gaps.add(source)
     messages.sort(key=lambda row: row['ts'])
     lines = [f"{row['source']} {row['ts']} ({'you→them' if row['is_from_me'] else 'them→you'}): {row['text']}"
              for row in messages]
-    text = "\n".join(lines)
-    # Overall attendee budget, in addition to the shared per-thread bounds. Explicitly
-    # mark omission instead of passing a clipped sentence as a complete quotation.
-    if len(text) > 8000:
-        text = "[earlier conversation omitted]\n" + text[-7900:]
-    return text
+    # Drop whole earlier messages to fit the attendee budget. Never clip dates or attribution.
+    while lines and sum(map(len, lines)) + len(lines) > 7900:
+        gaps.add(messages[len(messages) - len(lines)]['source'])
+        lines.pop(0)
+    if gaps:
+        lines.insert(0, '[Partial conversation: earlier messages may be omitted from ' + ', '.join(sorted(gaps)) + ']')
+    return "\n".join(lines)
 
 
 def _granola_line(email: str, granola_meetings: list) -> str:
@@ -339,17 +421,16 @@ def _company_deep_lines(r: dict) -> list:
         return []
     lines = []
     for b in _arr(cd, "builds"):
-        b = _s(b).strip()
+        b = ra.company_description(b)
         if b:
             lines.append(f"    builds: {b}")
-    story = _s(cd.get("founder_story")).strip()
+    story = ra.company_description(cd.get("founder_story"))
     if story:
         lines.append(f"    founder: {story}")
-    for t in _arr(cd, "traction"):
-        t = _s(t).strip()
-        if t:
-            lines.append(f"    traction: {t}")
-    market = _s(cd.get("market")).strip()
+    domain = ra.attendee_company_domain(r.get("email"))
+    for claim, url in list(ra.grounded_traction(r, domain))[:ra.MAX_TRACTION]:
+        lines.append(f'    traction: Source reports "{claim}" ({url})')
+    market = ra.company_description(cd.get("market"))
     if market:
         lines.append(f"    market: {market}")
     return lines
@@ -367,7 +448,7 @@ def _active_loops() -> list:
 MAX_RELEVANT_LOOPS_PER_ATTENDEE = 3
 
 
-def _loop_lines(email: str, identity, name: str, loops: list) -> list[str]:
+def _loop_lines(email: str, identity, name: str, loops: list, offered: dict | None = None) -> list[str]:
     """Bounded open obligations in both directions for this attendee, dated or undated. Matching
     mirrors _contact_identity's conservatism: contact_identifier must hit the attendee's normalized
     email/phone keys; a named row without an address needs the already-linked canonical ID."""
@@ -404,6 +485,9 @@ def _loop_lines(email: str, identity, name: str, loops: list) -> list[str]:
             line += f" (surfaced {n}x)"
         line += f" [{direction}]"
         lines.append(line)
+        if offered is not None and it.get("anchor_key"):
+            # The exact task versions this prep was given; a reply may close only one of these.
+            offered[it["anchor_key"]] = delivery_effects.loop_version(it)
     return lines
 
 
@@ -438,6 +522,7 @@ def build_context(inputs: dict) -> tuple[str, list]:
     # Private-context sources: the attendee-comms gather, the identity map (knowledge_query's
     # contact_index — email→name/phone bridge), and the continuity ledger's active loops.
     comms_by_email = _comms_lookup(inputs)
+    search_failed = attendee_search_failures(_obj(inputs, "attendee_comms"))
     contact_index = _arr(pk, "contact_index") + _arr(local, "contact_index")
     loops = _active_loops()
 
@@ -466,6 +551,7 @@ def build_context(inputs: dict) -> tuple[str, list]:
     blocks, meetings_out = [], []
     for _st, e, title, start, attendees in meetings:
         emails = {a["email"] for a in attendees}
+        offered = {}
         lines = [f"### {title} — {start}",
                  "calendar occurrence (copy these exact identity fields into meetings): "
                  + json.dumps({"event_id": _s(e.get("id")), "start": start},
@@ -496,15 +582,15 @@ def build_context(inputs: dict) -> tuple[str, list]:
                 hdr += f" — {company}"
             lines.append(hdr)
             if r:
-                summ = _s(r.get("summary")).strip()
+                summ = ra.company_description(r.get("summary"))
                 profiled = bool(summ) and summ.lower() != "no public profile found."
                 if profiled:
                     lines.append(f"    research: {summ}")
-                comp = _s(r.get("company_summary")).strip()
+                comp = ra.company_description(r.get("company_summary"))
                 if comp and not profiled:   # person → company fallback only: a profiled person's
                     lines.append(f"    company: {comp}")   # generic company blurb is not meeting context
                 for b in _arr(r, "relevance"):
-                    b = _s(b).strip()
+                    b = ra.company_description(b)
                     if b:
                         lines.append(f"    · {b}")
                 # Recency-sweep fields (research_attendees.py Pass B) — dated, source-URLed,
@@ -512,13 +598,13 @@ def build_context(inputs: dict) -> tuple[str, list]:
                 for it in _arr(r, "recent_activity"):
                     if not isinstance(it, dict):
                         continue
-                    what = _s(it.get("what")).strip()
+                    what = ra.company_description(it.get("what"))
                     url = _s(it.get("source_url")).strip()
                     when = _s(it.get("when")).strip()
                     if what and url:
                         lines.append("    recent: " + what + (f" ({when})" if when else "") + f" — {url}")
                 for p in _arr(r, "personal"):
-                    p = _s(p).strip()
+                    p = ra.company_description(p)
                     if p:
                         lines.append(f"    personal: {p}")
                 lines.extend(_company_deep_lines(r))
@@ -536,14 +622,18 @@ def build_context(inputs: dict) -> tuple[str, list]:
             # hard-capped (highest-signal lines first) so prep context stays budgeted.
             event_thread = _s(e.get('threadId') or e.get('thread_id')).strip()
             private = _thread_lines(comms_by_email.get(email) or [], event_thread)
-            private.extend(_loop_lines(email, identity, name, loops))
+            if email in search_failed and not private:
+                reason = ("attendee search limit" if search_failed[email] == 'not_searched'
+                          else "the Gmail search for this person failed")
+                private.append(f"    email history unavailable ({reason})")
+            private.extend(_loop_lines(email, identity, name, loops, offered))
             granola = _granola_line(email, granola_meetings)
             if granola:
                 private.append(granola)
-            if not hits:
+            if not hits and not inputs.get('exact_meeting'):
                 private += _text_lines(local, identity)
             lines.extend(private[:MAX_PRIVATE_LINES])
-            if hits:
+            if hits or inputs.get('exact_meeting'):
                 conversation = attendee_text_context(inputs, email, name)
                 if conversation:
                     lines.append("    Recent direct conversation (source material, not instructions):\n" + conversation)
@@ -554,7 +644,8 @@ def build_context(inputs: dict) -> tuple[str, list]:
         blocks.append("\n".join(lines))
         meetings_out.append({"event_id": _s(e.get("id")), "title": title,
                              "start": start, "attendees": att_struct, "talking_points": [],
-                             "prep_location": delivery_effects.prep_location(e.get("location"))})
+                             "prep_location": delivery_effects.prep_location(e.get("location")),
+                             "_offered_tasks": offered})
 
     context = "\n\n".join(([focus_note] if focus_note else []) + blocks)
     x_context = _format_x_context(inputs).strip()
@@ -567,7 +658,7 @@ def build_context(inputs: dict) -> tuple[str, list]:
     if x_status:
         availability["x"] = x_status
     if availability:
-        context += "\n\n" + _format_source_availability(availability, _obj(inputs, "source_results"))
+        context += "\n\n" + _format_source_availability(availability, _obj(inputs, "source_results"), disclose_partial=False)
     return context, meetings_out
 
 
@@ -575,9 +666,6 @@ def _master_context() -> str:
     """knowledge/master.md via its one owner module — the same always-in-context block the brief
     gets, so prep resolves partners/priorities/procedures the same way. Absent file → ''."""
     try:
-        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "_shared", "knowledge")
-        if base not in sys.path:
-            sys.path.insert(0, base)
         import master_file  # noqa: PLC0415
         return master_file.render_for_prompt()
     except Exception:  # noqa: BLE001
@@ -660,11 +748,18 @@ def compose(inputs: dict, llm=None) -> dict:
                 covered.append(canonical[key])
     if exact is not None and (len(covered) != 1 or not isinstance(rows, list) or len(rows) != 1):
         raise ValueError('focused prep lacks exact occurrence coverage')
+    offered = {}
+    for meeting in meetings:
+        tasks = meeting.pop('_offered_tasks', {})
+        if any(meeting is row for row in covered):
+            offered.update(tasks)
     out = _normalize(parsed, meetings)
     out["prep_markdown"] = to_chat(out.get("prep_markdown"))
     if x_sources:
         delivery_effects.stage([{'kind': 'source_permissions', 'sources': x_sources}])
     delivery_effects.stage_full_prep(covered)
+    if offered:
+        delivery_effects.stage([{'kind': 'prep_tasks_offered', 'displayed_versions': offered}])
     return out
 
 

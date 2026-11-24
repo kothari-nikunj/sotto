@@ -113,8 +113,9 @@ for(const scenario of ['edited-loss','unchanged','learning-fault','unknown-send'
   if(scenario==='pair-loss'||scenario==='pair-unknown'){
    const prior=observer!.prepare("SELECT result_json FROM actions WHERE json_extract(result_json,'$.args.operation')='propose_pair'").get()!;assert.equal(JSON.parse(String(prior.result_json)).preview.offer_receipt,undefined);
    if(scenario==='pair-unknown'){assert.equal(rows('drafts.jsonl').length,0);assert.equal(recordOffers,0);}
-   observer!.close();observer=undefined;await app!.close();app=undefined;await stopReceiver(receiver.child);receiver=await startReceiver(join(folder,'receiver'));phase='safe';step=0;await mount();assert.equal(sent.length,1,'accepted or uncertain pair is never resent');
-   if(scenario==='pair-unknown'){await turn('safe-unknown-pair','Hello',2);assert.equal(rows('drafts.jsonl').length,0);assert.equal(recordOffers,0);assert.equal(applies,0);return;}
+   observer!.close();observer=undefined;await app!.close();app=undefined;await stopReceiver(receiver.child);receiver=await startReceiver(join(folder,'receiver'));phase='safe';step=0;await mount();if(scenario==='pair-unknown'){await waitFor(()=>sent.length===2);assert.match(sent[1]!,/may not have reached you/);}
+   assert.equal(sent.filter(text=>/Accept:/.test(text)).length,1,'accepted or uncertain pair is never resent');
+   if(scenario==='pair-unknown'){await turn('safe-unknown-pair','Hello',3);assert.equal(rows('drafts.jsonl').length,0);assert.equal(recordOffers,0);assert.equal(applies,0);return;}
    assert.equal(recordOffers,2);assert.equal(applies,0);
   }
   await waitFor(()=>Boolean(observer!.prepare("SELECT id FROM actions WHERE json_extract(result_json,'$.args.operation')='propose_pair' AND json_extract(result_json,'$.preview.offer_receipt') IS NOT NULL").get()));

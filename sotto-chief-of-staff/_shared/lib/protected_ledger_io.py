@@ -23,6 +23,7 @@ import os
 import stat
 
 import ledger_io
+import yamlio
 
 MAX_FILE_BYTES = 128 * 1024
 MAX_FILES = 16384
@@ -44,22 +45,24 @@ def _strict_frontmatter_has_unique_keys(content: str) -> bool:
     if ledger_io.yaml is None:
         return False
 
-    class UniqueKeyLoader(ledger_io.yaml.SafeLoader):
-        def construct_mapping(self, node, deep=False):
-            self.flatten_mapping(node)
-            keys = set()
-            for key_node, _value_node in node.value:
-                key = self.construct_object(key_node, deep=deep)
-                if key in keys:
-                    raise ValueError('duplicate YAML mapping key')
-                keys.add(key)
-            return super().construct_mapping(node, deep=deep)
+    def unique_keys(base):
+        class UniqueKeyLoader(base):
+            def construct_mapping(self, node, deep=False):
+                self.flatten_mapping(node)
+                keys = set()
+                for key_node, _value_node in node.value:
+                    key = self.construct_object(key_node, deep=deep)
+                    if key in keys:
+                        raise ValueError('duplicate YAML mapping key')
+                    keys.add(key)
+                return super().construct_mapping(node, deep=deep)
+        return UniqueKeyLoader
 
     end = content.find('\n---', 3)
     if not content.startswith('---') or end == -1:
         return False
     try:
-        ledger_io.yaml.load(content[4:end], Loader=UniqueKeyLoader)
+        yamlio.safe_load(content[4:end], unique_keys)
     except (ValueError, TypeError, RecursionError, ledger_io.yaml.YAMLError):
         return False
     return True
